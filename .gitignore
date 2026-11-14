@@ -1,0 +1,62 @@
+# Build artifacts
+/target/
+/build/
+/dist/
+*.pdb
+*.exp
+*.lib
+*.dll
+*.so
+*.dylib
+
+# Model weights and runtime: downloaded separately, never committed
+/models/
+/runtime/
+/export/
+/smplx-model/
+*.onnx
+*.pt
+*.ckpt
+*.npz
+*.bin
+*.safetensors
+
+# Working notes, screenshots and handoff docs: not part of the release
+/docs/
+*.docx
+*.pptx
+*.xlsx
+
+# Scratch / one-off helpers used while porting
+/probe/
+/scratch/
+launch_app.py
+list_strings.py
+tools/bvh_compare.py
+tools/fbx_compare.py
+tools/click_button.py
+tools/parity.py
+tools/screenshot.py
+tools/smplx_parity.py
+tools/smplx_reference.py
+tools/run_setup.py
+tools/fetch_wheels.py
+tools/install_accel.py
+tools/launch_accelerated.py
+tools/__pycache__/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Editors / OS
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Legacy Python bridge (superseded by the Rust/C++ core)
+/python/

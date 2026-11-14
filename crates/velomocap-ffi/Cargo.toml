@@ -1,0 +1,15 @@
+[package]
+name = "velomocap-ffi"
+description = "C ABI shared library consumed by the Python bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "velomocap"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+velomocap-core = { path = "../velomocap-core" }
+serde.workspace = true
+serde_json.workspace = true

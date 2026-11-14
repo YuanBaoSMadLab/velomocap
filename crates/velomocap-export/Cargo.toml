@@ -1,0 +1,11 @@
+[package]
+name = "velomocap-export"
+description = "Track export writers (JSON/CSV) shared by the app and CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+velomocap-infer = { path = "../velomocap-infer" }
+velomocap-video = { path = "../velomocap-video" }
+anyhow.workspace = true

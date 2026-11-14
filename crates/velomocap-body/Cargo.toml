@@ -1,0 +1,12 @@
+[package]
+name = "velomocap-body"
+description = "SMPL-X body model: shape, pose, LBS skinning and joint solving in pure Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+velomocap-cpp = { path = "../velomocap-cpp" }
+anyhow.workspace = true
+rayon.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }

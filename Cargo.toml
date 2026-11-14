@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/velomocap-cpp",
+    "crates/velomocap-core",
+    "crates/velomocap-ffi",
+    "crates/velomocap-cli",
+    "crates/velomocap-infer",
+    "crates/velomocap-app",
+    "crates/velomocap-video",
+    "crates/velomocap-export",
+    "crates/velomocap-body",
+    "crates/velomocap-motion",
+    "crates/velomocap-models",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/toyxyz/velomocap"
+
+[workspace.dependencies]
+anyhow = "1"
+cc = "1"
+flate2 = { version = "1", features = ["zlib"] }
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

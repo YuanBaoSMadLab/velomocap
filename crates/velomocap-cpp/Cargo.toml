@@ -1,0 +1,12 @@
+[package]
+name = "velomocap-cpp"
+description = "C++ numeric kernels for VeloMocap, built from cpp/ via cc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+
+[build-dependencies]
+cc.workspace = true

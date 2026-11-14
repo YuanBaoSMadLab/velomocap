@@ -1,0 +1,33 @@
+VeloMocap
+Copyright 2026 VeloMocap contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+The license covers **only the source code in this repository** - the Rust
+crates, the C++ kernels and the scripts in `tools/`.
+
+What the license does NOT cover
+-------------------------------
+
+* **Model weights.** Nothing under `models/` or `runtime/` is part of this
+  repository: SAM 3D Body, FlowHMR, VGGT, YOLOv8 and SMPL/SMPL-H keep their own
+  licenses and are downloaded separately by the user. See `licenses/` in the
+  distributed package for the per-component terms.
+* **SMPL / SMPL-H.** Released by the Max Planck Institute under a non-commercial
+  research license; the model file is never redistributed here.
+* **Third-party binaries.** ONNX Runtime (MIT), PyTorch / LibTorch
+  (BSD-3-Clause), ffmpeg (GPLv3 for the build shipped in the portable package),
+  CUDA / cuDNN (NVIDIA EULA), YOLOv8 (AGPL-3.0) keep their own terms.
+* **Documentation and screenshots** under `docs/`, which are working notes and
+  are not part of the released tree.
+
+Attribution
+-----------
+
+VeloMocap is an independent re-implementation of the RGB MoCap pipeline
+(https://github.com/toyxyz/toyxyz_RGBMocap, MIT licensed). No source code from
+that project is included; the pipeline structure, model usage and export
+formats were studied from it.
+
+The body model maths (SMPL/SMPL-X linear blend skinning, shape and pose blend
+shapes) follows the published formulations of Loper et al. 2015 and
+Pavlakos et al. 2019.

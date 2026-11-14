@@ -1,0 +1,26 @@
+[package]
+name = "velomocap-app"
+description = "VeloMocap native desktop application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "velomocap-app"
+path = "src/main.rs"
+
+[dependencies]
+velomocap-core = { path = "../velomocap-core" }
+velomocap-infer = { path = "../velomocap-infer" }
+velomocap-video = { path = "../velomocap-video" }
+velomocap-export = { path = "../velomocap-export" }
+velomocap-motion = { path = "../velomocap-motion" }
+velomocap-models = { path = "../velomocap-models" }
+velomocap-body = { path = "../velomocap-body" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+eframe = { version = "0.32", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+egui = "0.32"
+rfd = "0.15"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

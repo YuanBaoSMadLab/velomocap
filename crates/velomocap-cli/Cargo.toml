@@ -1,0 +1,24 @@
+[package]
+name = "velomocap-cli"
+description = "VeloMocap benchmark and conversion command line tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "velomocap-cli"
+path = "src/main.rs"
+
+[dependencies]
+velomocap-core = { path = "../velomocap-core" }
+velomocap-cpp = { path = "../velomocap-cpp" }
+velomocap-infer = { path = "../velomocap-infer" }
+velomocap-video = { path = "../velomocap-video" }
+velomocap-export = { path = "../velomocap-export" }
+velomocap-body = { path = "../velomocap-body" }
+velomocap-motion = { path = "../velomocap-motion" }
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
