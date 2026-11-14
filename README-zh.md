@@ -7,7 +7,7 @@ VeloMocap 把一段手机视频变成可用的三维动作：检测人物、重�
 
 > English README: [README.md](README.md)
 
-![VeloMocap 工作区](assets/workspace.png)
+![VeloMocap 工作区](assets/screenshot.png)
 
 ```text
 视频 ─► YOLOv8 检测 ─► IoU 跟踪

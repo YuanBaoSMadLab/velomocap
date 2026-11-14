@@ -6,7 +6,7 @@ VeloMocap turns a phone clip into a rigged, animated 3D human: detect people, re
 their bodies with a 3D body model, estimate camera motion, generate temporally coherent
 motion, and export **BVH** or **FBX** that drops straight into Blender, Maya, Unity or Unreal.
 
-![The VeloMocap workspace](assets/workspace.png)
+![The VeloMocap workspace](assets/screenshot.png)
 
 ```text
 video ─► YOLOv8 detector ─► IoU tracker
