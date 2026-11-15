@@ -13,6 +13,7 @@ pub mod bvh;
 pub mod contact;
 pub mod error;
 pub mod fbx;
+pub mod fbx_read;
 pub mod filters;
 pub mod math;
 pub mod rig;
