@@ -42,6 +42,8 @@ pub struct Character {
     pub joints: Vec<[u16; 4]>,
     pub weights: Vec<[f32; 4]>,
     pub faces: Vec<[u32; 3]>,
+    /// How much the bind space was scaled to bring the character to human size.
+    pub scale: f32,
 }
 
 impl Character {
@@ -333,6 +335,37 @@ impl Gltf {
             joints.len() == rest.len() / 3 && weights.len() == rest.len() / 3,
             "the mesh attributes disagree on the vertex count"
         );
+        // Characters arrive at very different sizes: Mixamo's GLB is 2.2× life
+        // size (3.78 m tall), an Unreal mannequin is exactly 1.8 m. Scale the
+        // bind space, not the posed output, so the root translation the clip
+        // supplies is still in metres.
+        let mut height_min = f32::INFINITY;
+        let mut height_max = f32::NEG_INFINITY;
+        for vertex in rest.chunks_exact(3) {
+            height_min = height_min.min(vertex[1]);
+            height_max = height_max.max(vertex[1]);
+        }
+        let height = height_max - height_min;
+        let mut scale = if height > 0.2 { 1.75 / height } else { 1.0 };
+        if (scale - 1.0).abs() <= 0.15 {
+            scale = 1.0;
+        }
+        if scale != 1.0 {
+            for value in &mut rest {
+                *value *= scale;
+            }
+            for bone in &mut bones {
+                bone.bind = [bone.bind[0] * scale, bone.bind[1] * scale, bone.bind[2] * scale];
+                let m = &bone.bind_rot;
+                let bind_matrix = [
+                    m[0], m[1], m[2], bone.bind[0],
+                    m[3], m[4], m[5], bone.bind[1],
+                    m[6], m[7], m[8], bone.bind[2],
+                    0.0, 0.0, 0.0, 1.0,
+                ];
+                bone.inverse_bind = invert(&bind_matrix);
+            }
+        }
         Ok(Character {
             name,
             bones,
@@ -340,6 +373,7 @@ impl Gltf {
             joints,
             weights,
             faces,
+            scale,
         })
     }
 
@@ -705,13 +739,21 @@ mod tests {
             return;
         };
         let character = Character::load(std::path::Path::new(&path)).expect("load");
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for vertex in character.rest.chunks_exact(3) {
+            lo = lo.min(vertex[1]);
+            hi = hi.max(vertex[1]);
+        }
         eprintln!(
-            "{}: {} bones ({} matched), {} vertices, {} faces, unmatched {:?}",
+            "{}: {} bones ({} matched), {} vertices, {} faces, height {:.3} m, feet at {:.3} m, unmatched {:?}",
             character.name,
             character.bones.len(),
             character.matched(),
             character.vertex_count(),
             character.faces.len(),
+            hi - lo,
+            lo,
             character.unmatched()
         );
         assert!(character.vertex_count() > 0);
