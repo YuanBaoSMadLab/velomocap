@@ -14,6 +14,76 @@ use anyhow::Result;
 use velomocap_infer::MeshTopology;
 use velomocap_motion::{SamConfig, SamHooks, PersonTrack};
 
+/// How much of the pipeline is allowed to stay resident on the device.
+///
+/// The stages never run at the same time (SAM → camera → motion), so the mode
+/// decides two things: whether a stage's allocator keeps its blocks for the next
+/// stage, and which stages are allowed on the GPU at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryMode {
+    /// Keep everything on the device and never trim: the fastest, needs ~24 GB.
+    Unlimited,
+    /// Load and unload stage by stage, trimming between them: 16 GB.
+    Scheduled,
+    /// Stage by stage, but the 4.4 GB camera model runs on the CPU: 8 GB.
+    Hybrid,
+    /// Every model on the CPU, no device memory at all.
+    Cpu,
+}
+
+impl Default for MemoryMode {
+    fn default() -> Self {
+        Self::Scheduled
+    }
+}
+
+impl MemoryMode {
+    pub const ALL: [MemoryMode; 4] =
+        [Self::Unlimited, Self::Scheduled, Self::Hybrid, Self::Cpu];
+
+    /// Pick a mode from the device's total memory.
+    pub fn from_vram(total_bytes: Option<u64>) -> Self {
+        let Some(total) = total_bytes else {
+            return Self::Cpu;
+        };
+        let gb = total as f64 / 1e9;
+        if gb >= 22.0 {
+            Self::Unlimited
+        } else if gb >= 14.0 {
+            Self::Scheduled
+        } else if gb >= 5.0 {
+            Self::Hybrid
+        } else {
+            Self::Cpu
+        }
+    }
+
+    /// Short label for the console and the status bar.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unlimited => "unlimited",
+            Self::Scheduled => "scheduled",
+            Self::Hybrid => "hybrid",
+            Self::Cpu => "cpu",
+        }
+    }
+
+    /// Whether the heavy models run on the device at all.
+    pub fn uses_gpu(self) -> bool {
+        !matches!(self, Self::Cpu)
+    }
+
+    /// Whether each stage hands its memory back before the next one loads.
+    pub fn trims_between_stages(self) -> bool {
+        !matches!(self, Self::Unlimited)
+    }
+
+    /// Whether the camera estimator runs on the CPU to spare its 4.4 GB.
+    pub fn camera_on_cpu(self) -> bool {
+        matches!(self, Self::Hybrid)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureStage {
     Idle,
@@ -238,6 +308,8 @@ pub struct CaptureSettings {
     pub config: SamConfig,
     /// Run FlowHMR after the reconstruction and publish preview bodies.
     pub flow: Option<FlowSettings>,
+    /// How much may stay resident on the device (auto-selected from its size).
+    pub mode: MemoryMode,
 }
 
 pub fn start(settings: CaptureSettings) -> CaptureJob {
@@ -272,6 +344,15 @@ fn run(
 ) -> Result<()> {
     let started = Instant::now();
     let video = settings.video.clone();
+    let mode = settings.mode;
+    if !mode.trims_between_stages() {
+        if let Some(line) = velomocap_motion::vram::cuda_memory_line() {
+            eprintln!("[vram] start ({}): {line}", mode.label());
+            if let Ok(mut state) = shared.lock() {
+                state.vram = format!("{line} · {} (no trimming)", mode.label());
+            }
+        }
+    }
 
     let mut progress = {
         let shared = Arc::clone(&shared);
@@ -330,19 +411,20 @@ fn run(
     let capture = velomocap_motion::capture_people_with(&video, &settings.config, &mut hooks)?;
     // The detector and SAM module are gone at this point, but both allocators
     // keep their blocks: without handing them back, the flow stage cannot fit
-    // and its weights end up paged into host memory.
-    release_vram(&shared, "after SAM");
+    // and its weights end up paged into host memory. `Unlimited` keeps them on
+    // purpose — trimming is what costs the reload time.
+    release_vram(&shared, "after SAM", mode.trims_between_stages());
 
     // FlowHMR: the coherent SMPL-H motion behind the preview and the exports.
     // A failure here must not lose the reconstruction, so it is reported and the
     // per-frame MHR bodies stay on screen.
     if let Some(flow) = settings.flow.clone() {
-        if let Err(error) = run_flow(&video, &capture.people, &flow, &shared) {
+        if let Err(error) = run_flow(&video, &capture.people, &flow, &shared, mode) {
             let mut state = shared.lock().unwrap();
             state.progress.message = format!("FlowHMR: {error:#}");
             state.flow_note = format!("FlowHMR failed: {error}");
         }
-        release_vram(&shared, "after motion");
+        release_vram(&shared, "after motion", mode.trims_between_stages());
     }
     let summary = capture.summary();
     let line = capture.timings.line();
@@ -380,8 +462,12 @@ fn run(
 /// and ONNX Runtime keeps a per-session arena. The next stage's weights then
 /// cannot fit, Windows pages them into host memory, and every kernel crawls.
 /// Dropping the models is not enough — the cache has to be trimmed explicitly.
-fn release_vram(shared: &Arc<Mutex<CaptureShared>>, stage: &str) {
-    velomocap_motion::vram::empty_cuda_cache();
+fn release_vram(shared: &Arc<Mutex<CaptureShared>>, stage: &str, trim: bool) {
+    // `Unlimited` deliberately keeps the blocks: reloading a 4-5 GB model costs
+    // far more than the memory it saves on a card that has room for it.
+    if trim {
+        velomocap_motion::vram::empty_cuda_cache();
+    }
     let Some(line) = velomocap_motion::vram::cuda_memory_line() else {
         return;
     };
@@ -397,40 +483,45 @@ fn run_flow(
     people: &[PersonTrack],
     settings: &FlowSettings,
     shared: &Arc<Mutex<CaptureShared>>,
+    mode: MemoryMode,
 ) -> Result<()> {
     use velomocap_infer::{MotionConfig, SessionConfig, VggtCamera, VggtConfig};
 
-    let report = |message: &str| {
-        if let Ok(mut state) = shared.lock() {
-            state.progress.message = message.to_string();
-        }
-    };
-
     report_stage(shared, 0, 0, 0, "flow camera");
     let tools = velomocap_video::Tools::discover()?;
-    // The camera model is scoped so its ~4.4 GB leaves the device before
-    // FlowHMR loads. Keeping both resident is what pushed the motion stage's
-    // weights into host memory and slowed the run down by an order of magnitude.
-    let camera = {
+    let gpu = settings.gpu && mode.uses_gpu();
+    // Two ways to skip the 4.4 GB camera model: a fixed camera does not need it
+    // (its track is exactly what `freeze()` would produce), and `Hybrid` moves it
+    // to the CPU to leave the device to SAM and the motion model.
+    let camera = if !settings.estimate_camera {
+        let info = velomocap_video::probe(&tools, video)?;
+        eprintln!(
+            "[camera] static: identity track over {} frames (VGGT not loaded)",
+            info.frames.max(1)
+        );
+        velomocap_infer::CameraTrack::static_camera(
+            info.frames.max(1),
+            info.width,
+            info.height,
+        )
+    } else {
         let mut vggt = VggtCamera::load(VggtConfig {
             weights: settings.camera_weights.clone(),
             session: SessionConfig {
-                gpu: settings.gpu,
+                gpu: gpu && !mode.camera_on_cpu(),
                 ..Default::default()
             },
             ..Default::default()
         })?;
         let mut camera = vggt.estimate(&tools, video)?;
-        if !settings.estimate_camera {
-            // Fixed camera: reuse the first frame's extrinsics for the whole clip.
-            camera.freeze();
-        } else if settings.refine_camera {
+        if settings.refine_camera {
             camera.smooth(1);
         }
         camera
     };
-    release_vram(shared, "after camera");
-    report("flow body model");
+    // Scoped above, so the camera weights are gone before FlowHMR loads.
+    release_vram(shared, "after camera", mode.trims_between_stages());
+    report_stage(shared, 0, 0, 0, "flow body model");
     let has_posedirs = velomocap_body::npz::members(&settings.body)
         .map(|names| names.iter().any(|name| name == "posedirs" || name.starts_with("posedirs.")))
         .unwrap_or(false);
@@ -451,7 +542,7 @@ fn run_flow(
             weights: settings.weights.clone(),
             stats: settings.stats.clone(),
             session: SessionConfig {
-                gpu: settings.gpu,
+                gpu,
                 ..Default::default()
             },
             ..Default::default()
@@ -614,6 +705,23 @@ fn downscale(index: usize, rgb: &[u8], width: usize, height: usize, target: usiz
 }
 
 #[cfg(test)]
+    /// The auto-selection table, and the flags each mode implies.
+    #[test]
+    fn memory_mode_follows_the_card_size() {
+        let gb = |value: u64| Some(value * 1_000_000_000);
+        assert_eq!(MemoryMode::from_vram(gb(24)), MemoryMode::Unlimited);
+        assert_eq!(MemoryMode::from_vram(gb(16)), MemoryMode::Scheduled);
+        assert_eq!(MemoryMode::from_vram(gb(8)), MemoryMode::Hybrid);
+        assert_eq!(MemoryMode::from_vram(gb(4)), MemoryMode::Cpu);
+        assert_eq!(MemoryMode::from_vram(None), MemoryMode::Cpu);
+        assert!(!MemoryMode::Unlimited.trims_between_stages());
+        assert!(MemoryMode::Scheduled.trims_between_stages());
+        assert!(MemoryMode::Hybrid.camera_on_cpu());
+        assert!(!MemoryMode::Scheduled.camera_on_cpu());
+        assert!(!MemoryMode::Cpu.uses_gpu());
+        assert!(MemoryMode::Unlimited.uses_gpu());
+        assert!(MemoryMode::Hybrid.uses_gpu());
+    }
     /// Every stage the bar can show has a name, and the flow pass maps onto the
     /// same indices as the SAM pass — otherwise the bar jumps backwards.
     #[test]

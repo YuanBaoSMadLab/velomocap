@@ -90,6 +90,39 @@ impl CameraTrack {
         self.extrinsics.is_empty()
     }
 
+    /// A tripod camera: every frame has the same (identity) pose.
+    ///
+    /// This is what the static-camera mode uses instead of running VGGT at all.
+    /// It is numerically the same track the estimator produces for a fixed
+    /// shot — VGGT normalises frame zero to identity, and `freeze()` copies that
+    /// frame over the rest — so the 4.4 GB of camera weights never has to be
+    /// loaded.
+    pub fn static_camera(frames: usize, width: usize, height: usize) -> Self {
+        let frames = frames.max(1);
+        let identity = [
+            [1.0f32, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        // A plausible pinhole for a 40° vertical field of view. Nothing in the
+        // motion path reads it (it conditions on rotations only), but a track
+        // with zeros in it would be a trap for the next caller.
+        let focal = height.max(1) as f32 * 0.5 / (20.0f32.to_radians()).tan();
+        let intrinsics = [
+            [focal, 0.0, width as f32 * 0.5],
+            [0.0, focal, height as f32 * 0.5],
+            [0.0, 0.0, 1.0],
+        ];
+        Self {
+            extrinsics: vec![identity; frames],
+            intrinsics: vec![intrinsics; frames],
+            image_size: (height.max(1), width.max(1)),
+            model_size: (height.max(1), width.max(1)),
+            sample_indices: vec![0],
+        }
+    }
+
     /// Rotations relative to the first frame, flattened row-major (9 per frame).
     ///
     /// This is what the motion generator conditions on: world-to-camera
@@ -157,8 +190,7 @@ impl CameraTrack {
         }
     }
 
-    pub fn relative_rotation_rows(&self) -> Vec<f32> {
-        let first = match self.extrinsics.first() {
+    pub fn relative_rotation_rows(&self) -> Vec<f32> {        let first = match self.extrinsics.first() {
             Some(m) => rotation(m),
             None => return Vec::new(),
         };
@@ -668,6 +700,28 @@ fn mat_mul3(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A static camera only has to say "nothing moved": every frame's rotation
+    /// relative to frame zero must be the identity, which is what the estimator
+    /// plus `freeze()` produces for a tripod shot.
+    #[test]
+    fn a_static_camera_track_has_no_rotation_between_frames() {
+        let track = CameraTrack::static_camera(4, 1920, 1080);
+        assert_eq!(track.len(), 4);
+        assert_eq!(track.image_size, (1080, 1920));
+        let rows = track.relative_rotation_rows();
+        assert_eq!(rows.len(), 4 * 9);
+        let identity = [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        for frame in rows.chunks_exact(9) {
+            for (got, want) in frame.iter().zip(identity.iter()) {
+                assert!((got - want).abs() < 1e-6, "rotation is not identity: {frame:?}");
+            }
+        }
+        // The intrinsics have to be usable, not zeros: nothing in the motion path
+        // reads them today, and a zeroed matrix would be a trap later.
+        assert!(track.intrinsics[0][0][0] > 100.0);
+        assert!(track.intrinsics[0][1][1] > 100.0);
+    }
 
     #[test]
     fn rope_table_shape_and_identity() {

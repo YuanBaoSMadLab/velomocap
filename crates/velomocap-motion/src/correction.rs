@@ -1570,6 +1570,15 @@ fn hand_lock(
                 })
                 .collect();
             let gains = smooth_weights(&raw_gains, fps);
+            // Calibrate the elbow branch once for the whole stance: which side the
+            // flexion goes to must not change between frames.
+            let stance_local: Vec<[f64; 9]> = (begin..end)
+                .map(|index| {
+                    let (world, _) = crate::anatomical::forward(body, &clip.poses[index], &rest);
+                    math::tmul3(&world[shoulder], &world[elbow])
+                })
+                .collect();
+            let branch = crate::anatomical::elbow_branch(&rest, &stance_local, hand_index);
             for index in first..last {
                 let ramp_weight = if index < begin {
                     (index + ramp + 1 - begin) as f64 / (ramp + 1) as f64
@@ -1586,7 +1595,7 @@ fn hand_lock(
                 let weight = ramp_weight * gain;
                 let source = clip.poses[index].clone();
                 let hint = bend_hint(&clip.skeletons[index], shoulder, elbow, wrist);
-                if solve_arm(body, &mut clip.poses[index], &rest, shoulder, elbow, wrist, target, hint) {
+                if solve_arm(body, &mut clip.poses[index], &rest, shoulder, elbow, wrist, target, hint, branch) {
                     // Same guard as the legs: no single frame may swing the wrist
                     // enough for the fingers to jump.
                     limit_end_rotation(
@@ -1647,6 +1656,7 @@ fn solve_arm(
     wrist: usize,
     target: [f32; 3],
     hint: Option<[f64; 3]>,
+    branch: f64,
 ) -> bool {
     let target = [target[0] as f64, target[1] as f64, target[2] as f64];
     let start = {
@@ -1690,6 +1700,11 @@ fn solve_arm(
         axis = [0.0, 0.0, 1.0];
     } else {
         axis = normalise3(axis);
+    }
+    // The stance's calibrated elbow branch decides which side the flexion goes
+    // to; a per-frame decision is what makes an elbow flip between solutions.
+    if branch < 0.0 {
+        axis = [-axis[0], -axis[1], -axis[2]];
     }
 
     let mut moved = false;
@@ -2309,7 +2324,8 @@ mod tests {
             LEFT_ELBOW,
             LEFT_WRIST,
             target,
-            None
+            None,
+            1.0
         ));
 
         let after = body.forward_joints(&pose);

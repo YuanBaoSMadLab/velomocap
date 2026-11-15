@@ -1468,6 +1468,37 @@ fn correction_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
     });
 }
 
+/// Label for the residency combo, in the user's language.
+fn memory_mode_label(mode: crate::capture::MemoryMode) -> String {
+    match mode {
+        crate::capture::MemoryMode::Unlimited => i18n::zh_en("无限制（常驻显存）", "Unlimited (resident)"),
+        crate::capture::MemoryMode::Scheduled => i18n::zh_en("计划（逐阶段装卸）", "Scheduled (per stage)"),
+        crate::capture::MemoryMode::Hybrid => i18n::zh_en("混合（相机走 CPU）", "Hybrid (camera on CPU)"),
+        crate::capture::MemoryMode::Cpu => i18n::zh_en("仅 CPU", "CPU only"),
+    }
+}
+
+/// Which cards each mode is meant for, shown on hover.
+fn memory_mode_hint(mode: crate::capture::MemoryMode) -> String {
+    match mode {
+        crate::capture::MemoryMode::Unlimited => i18n::zh_en(
+            "适合 24 GB 及以上（3090/4090）：全程不卸载，响应最快",
+            "24 GB and up (3090/4090): never unload, fastest response",
+        ),
+        crate::capture::MemoryMode::Scheduled => i18n::zh_en(
+            "适合 16 GB：逐阶段实时装载与卸载，避免权重落内存",
+            "16 GB: load and unload per stage, nothing spills to host memory",
+        ),
+        crate::capture::MemoryMode::Hybrid => i18n::zh_en(
+            "适合 8 GB 左右：相机模型走 CPU，把显存留给 SAM 与动作模型",
+            "Around 8 GB: the camera model runs on the CPU, the device goes to SAM and motion",
+        ),
+        crate::capture::MemoryMode::Cpu => i18n::zh_en(
+            "完全使用内存，不占用任何显存（最慢）",
+            "Everything in host memory, no device memory at all (slowest)",
+        ),
+    }
+}
 fn resources_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
     group(ui, i18n::t("Processing Resources"), |ui| {
         ui.horizontal(|ui| {
@@ -1479,6 +1510,33 @@ fn resources_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
             };
             ui.label(egui::RichText::new(label).size(10.0).color(colour));
         });
+        // Residency strategy: auto-selected from the card's size at start-up,
+        // overridable here. The four modes are what the pipeline supports.
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(i18n::t("Memory mode")).size(11.0));
+            egui::ComboBox::from_id_salt("memory-mode")
+                .selected_text(memory_mode_label(app.memory_mode))
+                .width(ui.available_width() - 6.0)
+                .show_ui(ui, |ui| {
+                    for mode in crate::capture::MemoryMode::ALL {
+                        let selected = app.memory_mode == mode;
+                        let response = ui.selectable_label(selected, memory_mode_label(mode));
+                        if response.clicked() && !selected {
+                            app.memory_mode = mode;
+                            app.gpu = mode.uses_gpu();
+                            app.log(format!("Memory mode: {}", mode.label()));
+                        }
+                        response.on_hover_text(memory_mode_hint(mode));
+                    }
+                });
+        })
+        .response
+        .on_hover_text(i18n::t(
+            "Detected from the card at start-up; pick another mode to override it",
+        ));
+        if !app.vram.is_empty() {
+            ui.label(egui::RichText::new(format!("VRAM {}", app.vram)).size(10.0).color(MUTED));
+        }
         ui.add(
             egui::Slider::new(&mut app.scale_width, 320..=1920)
                 .step_by(32.0)

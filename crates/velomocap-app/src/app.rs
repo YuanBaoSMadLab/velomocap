@@ -151,6 +151,9 @@ pub struct VeloMocap {
     pub params_dir: PathBuf,
     pub confidence: f32,
     pub gpu: bool,
+    /// How much of the pipeline may stay resident on the device. Chosen from the
+    /// card's size the first time the app starts, and overridable in the UI.
+    pub memory_mode: capture::MemoryMode,
     pub flow_weights: PathBuf,
     pub flow_stats: PathBuf,
     pub smplh_model: PathBuf,
@@ -269,13 +272,21 @@ impl VeloMocap {
             .unwrap_or_else(|| PathBuf::from("models/body_models/smplh/neutral/model.npz"));
         let camera_weights = resolve_model(&["models/flowhmr/vggt_omega_1b_512.onnx"])
             .unwrap_or_else(|| PathBuf::from("models/flowhmr/vggt_omega_1b_512.onnx"));
+        // The device's size decides the default residency strategy; the sidebar
+        // combo lets the user override it. `VELOMOCAP_FORCE_CPU` still wins.
+        let device_memory = velomocap_motion::vram::cuda_memory().map(|(_, total)| total);
+        let mut memory_mode = capture::MemoryMode::from_vram(device_memory);
+        if std::env::var("VELOMOCAP_FORCE_CPU").is_ok() {
+            memory_mode = capture::MemoryMode::Cpu;
+        }
         let mut app = Self {
             video,
             detector,
             sam3d_dir,
             params_dir,
             confidence: 0.3,
-            gpu: std::env::var("VELOMOCAP_FORCE_CPU").is_err(),
+            gpu: memory_mode.uses_gpu(),
+            memory_mode,
             flow_weights,
             flow_stats,
             smplh_model,
@@ -353,6 +364,17 @@ impl VeloMocap {
         }
         crate::models_ui::refresh(&mut app, false);
         app.log("VeloMocap native core ready.");
+        match device_memory {
+            Some(total) => app.log(format!(
+                "Memory mode: {} ({:.1} GB device, auto-selected)",
+                memory_mode.label(),
+                total as f64 / 1e9
+            )),
+            None => app.log(format!(
+                "Memory mode: {} (no CUDA device visible)",
+                memory_mode.label()
+            )),
+        }
         if let Some(path) = app.video.clone() {
             app.load_video(path);
                         app.playing = play;
@@ -685,7 +707,7 @@ impl VeloMocap {
                 confidence: self.confidence,
                 work_width: self.scale_width,
                 max_frames: self.max_frames,
-                gpu: self.gpu,
+                gpu: self.gpu && self.memory_mode.uses_gpu(),
                 seed_boxes: seeds,
                 ..Default::default()
             },
@@ -695,12 +717,18 @@ impl VeloMocap {
                 body: self.smplh_model.clone(),
                 camera_weights: self.camera_weights.clone(),
                 max_frames: self.max_frames,
-                gpu: self.gpu,
+                gpu: self.gpu && self.memory_mode.uses_gpu(),
                 correction: self.correction,
                 estimate_camera: self.estimate_camera,
                 refine_camera: self.refine_camera,
             }),
+            mode: self.memory_mode,
         }));
+        self.log(format!(
+            "Memory mode: {} ({})",
+            self.memory_mode.label(),
+            if self.memory_mode.uses_gpu() { "GPU" } else { "CPU only" }
+        ));
     }
     pub fn cancel_capture(&mut self) {
         if let Some(job) = &self.capture {
