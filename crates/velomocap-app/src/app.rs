@@ -747,18 +747,20 @@ impl VeloMocap {
     /// The clip's export payload: renamed into the selected rig, and
     /// rest-corrected when asked. The default biped payload is the clip's own,
     /// which is what every export wrote before the retarget chain existed.
+    ///
+    /// `rest_correct` is a property of the *format*: a BVH carries no bind pose,
+    /// so the correction is what makes a canonical-rest rig play it, while an
+    /// FBX states its own bind (ours, from the SMPL-H rest) and correcting its
+    /// channels against someone else's rest would contradict that bind.
     fn export_payload(
         &self,
         bvh: &velomocap_motion::PreparedBvh,
+        rest_correct: bool,
     ) -> Result<velomocap_motion::PreparedBvh, String> {
         let mut prepared = bvh.clone();
-        if self.export_rig != velomocap_motion::retarget::Rig::Biped || self.export_rest_correct {
-            velomocap_motion::retarget::rewrite(
-                &mut prepared,
-                self.export_rig,
-                self.export_rest_correct,
-            )
-            .map_err(|error| format!("{error:#}"))?;
+        if self.export_rig != velomocap_motion::retarget::Rig::Biped || rest_correct {
+            velomocap_motion::retarget::rewrite(&mut prepared, self.export_rig, rest_correct)
+                .map_err(|error| format!("{error:#}"))?;
         }
         Ok(prepared)
     }
@@ -777,7 +779,12 @@ impl VeloMocap {
             return;
         };
         let path = video.with_extension("fbx");
-        let prepared = match self.export_payload(&clip.bvh) {
+        if self.export_rest_correct {
+            self.log(
+                "FBX: the file carries its own bind pose, so the rest correction is applied to BVH exports only.",
+            );
+        }
+        let prepared = match self.export_payload(&clip.bvh, false) {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.error = Some(error);
@@ -812,7 +819,7 @@ impl VeloMocap {
             .cloned()
         {
             let path = video.with_extension("bvh");
-            let prepared = match self.export_payload(&clip.bvh) {
+            let prepared = match self.export_payload(&clip.bvh, self.export_rest_correct) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     self.error = Some(error);
