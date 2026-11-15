@@ -145,8 +145,38 @@ impl ContactTracks {
     }
 
     /// JSON text of the document.
+    ///
+    /// Hand-built rather than `serde`'s pretty printer, which puts every frame
+    /// number on its own line: one track per line is what a lock document has to
+    /// look like if anyone is going to edit one by hand (`--dump-locks` writes
+    /// one, `--locks` reads it back).
     pub fn to_json(&self, frames: usize, fps: f64) -> String {
-        serde_json::to_string_pretty(&self.document(frames, fps)).unwrap_or_else(|_| "{}".into())
+        let mut out = String::from("{\n");
+        out.push_str(&format!("  \"version\": {LOCK_VERSION},\n"));
+        out.push_str(&format!("  \"frames\": {frames},\n"));
+        out.push_str(&format!("  \"fps\": {fps},\n"));
+        out.push_str("  \"tracks\": [\n");
+        for (index, track) in self.tracks.iter().enumerate() {
+            if index > 0 {
+                out.push_str(",\n");
+            }
+            out.push_str("    ");
+            match track {
+                None => out.push_str("null"),
+                Some(list) => {
+                    out.push('[');
+                    for (slot, [start, end]) in list.iter().enumerate() {
+                        if slot > 0 {
+                            out.push_str(", ");
+                        }
+                        out.push_str(&format!("[{start}, {end}]"));
+                    }
+                    out.push(']');
+                }
+            }
+        }
+        out.push_str("\n  ]\n}\n");
+        out
     }
 
     /// Read a saved document and check it belongs to this clip.
@@ -299,8 +329,7 @@ mod tests {
     /// A saved document round-trips, and one saved for another clip is refused
     /// with the note the interface shows instead of applying stale locks.
     #[test]
-    fn the_document_is_tied_to_its_clip() {
-        let mut locks = ContactTracks::seeded(
+    fn the_document_is_tied_to_its_clip() {        let mut locks = ContactTracks::seeded(
             [[[0, 10], [20, 30]], [[5, 6], [40, 44]]],
             [vec![[1, 2]], vec![]],
         );
@@ -316,6 +345,26 @@ mod tests {
         let error = ContactTracks::from_json(&text, 50, 25.0).expect_err("fps moved");
         assert!(error.contains("30.000"), "unhelpful note: {error}");
         assert!(ContactTracks::from_json("not json", 50, 30.0).is_err());
+    }
+
+    /// The document has to stay editable by hand: one track per line, intervals
+    /// compact, and it still parses back to the same thing.
+    #[test]
+    fn the_document_is_one_line_per_track() {
+        let mut locks = ContactTracks::automatic();
+        locks.set_track(LEFT_FOOT, vec![[0, 8], [12, 20]]);
+        locks.set_track(RIGHT_HAND, vec![[4, 6]]);
+        let text = locks.to_json(48, 24.0);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            11,
+            "four keys, four tracks, and the brackets:\n{text}"
+        );
+        assert!(lines[5].contains("[[0, 8], [12, 20]]"), "{}", lines[5]);
+        assert_eq!(lines[6].trim(), "null,", "an untouched track stays null");
+        assert!(lines[8].contains("[[4, 6]]"), "{}", lines[8]);
+        assert_eq!(ContactTracks::from_json(&text, 48, 24.0).unwrap(), locks);
     }
 
     #[test]

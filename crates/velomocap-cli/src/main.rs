@@ -188,6 +188,25 @@ enum Command {
         /// Write the generated motion as binary FBX 7.4 as well.
         #[arg(long)]
         fbx: Option<PathBuf>,
+        /// Bone naming for the export: biped (default), mixamo, mixamo-prefixed,
+        /// vrm, unreal, daz or mmd.
+        #[arg(long, default_value = "biped")]
+        rig: String,
+        /// Re-express the exported rotations in the canonical T-pose bind. On by
+        /// default for the rigs that bind in it; BVH only (an FBX carries its own
+        /// bind).
+        #[arg(long)]
+        rest_correct: bool,
+        /// Keep the clip's own rest even for a rig that binds in the T-pose.
+        #[arg(long)]
+        no_rest_correct: bool,
+        /// Apply hand-drawn contact timing (the app's `<video>.locks.json`).
+        #[arg(long)]
+        locks: Option<PathBuf>,
+        /// Write the contact runs the detector found as an editable lock document,
+        /// then reuse it with --locks.
+        #[arg(long)]
+        dump_locks: Option<PathBuf>,
         /// Write the first generated frame's skinned vertices (f32 LE, 6890x3).
         #[arg(long)]
         dump_mesh: Option<PathBuf>,
@@ -409,6 +428,22 @@ struct BenchRow {
     detail: String,
 }
 
+/// How the generated clip is written out: the bone vocabulary, and whether the
+/// rotations are re-expressed in the canonical T-pose bind.
+#[derive(Clone, Copy)]
+struct ExportChoice {
+    rig: velomocap_motion::retarget::Rig,
+    /// `None` = pick by rig: on for the T-pose binds, off for biped/Unreal/MMD.
+    rest_correct: Option<bool>,
+}
+
+impl ExportChoice {
+    fn rest_correct(self) -> bool {
+        self.rest_correct.unwrap_or_else(|| {
+            self.rig != velomocap_motion::retarget::Rig::Biped && self.rig.binds_in_t_pose()
+        })
+    }
+}
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Info => {
@@ -489,6 +524,11 @@ fn main() -> Result<()> {
             person,
             bvh,
             fbx,
+            rig,
+            rest_correct,
+            no_rest_correct,
+            locks,
+            dump_locks,
             dump_mesh,
             dump_joints,
             dump_rotations,
@@ -518,7 +558,12 @@ fn main() -> Result<()> {
             zero_noise,
             dump,
             cpu,
-        } => flow_report(
+        } => {
+            // A typo in the lock path should not cost a full reconstruction.
+            if let Some(path) = locks.as_deref() {
+                anyhow::ensure!(path.is_file(), "{} does not exist", path.display());
+            }
+            flow_report(
             &video,
             &detector,
             &sam3d,
@@ -531,6 +576,19 @@ fn main() -> Result<()> {
             person,
             bvh.as_deref(),
             fbx.as_deref(),
+            ExportChoice {
+                rig: velomocap_motion::retarget::Rig::from_slug(&rig)
+                    .with_context(|| format!("unknown rig {rig:?}; try biped, mixamo, mixamo-prefixed, vrm, unreal, daz or mmd"))?,
+                rest_correct: if rest_correct {
+                    Some(true)
+                } else if no_rest_correct {
+                    Some(false)
+                } else {
+                    None
+                },
+            },
+            locks.as_deref(),
+            dump_locks.as_deref(),
             dump_mesh.as_deref(),
             dump_joints.as_deref(),
             dump_rotations.as_deref(),
@@ -560,7 +618,8 @@ fn main() -> Result<()> {
             zero_noise,
             dump.as_deref(),
             !cpu,
-        ),
+        )
+        },
         Command::SamTorch { weights, cpu } => sam_torch_report(&weights, !cpu),
         Command::SamFullTorch {
             weights,
@@ -1128,6 +1187,11 @@ fn flow_report(
     person: usize,
     bvh: Option<&std::path::Path>,
     fbx: Option<&std::path::Path>,
+    export: ExportChoice,
+    // Hand-drawn contact timing to apply, in the app's lock-document format.
+    locks: Option<&std::path::Path>,
+    // Where to write the contact runs the detector found, as an editable lock document.
+    dump_locks: Option<&std::path::Path>,
     dump_mesh: Option<&std::path::Path>,
     dump_joints: Option<&std::path::Path>,
     dump_rotations: Option<&std::path::Path>,
@@ -1364,6 +1428,40 @@ fn flow_report(
         mesh_sole: !joint_sole,
         smoothing,
     };
+    // Hand-drawn contact timing, in the same document the app writes next to a
+    // clip. A document from another clip is reported and dropped rather than
+    // applied to motion it does not describe.
+    let fps = clip.fps as f64;
+    let tracks = match locks {
+        Some(path) => {
+            anyhow::ensure!(path.is_file(), "{} does not exist", path.display());
+            let (tracks, note) = velomocap_motion::ContactTracks::load(path, clip.frames(), fps);
+            match note {
+                Some(note) => println!("locks: {note} (using the detection)"),
+                None if tracks.is_automatic() => {
+                    println!("locks: {} holds no tracks", path.display())
+                }
+                None => println!("locks: {}", lock_summary(&tracks)),
+            }
+            tracks
+        }
+        None => velomocap_motion::ContactTracks::automatic(),
+    };
+    let correction =
+        velomocap_motion::correction::apply_with_locks(&mut clip, &model, &settings, &tracks)?;
+    println!("  {}", correction.line());
+    if let Some(path) = dump_locks {
+        if !settings.enabled {
+            println!("dump-locks: correction is off, so there are no detected runs to write");
+        }
+        let detected = correction.detected_tracks();
+        detected.save(path, clip.frames(), fps)?;
+        println!(
+            "wrote {} (detected runs: {})",
+            path.display(),
+            lock_summary(&detected)
+        );
+    }
     let correction = velomocap_motion::correction::apply(&mut clip, &model, &settings)?;
     println!("  {}", correction.line());
 
@@ -1438,28 +1536,66 @@ fn flow_report(
         }
     }
     if let Some(path) = bvh {
-        let report = velomocap_motion::write_clip_bvh(path, &clip, &model, clip.fps as f64)?;
+        let rest_correct = export.rest_correct();
+        let prepared = velomocap_motion::prepare_bvh_for(
+            &clip,
+            &model,
+            clip.fps as f64,
+            export.rig,
+            rest_correct,
+        )?;
+        let report = velomocap_motion::write_prepared(path, &prepared)?;
         println!(
-            "wrote {} ({} frames at {:.1} fps, {} bones, order {})",
+            "wrote {} ({} frames at {:.1} fps, {} bones, order {}, {}{})",
             path.display(),
             clip.frames(),
             clip.fps,
             model.num_joints,
-            report.orders.first().cloned().unwrap_or_default()
+            report.orders.first().cloned().unwrap_or_default(),
+            export.rig.label(),
+            if rest_correct { ", rest corrected" } else { "" }
         );
     }
     if let Some(path) = fbx {
-        let prepared = velomocap_motion::prepare_bvh(&clip, &model, clip.fps as f64)?;
+        // An FBX states its own bind (ours), so the rest correction belongs to
+        // the BVH; and the writer keeps bone names ASCII, which rules out MMD.
+        anyhow::ensure!(
+            export.rig.ascii_names(),
+            "{} bone names are not ASCII; the FBX writer needs ASCII names. Export BVH instead.",
+            export.rig.label()
+        );
+        if export.rest_correct() {
+            println!("fbx: the file carries its own bind pose, so the rest correction stays with the BVH");
+        }
+        let prepared =
+            velomocap_motion::prepare_bvh_for(&clip, &model, clip.fps as f64, export.rig, false)?;
         let report = velomocap_motion::write_prepared_fbx(path, &prepared)?;
         println!(
-            "wrote {} (binary FBX, {} bones, {} keys, stop tick {})",
+            "wrote {} (binary FBX, {} bones, {} keys, stop tick {}, {})",
             path.display(),
             report.bones,
             report.key_count,
-            report.stop_tick
+            report.stop_tick,
+            export.rig.label()
         );
     }
     Ok(())
+}
+
+/// `L foot 3 · R foot 2 · L hand auto · R hand auto`, for the CLI log lines.
+fn lock_summary(tracks: &velomocap_motion::ContactTracks) -> String {
+    if tracks.is_automatic() {
+        return "automatic".to_string();
+    }
+    let mut parts = Vec::new();
+    for (index, count) in tracks.counts().iter().enumerate() {
+        let label = velomocap_motion::TRACK_LABELS[index];
+        parts.push(match count {
+            Some(count) => format!("{label} {count}"),
+            None => format!("{label} auto"),
+        });
+    }
+    parts.join(" · ")
 }
 
 /// Read a camera track written by `velomocap-cli camera --json`.
@@ -2431,6 +2567,3 @@ fn bench(frames: usize, repeat: usize, json: Option<PathBuf>) -> Result<()> {
     }
     Ok(())
 }
-
-
-

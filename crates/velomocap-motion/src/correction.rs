@@ -237,9 +237,26 @@ pub struct CorrectionReport {
     pub jitter_after: f32,
     /// The pass was rolled back because it made the clip jumpier.
     pub skipped: bool,
+    /// The contact runs the detector found, per track (L foot, R foot, L hand,
+    /// R hand). Empty for a limb it found nothing on, and for a limb whose track
+    /// was hand-drawn — this is the editor's "automatic" baseline, and what
+    /// `--dump-locks` writes out so the runs can be edited and fed back.
+    pub detected: [Vec<[usize; 2]>; crate::locks::TRACK_COUNT],
 }
 
 impl CorrectionReport {
+    /// The detected runs as a `ContactTracks` document: a track with runs becomes
+    /// manual with those runs, a track without stays automatic.
+    pub fn detected_tracks(&self) -> crate::locks::ContactTracks {
+        let mut tracks = crate::locks::ContactTracks::automatic();
+        for (index, runs) in self.detected.iter().enumerate() {
+            if !runs.is_empty() {
+                tracks.set_track(index, runs.clone());
+            }
+        }
+        tracks
+    }
+
     pub fn line(&self) -> String {
         let mut out = format!(
             "correction: {} foot contacts, {} hand contacts, {} IK frames, max shift {:.3} m, hand residual {:.1} mm, ground {:+.3} m, pelvis lift {:.3} m, jitter {:.1}->{:.1} mm",
@@ -1500,6 +1517,10 @@ fn foot_lock(
             Some(runs) => runs.clone(),
             None => contact_runs(&contact, thresholds.min_run),
         };
+        if manual.is_none() {
+            // The editor's baseline: what detection found, before any drawing.
+            report.detected[foot_index] = runs.iter().map(|(a, b)| [*a, *b]).collect();
+        }
         if runs.is_empty() {
             continue;
         }
@@ -1669,11 +1690,15 @@ fn hand_lock(
         };
         // Tracks 2 and 3 are the hands, in the same order as the feet
         // (`flow_correction.py` splits `ranges[2:]` off for `apply_hands`).
-        let runs = match locks.runs(crate::locks::LEFT_HAND + hand_index, count)
-        {
-            Some(runs) => runs,
+        let manual = locks.runs(crate::locks::LEFT_HAND + hand_index, count);
+        let runs = match &manual {
+            Some(runs) => runs.clone(),
             None => planned.runs[hand_index].clone(),
         };
+        if manual.is_none() {
+            report.detected[crate::locks::LEFT_HAND + hand_index] =
+                runs.iter().map(|(a, b)| [*a, *b]).collect();
+        }
         for (begin, end) in runs.iter().cloned() {
             let mut columns = [Vec::new(), Vec::new(), Vec::new()];
             for index in begin..end {
