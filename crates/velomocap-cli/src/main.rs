@@ -209,6 +209,9 @@ enum Command {
         /// Skip the contact IK on the legs (root correction only).
         #[arg(long)]
         no_leg_ik: bool,
+        /// Temporal smoothing weight (0 = off, smaller is stronger).
+        #[arg(long, default_value_t = 1e-3)]
+        smooth: f64,
         /// Lock preset: tight, normal or loose.
         #[arg(long, default_value = "normal")]
         lock_preset: String,
@@ -482,6 +485,7 @@ fn main() -> Result<()> {
             no_foot,
             no_hand,
             no_leg_ik,
+            smooth,
             lock_preset,
             lock_mode,
             floor,
@@ -520,6 +524,7 @@ fn main() -> Result<()> {
             no_foot,
             no_hand,
             no_leg_ik,
+            smooth,
             &lock_preset,
             &lock_mode,
             floor,
@@ -1113,6 +1118,7 @@ fn flow_report(
     no_foot: bool,
     no_hand: bool,
     no_leg_ik: bool,
+    smoothing: f64,
     lock_preset: &str,
     lock_mode: &str,
     floor: f32,
@@ -1334,6 +1340,7 @@ fn flow_report(
         floor,
         pelvis_offset: pelvis,
         leg_ik: !no_leg_ik,
+        smoothing,
     };
     let correction = velomocap_motion::correction::apply(&mut clip, &model, &settings)?;
     println!("  {}", correction.line());

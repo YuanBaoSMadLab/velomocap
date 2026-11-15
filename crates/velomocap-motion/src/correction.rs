@@ -84,6 +84,10 @@ pub struct CorrectionSettings {
     pub floor: f32,
     /// Vertical shift applied to the whole clip.
     pub pelvis_offset: f32,
+    /// Temporal smoothing weight applied before the contact passes. Smaller is
+    /// stronger (0 turns it off); 1e-3 removes the network's per-frame noise
+    /// while keeping a 0.5 s arm swing intact.
+    pub smoothing: f64,
     /// Run the contact IK on the legs. Off by default: the root correction
     /// already settles and pins the feet, while the per-frame IK on hip and knee
     /// measurably increases the joint jitter (74.8 -> 99.6 mm/s^2 on a turning
@@ -102,6 +106,7 @@ impl Default for CorrectionSettings {
             floor: 0.0,
             pelvis_offset: 0.0,
             leg_ik: false,
+            smoothing: 1e-3,
         }
     }
 }
@@ -245,6 +250,15 @@ pub fn apply(
         }
     }
     let thresholds = settings.thresholds();
+
+    // Smooth the network's per-frame noise before the contacts are detected: the
+    // reference plans its root and targets with an acceleration term, and our
+    // FlowHMR output needs the same treatment or a swinging arm moves 10 cm in a
+    // frame. Contacts are then detected on the smoothed motion, so the pins below
+    // stay exact.
+    if settings.smoothing > 0.0 {
+        crate::temporal::smooth(clip, body, settings.smoothing)?;
+    }
 
     // Do no harm: a correction that makes the clip jumpier than the network's own
     // motion is worse than no correction at all, and turning clips are exactly
