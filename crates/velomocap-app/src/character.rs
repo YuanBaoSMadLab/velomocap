@@ -85,9 +85,213 @@ impl Character {
                 .with_context(|| format!("{} is not a readable binary FBX", path.display()))?;
             return Self::from_fbx(&document, name);
         }
+        if extension == "pmx" {
+            return Self::from_pmx(&bytes, name);
+        }
         let gltf = Gltf::parse(&bytes)
             .with_context(|| format!("{} is not a readable glTF/GLB file", path.display()))?;
         gltf.build(name)
+    }
+
+    /// Build a character from a PMX (MMD) model.
+    ///
+    /// PMX has no bind matrices: the rest pose is the bone positions with an
+    /// identity orientation, so each bone's bind is a translation and the skin
+    /// factor is its inverse. That is exactly what MMD's own skinning does.
+    fn from_pmx(bytes: &[u8], name: String) -> Result<Self> {
+        let mut cursor = Cursor { data: bytes, offset: 0 };
+        anyhow::ensure!(bytes.starts_with(b"PMX "), "not a PMX file");
+        cursor.offset = 4;
+        let _version = cursor.f32();
+        let settings = cursor.u8() as usize;
+        let settings_start = cursor.offset;
+        let encoding = cursor.u8();
+        let extra_uvs = cursor.u8() as usize;
+        let vertex_index_size = cursor.u8() as usize;
+        let _texture_index_size = cursor.u8() as usize;
+        let _material_index_size = cursor.u8() as usize;
+        let bone_index_size = cursor.u8() as usize;
+        let _morph_index_size = cursor.u8() as usize;
+        let _rigidbody_index_size = cursor.u8() as usize;
+        cursor.offset = settings_start + settings;
+        for _ in 0..4 {
+            let _ = cursor.text(encoding);
+        }
+
+        let vertices = cursor.i32();
+        anyhow::ensure!(vertices > 0, "the PMX has no vertices");
+        let mut rest = Vec::with_capacity(vertices as usize * 3);
+        let mut joints: Vec<[u16; 4]> = Vec::with_capacity(vertices as usize);
+        let mut weights: Vec<[f32; 4]> = Vec::with_capacity(vertices as usize);
+        for _ in 0..vertices {
+            rest.push(cursor.f32());
+            rest.push(cursor.f32());
+            rest.push(cursor.f32());
+            for _ in 0..3 {
+                cursor.f32(); // normal
+            }
+            for _ in 0..2 {
+                cursor.f32(); // uv
+            }
+            for _ in 0..extra_uvs * 4 {
+                cursor.f32();
+            }
+            let weight_kind = cursor.u8();
+            let mut vertex_joints = [0u16; 4];
+            let mut vertex_weights = [0.0f32; 4];
+            match weight_kind {
+                0 => {
+                    vertex_joints[0] = cursor.bone_index(bone_index_size) as u16;
+                    vertex_weights[0] = 1.0;
+                }
+                1 => {
+                    vertex_joints[0] = cursor.bone_index(bone_index_size) as u16;
+                    vertex_joints[1] = cursor.bone_index(bone_index_size) as u16;
+                    let first = cursor.f32();
+                    vertex_weights[0] = first;
+                    vertex_weights[1] = 1.0 - first;
+                }
+                2 | 4 => {
+                    for slot in 0..4 {
+                        vertex_joints[slot] = cursor.bone_index(bone_index_size) as u16;
+                    }
+                    for slot in 0..4 {
+                        vertex_weights[slot] = cursor.f32();
+                    }
+                }
+                _ => {
+                    // SDEF: two bones, one weight, then C/R0/R1 spheres.
+                    vertex_joints[0] = cursor.bone_index(bone_index_size) as u16;
+                    vertex_joints[1] = cursor.bone_index(bone_index_size) as u16;
+                    let first = cursor.f32();
+                    vertex_weights[0] = first;
+                    vertex_weights[1] = 1.0 - first;
+                    for _ in 0..9 {
+                        cursor.f32();
+                    }
+                }
+            }
+            cursor.f32(); // edge scale
+            if !vertex_weights.iter().any(|weight| *weight > 0.0) {
+                vertex_weights[0] = 1.0;
+            }
+            joints.push(vertex_joints);
+            weights.push(vertex_weights);
+        }
+
+        let indices = cursor.i32();
+        anyhow::ensure!(indices > 0, "the PMX has no faces");
+        let mut faces = Vec::with_capacity(indices as usize / 3);
+        for _ in 0..indices {
+            let index = match vertex_index_size {
+                1 => cursor.u8() as u32,
+                2 => cursor.u16() as u32,
+                _ => cursor.i32() as u32,
+            };
+            faces.push(index);
+        }
+
+        let textures = cursor.i32();
+        for _ in 0..textures.max(0) {
+            let _ = cursor.text(encoding);
+        }
+        let materials = cursor.i32();
+        for _ in 0..materials.max(0) {
+            for _ in 0..4 {
+                let _ = cursor.text(encoding);
+            }
+            // Diffuse 4, specular 3, specular strength 1, ambient 3.
+            for _ in 0..11 {
+                cursor.f32();
+            }
+            cursor.u8(); // flags
+            for _ in 0..5 {
+                cursor.f32(); // edge colour and size
+            }
+            let _texture = cursor.index(_texture_index_size);
+            let _sphere = cursor.index(_texture_index_size);
+            cursor.u8(); // sphere mode
+            if cursor.u8() == 0 {
+                let _ = cursor.index(_texture_index_size);
+            } else {
+                cursor.u8();
+            }
+            let _ = cursor.text(encoding);
+        }
+
+        let bone_count = cursor.i32();
+        anyhow::ensure!(bone_count > 0, "the PMX has no bones");
+        let mut bones = Vec::with_capacity(bone_count as usize);
+        for _ in 0..bone_count {
+            let bone_name = cursor.text(encoding);
+            let _english = cursor.text(encoding);
+            let position = [cursor.f32(), cursor.f32(), cursor.f32()];
+            let _parent = cursor.index(bone_index_size);
+            let _layer = cursor.i32();
+            let flags = cursor.u16();
+            if flags & 0x0001 != 0 {
+                for _ in 0..3 {
+                    cursor.f32();
+                }
+            }
+            if flags & 0x0002 != 0 {
+                let _ = cursor.index(bone_index_size);
+            }
+            if flags & 0x0100 != 0 {
+                let _ = cursor.index(bone_index_size);
+                cursor.f32();
+            }
+            if flags & 0x0400 != 0 {
+                for _ in 0..3 {
+                    cursor.f32();
+                }
+            }
+            if flags & 0x0800 != 0 {
+                for _ in 0..6 {
+                    cursor.f32();
+                }
+            }
+            if flags & 0x2000 != 0 {
+                cursor.i32();
+            }
+            if flags & 0x0020 != 0 {
+                let _ = cursor.index(bone_index_size);
+                let loops = cursor.i32();
+                cursor.f32();
+                for _ in 0..loops.max(0) {
+                    let _ = cursor.index(bone_index_size);
+                    if cursor.u8() != 0 {
+                        for _ in 0..3 {
+                            cursor.f32();
+                        }
+                    }
+                }
+            }
+            let mut bind_matrix = [0.0f32; 16];
+            bind_matrix[0] = 1.0;
+            bind_matrix[5] = 1.0;
+            bind_matrix[10] = 1.0;
+            bind_matrix[15] = 1.0;
+            bind_matrix[3] = position[0];
+            bind_matrix[7] = position[1];
+            bind_matrix[11] = position[2];
+            bones.push(Bone {
+                canonical: velomocap_motion::retarget::canonicalize(&bone_name),
+                name: bone_name,
+                bind: position,
+                bind_rot: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                inverse_bind: invert(&bind_matrix),
+            });
+        }
+        anyhow::ensure!(
+            faces.len() % 3 == 0,
+            "the PMX face list is not triangles"
+        );
+        let faces: Vec<[u32; 3]> = faces
+            .chunks_exact(3)
+            .map(|face| [face[0], face[1], face[2]])
+            .collect();
+        Ok(finalize(name, bones, rest, joints, weights, faces))
     }
 
     /// Build a character from a parsed FBX: the skin deformer's clusters give the
@@ -340,6 +544,94 @@ impl Character {
             }
         }
         out
+    }
+}
+
+/// A little-endian cursor over a PMX byte stream. PMX has no alignment, so every
+/// field is read in order; a truncated file yields zeros rather than panicking,
+/// and the caller's `anyhow::ensure!` checks catch what that produces.
+struct Cursor<'a> {
+    data: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn take(&mut self, count: usize) -> &'a [u8] {
+        let end = (self.offset + count).min(self.data.len());
+        let slice = &self.data[self.offset.min(end)..end];
+        self.offset = end;
+        slice
+    }
+
+    fn u8(&mut self) -> u8 {
+        self.take(1).first().copied().unwrap_or(0)
+    }
+
+    fn u16(&mut self) -> u16 {
+        let bytes = self.take(2);
+        if bytes.len() < 2 {
+            return 0;
+        }
+        u16::from_le_bytes([bytes[0], bytes[1]])
+    }
+
+    fn i32(&mut self) -> i32 {
+        let bytes = self.take(4);
+        if bytes.len() < 4 {
+            return 0;
+        }
+        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    fn f32(&mut self) -> f32 {
+        f32::from_bits(self.i32() as u32)
+    }
+
+    /// A PMX index of the given width. Width 1 is unsigned, 2 and 4 are signed;
+    /// -1 means "none".
+    fn index(&mut self, width: usize) -> i32 {
+        match width {
+            1 => self.u8() as i32,
+            2 => {
+                let bytes = self.take(2);
+                if bytes.len() < 2 {
+                    return -1;
+                }
+                i16::from_le_bytes([bytes[0], bytes[1]]) as i32
+            }
+            _ => self.i32(),
+        }
+    }
+
+    /// A bone index, where width 1 uses 0xFF for "none".
+    fn bone_index(&mut self, width: usize) -> i32 {
+        if width == 1 {
+            let value = self.u8();
+            if value == 0xFF {
+                return -1;
+            }
+            value as i32
+        } else {
+            self.index(width)
+        }
+    }
+
+    /// A length-prefixed string, UTF-16LE (encoding 0) or UTF-8 (1).
+    fn text(&mut self, encoding: u8) -> String {
+        let length = self.i32();
+        if length <= 0 {
+            return String::new();
+        }
+        let bytes = self.take(length as usize);
+        if encoding == 0 {
+            let units: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        } else {
+            String::from_utf8_lossy(bytes).to_string()
+        }
     }
 }
 
@@ -1112,6 +1404,81 @@ mod tests {
         assert!((weights[0] - 0.5).abs() < 1e-5, "{weights:?}");
         assert!((weights[1] - 0.5).abs() < 1e-5, "{weights:?}");
         // Already 1.75 m tall, so nothing is scaled.
+        assert!((character.scale - 1.0).abs() < 1e-6);
+    }
+
+    /// A minimal PMX: two bones, four vertices (BDEF1), two triangles.
+    fn pmx_sample() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"PMX ");
+        out.extend_from_slice(&2.0f32.to_le_bytes());
+        out.push(8u8);
+        for setting in [1u8, 0, 4, 4, 4, 4, 4, 4] {
+            out.push(setting);
+        }
+        for text in ["model", "model_en", "comment", "comment_en"] {
+            out.extend_from_slice(&(text.len() as i32).to_le_bytes());
+            out.extend_from_slice(text.as_bytes());
+        }
+        let positions = [
+            [0.0f32, 0.0, 0.0],
+            [0.0, 1.75, 0.0],
+            [0.5, 0.0, 0.0],
+            [0.5, 1.75, 0.0],
+        ];
+        out.extend_from_slice(&(positions.len() as i32).to_le_bytes());
+        for position in positions {
+            for value in position {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+            for _ in 0..3 {
+                out.extend_from_slice(&0.0f32.to_le_bytes()); // normal
+            }
+            for _ in 0..2 {
+                out.extend_from_slice(&0.0f32.to_le_bytes()); // uv
+            }
+            out.push(0); // BDEF1
+            out.extend_from_slice(&0i32.to_le_bytes()); // bone 0
+            out.extend_from_slice(&1.0f32.to_le_bytes()); // edge scale
+        }
+        let indices = [0i32, 1, 3, 0, 3, 2];
+        out.extend_from_slice(&(indices.len() as i32).to_le_bytes());
+        for index in indices {
+            out.extend_from_slice(&index.to_le_bytes());
+        }
+        out.extend_from_slice(&0i32.to_le_bytes()); // textures
+        out.extend_from_slice(&0i32.to_le_bytes()); // materials
+        out.extend_from_slice(&2i32.to_le_bytes()); // bones
+        let mut bone = |out: &mut Vec<u8>, name: &str, position: [f32; 3], parent: i32| {
+            for text in [name, ""] {
+                out.extend_from_slice(&(text.len() as i32).to_le_bytes());
+                out.extend_from_slice(text.as_bytes());
+            }
+            for value in position {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+            out.extend_from_slice(&parent.to_le_bytes());
+            out.extend_from_slice(&0i32.to_le_bytes()); // layer
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        };
+        bone(&mut out, "Hips", [0.0, 1.0, 0.0], -1);
+        bone(&mut out, "LeftUpLeg", [0.1, 1.0, 0.0], 0);
+        out
+    }
+
+    #[test]
+    fn a_pmx_model_imports_with_its_bones_and_faces() {
+        let character =
+            Character::from_pmx(&pmx_sample(), "pmx".into()).expect("from_pmx");
+        assert_eq!(character.bones.len(), 2);
+        assert_eq!(character.bones[0].name, "Hips");
+        assert_eq!(character.bones[0].canonical, Some(0));
+        assert_eq!(
+            character.bones[1].canonical,
+            velomocap_motion::retarget::canonicalize("LeftUpLeg")
+        );
+        assert_eq!(character.vertex_count(), 4);
+        assert_eq!(character.faces.len(), 2);
         assert!((character.scale - 1.0).abs() < 1e-6);
     }
 

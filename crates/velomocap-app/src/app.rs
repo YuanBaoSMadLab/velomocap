@@ -562,7 +562,7 @@ impl VeloMocap {
     /// clip, and the choice is saved beside the clip.
     pub fn import_character_dialog(&mut self, person: usize) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("Humanoid character", &["vrm", "glb", "fbx"])
+            .add_filter("Humanoid character", &["vrm", "glb", "fbx", "pmx"])
             .set_title("Import character")
             .pick_file()
         else {
