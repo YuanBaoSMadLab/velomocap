@@ -1,15 +1,37 @@
 //! Contact correction for a generated SMPL-H clip.
 //!
-//! The reference solves this with its motion-correction stage (`foot_contacts`
-//! and `hand_lock`): a planted foot must not slide and a resting hand must stay
-//! put. Without this pass the character skates over the floor.
+//! Ported from NVIDIA Kimodo's `MotionCorrection` (Apache-2.0, see `ik.rs` and
+//! `trajectory.rs` for the individual notices). Coverage against the original:
 //!
-//! * Feet are pinned through Kimodo's trajectory corrector (`k-1`): the contact
-//!   frames are pins, the rest is free, and the velocity/acceleration weights
-//!   keep the root from kinking where a contact run starts. Only X/Z move; the
-//!   vertical placement belongs to the floor solve.
-//! * Hands are pinned with a two-bone IK (the Kimodo solve on the SMPL-H chain),
-//!   then the chain is written back as axis-angle rotations.
+//! | Reference | Here |
+//! | --- | --- |
+//! | `IK::TwoBoneIk`, `IK::OneBoneIk` | `ik::two_bone_ik`, `ik::one_bone_ik` |
+//! | `TrajectoryCorrector` (ADMM) | `trajectory.rs` |
+//! | `CorrectHipsY` | `ground_feet` |
+//! | `CorrectHipsXZ` + `velocity_weights` | `foot_lock`, `velocity_weights` |
+//! | `DoContactIK` + `TargetReachFalloff` | `leg_ik`, `reach_falloff` |
+//! | `PRESETS` (`correction_settings.py`) | `Thresholds` |
+//! | `support_weights` / `support_samples` | `support_weight`, `support_point` |
+//! | `airborne_excursions` | `flight_frames` |
+//! | `rolling_anchor` | `rolling_anchor`, `rolling_path` |
+//! | `couple_anchors` | `couple_anchor_offsets` |
+//! | `smooth_auto_handoffs` / `_hermite` | `smooth_handoffs`, `hermite` |
+//! | `reachable_pelvis_lift` | the capped lift in `leg_ik` |
+//!
+//! `CorrectJointRotations` has no counterpart on purpose: it only moves a bone
+//! whose `fullBodyMask` is set, and the reference's own call passes a mask of
+//! zeros (`RGBMocap/mocap/correction.py` builds `c` from the contact array and
+//! passes `zero` for every body mask), so the function is a no-op in that path.
+//! `DoEffectorIK` is implemented as the position pin in `hand_lock`; its optional
+//! "keep the wrist orientation" branch is not needed because the IK only moves
+//! the shoulder and the elbow.
+//!
+//! * Feet are pinned through the trajectory corrector: the contact frames are
+//!   pins, the rest is free, and the velocity/acceleration weights keep the root
+//!   from kinking where a contact run starts. Only X/Z move; the vertical
+//!   placement belongs to the floor solve.
+//! * Hands are pinned with a two-bone IK on the SMPL-H chain, then the chain is
+//!   written back as axis-angle rotations.
 
 use anyhow::Result;
 
