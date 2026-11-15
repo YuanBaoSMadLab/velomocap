@@ -330,6 +330,9 @@ pub struct VeloMocap {
     /// viewport, the reference's "Import Character". The rest rotations turn a
     /// clip rotation into the delta a character is posed with.
     pub character_rest: Option<Arc<Vec<[f32; 9]>>>,
+    /// The same rest pose's joint positions, which is what tells an imported
+    /// character's bind pose how far it has to swing to match the clip.
+    pub character_rest_positions: Option<Arc<Vec<[f32; 3]>>>,
     /// The person whose character panel is open.
     pub person_panel: Option<usize>,
     /// The saved character map has been applied to the current people.
@@ -477,6 +480,7 @@ impl VeloMocap {
             show_guide: false,
             show_export: false,
             character_rest: None,
+            character_rest_positions: None,
             person_panel: None,
             characters_loaded: false,
             export_format: ExportFormat::Bvh,
@@ -586,7 +590,9 @@ impl VeloMocap {
                     .map(|name| name.to_string())
                     .collect();
                 if self.character_rest.is_none() {
-                    self.character_rest = self.rest_rotations();
+                    let (rotations, positions) = self.rest_pose();
+                    self.character_rest = rotations;
+                    self.character_rest_positions = positions;
                 }
                 self.log(format!(
                     "{}: {} · {bones} bones ({matched} matched), {vertices} vertices{}",
@@ -699,7 +705,9 @@ impl VeloMocap {
             match crate::character::Character::load(&file) {
                 Ok(character) => {
                     if self.character_rest.is_none() {
-                        self.character_rest = self.rest_rotations();
+                        let (rotations, positions) = self.rest_pose();
+                        self.character_rest = rotations;
+                        self.character_rest_positions = positions;
                     }
                     self.people[index].character = Some(AssignedCharacter {
                         path: file,
@@ -711,19 +719,29 @@ impl VeloMocap {
         }
     }
 
-    /// The body model's rest orientation, which turns a clip rotation into the
-    /// delta an imported character is posed with.
-    fn rest_rotations(&self) -> Option<Arc<Vec<[f32; 9]>>> {
-        let body = velomocap_body::BodyModel::load(&self.smplh_model, 16).ok()?;
+    /// The body model's rest orientation and joint positions, which turn a clip
+    /// rotation into the delta an imported character is posed with.
+    fn rest_pose(&self) -> (Option<Arc<Vec<[f32; 9]>>>, Option<Arc<Vec<[f32; 3]>>>) {
+        let Ok(body) = velomocap_body::BodyModel::load(&self.smplh_model, 16) else {
+            return (None, None);
+        };
         let pose = velomocap_body::Pose::neutral(body.num_joints, 16);
         let skeleton = body.forward_joints(&pose);
-        let mut out = Vec::with_capacity(skeleton.rotations.len() / 9);
+        let mut rotations = Vec::with_capacity(skeleton.rotations.len() / 9);
         for joint in 0..skeleton.rotations.len() / 9 {
             let mut rotation = [0.0f32; 9];
             rotation.copy_from_slice(&skeleton.rotations[joint * 9..joint * 9 + 9]);
-            out.push(rotation);
+            rotations.push(rotation);
         }
-        Some(Arc::new(out))
+        let mut positions = Vec::with_capacity(skeleton.positions.len() / 3);
+        for joint in 0..skeleton.positions.len() / 3 {
+            positions.push([
+                skeleton.positions[joint * 3],
+                skeleton.positions[joint * 3 + 1],
+                skeleton.positions[joint * 3 + 2],
+            ]);
+        }
+        (Some(Arc::new(rotations)), Some(Arc::new(positions)))
     }
 
     pub fn open_video_dialog(&mut self) {        let Some(path) = rfd::FileDialog::new()

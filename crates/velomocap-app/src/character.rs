@@ -23,6 +23,9 @@ pub struct Bone {
     pub name: String,
     /// Canonical bone index (0..52), when the name resolves.
     pub canonical: Option<usize>,
+    /// Nearest ancestor that is one of this character's bones. The hierarchy is
+    /// what lets a bone's joint carry its children along.
+    pub parent: Option<usize>,
     /// Bind-pose world position.
     pub bind: [f32; 3],
     /// Bind-pose world rotation, row-major 3×3.
@@ -36,6 +39,8 @@ pub struct Bone {
 pub struct Character {
     pub name: String,
     pub bones: Vec<Bone>,
+    /// Bone indices, parents before children.
+    pub order: Vec<usize>,
     /// Bind-pose vertices, xyz.
     pub rest: Vec<f32>,
     /// Four joint indices and weights per vertex.
@@ -226,7 +231,7 @@ impl Character {
             let bone_name = cursor.text(encoding);
             let _english = cursor.text(encoding);
             let position = [cursor.f32(), cursor.f32(), cursor.f32()];
-            let _parent = cursor.index(bone_index_size);
+            let parent = cursor.index(bone_index_size);
             let _layer = cursor.i32();
             let flags = cursor.u16();
             if flags & 0x0001 != 0 {
@@ -278,6 +283,11 @@ impl Character {
             bones.push(Bone {
                 canonical: velomocap_motion::retarget::canonicalize(&bone_name),
                 name: bone_name,
+                parent: if parent >= 0 && parent < bone_count {
+                    Some(parent as usize)
+                } else {
+                    None
+                },
                 bind: position,
                 bind_rot: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
                 inverse_bind: invert(&bind_matrix),
@@ -365,6 +375,7 @@ impl Character {
         let mut vertex_count = positions.len() / 3;
         let mut per_vertex: Vec<Vec<(usize, f32)>> = vec![Vec::new(); vertex_count];
         let mut bones: Vec<Bone> = Vec::new();
+        let mut bone_models: Vec<i64> = Vec::new();
         for node in objects.children_named("Deformer") {
             if node.str_at(2) != Some("Cluster") {
                 continue;
@@ -397,9 +408,11 @@ impl Character {
             let bind_matrix = transpose4(&matrix);
             let bone_name = model_names.get(&bone_id).cloned().unwrap_or_default();
             let slot = bones.len();
+            bone_models.push(bone_id);
             bones.push(Bone {
                 canonical: velomocap_motion::retarget::canonicalize(&bone_name),
                 name: bone_name,
+                parent: None,
                 bind: translation_of(&bind_matrix),
                 bind_rot: rotation_of(&bind_matrix),
                 inverse_bind: invert(&bind_matrix),
@@ -421,6 +434,34 @@ impl Character {
             }
         }
         anyhow::ensure!(!bones.is_empty(), "the skin has no clusters");
+
+        // The bone hierarchy is in the `OO` connections: each Model names the
+        // Model it hangs from. Walk up until the parent is a bone of this skin.
+        let mut slot_of: HashMap<i64, usize> = HashMap::new();
+        for (slot, id) in bone_models.iter().enumerate() {
+            slot_of.entry(*id).or_insert(slot);
+        }
+        for slot in 0..bones.len() {
+            let mut child = bone_models[slot];
+            for _ in 0..model_names.len().max(1) {
+                let Some((_, _, next)) = connections
+                    .iter()
+                    .find(|(kind, id, _)| kind == "OO" && *id == child)
+                else {
+                    break;
+                };
+                if let Some(parent) = slot_of.get(next) {
+                    if *parent != slot {
+                        bones[slot].parent = Some(*parent);
+                    }
+                    break;
+                }
+                if !model_names.contains_key(next) {
+                    break;
+                }
+                child = *next;
+            }
+        }
 
         let mut rest: Vec<f32> = Vec::with_capacity(vertex_count * 3);
         for value in &positions {
@@ -473,6 +514,7 @@ impl Character {
         &self,
         world: &[[f32; 9]],
         rest: &[[f32; 9]],
+        rest_positions: &[[f32; 3]],
         names: &[String],
         translation: [f32; 3],
     ) -> Vec<f32> {
@@ -489,27 +531,68 @@ impl Character {
                 }
             }
         }
-        // Skin matrix per bone: rotate its bind orientation by the clip's own
-        // world-space change, then undo the bind pose.
+        // How far the clip has turned each bone from its own rest pose.
+        let mut delta = [identity(); 52];
+        let mut mapped = [false; 52];
+        for canonical in 0..52 {
+            let joint = joint_of[canonical];
+            if joint == usize::MAX || joint >= world.len() || joint >= rest.len() {
+                continue;
+            }
+            delta[canonical] = multiply(&world[joint], &transpose(&rest[joint]));
+            mapped[canonical] = true;
+        }
+        let swing = self.bind_swing(&joint_of, rest_positions);
+        // Walk parents first: each bone's world rotation is the clip's own delta
+        // for that joint, and its pivot follows its parent's motion. Without the
+        // second half a raised arm would rotate about the bind elbow.
+        let mut effective = vec![identity(); self.bones.len()];
+        let mut position = vec![[0.0f32; 3]; self.bones.len()];
         let mut skin = vec![[0.0f32; 16]; self.bones.len()];
-        for (index, bone) in self.bones.iter().enumerate() {
+        for &index in &self.order {
+            let bone = &self.bones[index];
+            let carried = bone
+                .parent
+                .map(|parent| effective[parent])
+                .unwrap_or_else(identity);
             let rotation = match bone.canonical {
-                Some(canonical) if joint_of[canonical] != usize::MAX => {
-                    let joint = joint_of[canonical];
-                    let delta = multiply(&world[joint], &transpose(&rest[joint]));
-                    multiply(&delta, &bone.bind_rot)
+                Some(canonical) if mapped[canonical] => {
+                    multiply(&delta[canonical], &swing[index])
                 }
-                _ => bone.bind_rot,
+                // A bone the clip cannot drive rides with its parent.
+                _ => carried,
             };
-            // M = [R | translation + bind] * inverse_bind
-            let at = bone.bind;
-            let mut world_matrix = [
-                rotation[0], rotation[1], rotation[2], at[0] + translation[0],
-                rotation[3], rotation[4], rotation[5], at[1] + translation[1],
-                rotation[6], rotation[7], rotation[8], at[2] + translation[2],
-                0.0, 0.0, 0.0, 1.0,
-            ];
-            world_matrix = multiply4(&world_matrix, &bone.inverse_bind);
+            let at = match bone.parent {
+                Some(parent) => {
+                    let from = self.bones[parent].bind;
+                    let mut at = position[parent];
+                    for axis in 0..3 {
+                        for axis_in in 0..3 {
+                            at[axis] += carried[axis * 3 + axis_in]
+                                * (bone.bind[axis_in] - from[axis_in]);
+                        }
+                    }
+                    at
+                }
+                None => [
+                    bone.bind[0] + translation[0],
+                    bone.bind[1] + translation[1],
+                    bone.bind[2] + translation[2],
+                ],
+            };
+            effective[index] = rotation;
+            position[index] = at;
+            let rotation = multiply(&rotation, &bone.bind_rot);
+            // M = [R | pivot] * inverse_bind
+            let world_matrix = multiply4(
+                &[
+                    rotation[0], rotation[1], rotation[2], at[0],
+                    rotation[3], rotation[4], rotation[5], at[1],
+                    rotation[6], rotation[7], rotation[8], at[2],
+                    0.0, 0.0, 0.0, 1.0,
+                ],
+                &bone.inverse_bind,
+            );
             skin[index] = world_matrix;
         }
         let mut out = vec![0.0f32; self.rest.len()];
@@ -544,6 +627,88 @@ impl Character {
             }
         }
         out
+    }
+
+    /// The rotation that takes each bone from its bind direction to the clip's
+    /// rest direction, so a character bound in an A-pose plays the clip's angles
+    /// instead of keeping its own.
+    ///
+    /// A bone's direction is the segment to its first child, which is exactly
+    /// what that joint's rotation swings; the clip's rest comes from the body
+    /// model's neutral pose. Bones whose bind already matches, or whose angle is
+    /// too large to be a bind-pose difference, are left alone.
+    fn bind_swing(&self, joint_of: &[usize; 52], rest_positions: &[[f32; 3]]) -> Vec<[f32; 9]> {
+        use velomocap_motion::retarget::PARENTS;
+        let mut swing = vec![identity(); self.bones.len()];
+        let mut primary = [usize::MAX; 52];
+        for (child, parent) in PARENTS.iter().enumerate() {
+            let Some(parent) = parent else {
+                continue;
+            };
+            let parent = *parent as usize;
+            if parent < primary.len() && primary[parent] == usize::MAX {
+                primary[parent] = child;
+            }
+        }
+        let mut slot_of = [usize::MAX; 52];
+        for (slot, bone) in self.bones.iter().enumerate() {
+            if let Some(canonical) = bone.canonical {
+                if slot_of[canonical] == usize::MAX {
+                    slot_of[canonical] = slot;
+                }
+            }
+        }
+        for (slot, bone) in self.bones.iter().enumerate() {
+            let Some(canonical) = bone.canonical else {
+                continue;
+            };
+            let Some(child) = primary.get(canonical).copied() else {
+                continue;
+            };
+            if child == usize::MAX {
+                continue;
+            }
+            let child_slot = slot_of.get(child).copied().unwrap_or(usize::MAX);
+            if child_slot == usize::MAX {
+                continue;
+            }
+            let (joint, child_joint) = (joint_of[canonical], joint_of[child]);
+            if joint == usize::MAX || child_joint == usize::MAX {
+                continue;
+            }
+            if joint >= rest_positions.len() || child_joint >= rest_positions.len() {
+                continue;
+            }
+            let Some(bind_dir) = unit([
+                self.bones[child_slot].bind[0] - bone.bind[0],
+                self.bones[child_slot].bind[1] - bone.bind[1],
+                self.bones[child_slot].bind[2] - bone.bind[2],
+            ]) else {
+                continue;
+            };
+            let Some(rest_dir) = unit([
+                rest_positions[child_joint][0] - rest_positions[joint][0],
+                rest_positions[child_joint][1] - rest_positions[joint][1],
+                rest_positions[child_joint][2] - rest_positions[joint][2],
+            ]) else {
+                continue;
+            };
+            let cosine = bind_dir[0] * rest_dir[0]
+                + bind_dir[1] * rest_dir[1]
+                + bind_dir[2] * rest_dir[2];
+            // Already the same direction: nothing to swing.
+            if cosine > 0.9995 {
+                continue;
+            }
+            // Past 110° this is a different rig convention, not a bind pose.
+            if cosine < -0.342 {
+                continue;
+            }
+            if let Some(rotation) = rotation_between(bind_dir, rest_dir) {
+                swing[slot] = rotation;
+            }
+        }
+        swing
     }
 }
 
@@ -680,9 +845,11 @@ fn finalize(
             bone.inverse_bind = invert(&bind_matrix);
         }
     }
+    let order = hierarchy_order(&bones);
     Character {
         name,
         bones,
+        order,
         rest,
         joints,
         weights,
@@ -691,7 +858,76 @@ fn finalize(
     }
 }
 
+/// Parents before children, so one pass can carry each joint's motion down the
+/// chain. A malformed file with a cycle keeps the remaining bones in file order.
+fn hierarchy_order(bones: &[Bone]) -> Vec<usize> {
+    let mut order = Vec::with_capacity(bones.len());
+    let mut placed = vec![false; bones.len()];
+    while order.len() < bones.len() {
+        let before = order.len();
+        for (index, bone) in bones.iter().enumerate() {
+            if placed[index] {
+                continue;
+            }
+            let ready = match bone.parent {
+                Some(parent) => parent < bones.len() && placed[parent],
+                None => true,
+            };
+            if ready {
+                placed[index] = true;
+                order.push(index);
+            }
+        }
+        if order.len() == before {
+            for (index, done) in placed.iter_mut().enumerate() {
+                if !*done {
+                    *done = true;
+                    order.push(index);
+                }
+            }
+        }
+    }
+    order
+}
+
 fn transpose(m: &[f32; 9]) -> [f32; 9] {    [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]]
+}
+
+fn identity() -> [f32; 9] {
+    [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+}
+
+fn unit(v: [f32; 3]) -> Option<[f32; 3]> {
+    let length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if length < 1e-6 {
+        return None;
+    }
+    Some([v[0] / length, v[1] / length, v[2] / length])
+}
+
+/// The smallest rotation that takes `from` onto `to`; both must be unit vectors.
+fn rotation_between(from: [f32; 3], to: [f32; 3]) -> Option<[f32; 9]> {
+    let cross = [
+        from[1] * to[2] - from[2] * to[1],
+        from[2] * to[0] - from[0] * to[2],
+        from[0] * to[1] - from[1] * to[0],
+    ];
+    let sine = (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
+    let cosine = from[0] * to[0] + from[1] * to[1] + from[2] * to[2];
+    if sine < 1e-6 {
+        // Parallel, or exactly opposite with no axis to pick.
+        return if cosine > 0.0 { Some(identity()) } else { None };
+    }
+    let angle = sine.atan2(cosine);
+    let axis = [cross[0] / sine, cross[1] / sine, cross[2] / sine];
+    let (sine, cosine) = angle.sin_cos();
+    let t = 1.0 - cosine;
+    let [x, y, z] = axis;
+    Some([
+        t * x * x + cosine, t * x * y - sine * z, t * x * z + sine * y,
+        t * x * y + sine * z, t * y * y + cosine, t * y * z - sine * x,
+        t * x * z - sine * y, t * y * z + sine * x, t * z * z + cosine,
+    ])
 }
 
 fn multiply(a: &[f32; 9], b: &[f32; 9]) -> [f32; 9] {
@@ -822,10 +1058,45 @@ impl Gltf {
                     .and_then(|node| node.get("name"))
                     .and_then(|name| name.as_str())
                     .and_then(velomocap_motion::retarget::canonicalize),
+                parent: None,
                 bind: translation_of(&bind_matrix),
                 bind_rot: rotation_of(&bind_matrix),
                 inverse_bind,
             });
+        }
+
+        // The joint hierarchy is the node tree: a joint's parent is its nearest
+        // ancestor that is also a joint of this skin.
+        let mut node_parent: Vec<Option<usize>> = vec![None; nodes.len()];
+        for (index, node) in nodes.iter().enumerate() {
+            if let Some(children) = node.get("children").and_then(|value| value.as_array()) {
+                for child in children {
+                    if let Some(child) = child.as_u64() {
+                        if let Some(slot) = node_parent.get_mut(child as usize) {
+                            *slot = Some(index);
+                        }
+                    }
+                }
+            }
+        }
+        let mut slot_of_node: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for (slot, node) in joint_nodes.iter().enumerate() {
+            slot_of_node.entry(*node).or_insert(slot);
+        }
+        for (slot, node) in joint_nodes.iter().enumerate() {
+            let mut current = node_parent.get(*node).copied().flatten();
+            for _ in 0..nodes.len().max(1) {
+                let Some(parent) = current else {
+                    break;
+                };
+                if let Some(found) = slot_of_node.get(&parent) {
+                    if *found != slot {
+                        bones[slot].parent = Some(*found);
+                    }
+                    break;
+                }
+                current = node_parent.get(parent).copied().flatten();
+            }
         }
 
         // Every skinned primitive becomes triangles in one buffer.
@@ -1267,6 +1538,52 @@ mod tests {
             lo,
             character.unmatched()
         );
+        // What the pose fix depends on: a hierarchy to carry motion down, and
+        // the limb angles it has to swing away. A T-pose arm is level, an A-pose
+        // arm sits tens of degrees below it, and that gap is what used to be
+        // added on top of the clip's own rotation.
+        let rooted = character.bones.iter().filter(|bone| bone.parent.is_some()).count();
+        eprintln!(
+            "{}: {rooted}/{} bones hang from a parent",
+            character.name,
+            character.bones.len()
+        );
+        let mut slot_of = [usize::MAX; 52];
+        for (slot, bone) in character.bones.iter().enumerate() {
+            if let Some(canonical) = bone.canonical {
+                if slot_of[canonical] == usize::MAX {
+                    slot_of[canonical] = slot;
+                }
+            }
+        }
+        for (label, parent, child) in [
+            ("LeftArm", 7, 8),
+            ("RightArm", 26, 27),
+            ("LeftUpLeg", 44, 45),
+            ("RightUpLeg", 48, 49),
+        ] {
+            let (parent, child) = (slot_of[parent], slot_of[child]);
+            if parent == usize::MAX || child == usize::MAX {
+                continue;
+            }
+            let from = character.bones[parent].bind;
+            let to = character.bones[child].bind;
+            let offset = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+            let length = (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt();
+            if length < 1e-6 {
+                continue;
+            }
+            let below = (offset[1] / length).asin().to_degrees();
+            eprintln!(
+                "  {label}: {:.0}° below level, {:.3} m, from {:?} ({}) to {:?} ({})",
+                below.abs(),
+                length,
+                from,
+                character.bones[parent].name,
+                to,
+                character.bones[child].name,
+            );
+        }
         assert!(character.vertex_count() > 0);
     }
 
@@ -1506,14 +1823,107 @@ mod tests {
         let character = Gltf::parse(&bytes).unwrap().build("sample".into()).unwrap();
         let world = vec![neutral(); 52];
         let rest = vec![neutral(); 52];
+        let rest_positions = vec![[0.0f32; 3]; 52];
         // Only Hips (canonical 0) is named, and it is SMPL-H joint 0.
         let mut names = vec![String::new(); 52];
         names[0] = "Hips".to_string();
-        let posed = character.pose(&world, &rest, &names, [0.0, 1.0, 0.0]);
+        let posed = character.pose(&world, &rest, &rest_positions, &names, [0.0, 1.0, 0.0]);
         // Vertex 0 is fully weighted to Hips, whose bind position is the origin.
         assert!((posed[1] - 1.0).abs() < 1e-5, "{posed:?}");
         // The translation is global: a vertex weighted to the other bone moves
         // with the character too.
         assert!((posed[4] - 1.0).abs() < 1e-5, "{posed:?}");
+    }
+
+    /// A hand-built character: `bind` sits where the bone is in the file, the
+    /// inverse bind undoes it.
+    fn bound(name: &str, canonical: usize, parent: Option<usize>, bind: [f32; 3]) -> Bone {
+        let matrix = [
+            1.0, 0.0, 0.0, bind[0],
+            0.0, 1.0, 0.0, bind[1],
+            0.0, 0.0, 1.0, bind[2],
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        Bone {
+            name: name.to_string(),
+            canonical: Some(canonical),
+            parent,
+            bind,
+            bind_rot: identity(),
+            inverse_bind: invert(&matrix),
+        }
+    }
+
+    fn handmade(bones: Vec<Bone>, rest: Vec<f32>) -> Character {
+        let order = hierarchy_order(&bones);
+        let count = rest.len() / 3;
+        Character {
+            name: "handmade".to_string(),
+            bones,
+            order,
+            rest,
+            joints: vec![[0, 0, 0, 0]; count],
+            weights: vec![[1.0, 0.0, 0.0, 0.0]; count],
+            faces: Vec::new(),
+            scale: 1.0,
+        }
+    }
+
+    /// A joint's pivot must travel with its parent: when the hips turn, the leg
+    /// swings around the hips, not around the place the leg was bound at.
+    #[test]
+    fn a_child_joint_swings_around_its_parent() {
+        let bones = vec![
+            bound("Hips", 0, None, [0.0, 0.0, 0.0]),
+            bound("LeftUpLeg", 44, Some(0), [0.0, -1.0, 0.0]),
+        ];
+        // One vertex a metre below the leg joint, fully weighted to the leg.
+        let mut character = handmade(bones, vec![0.0, -2.0, 0.0]);
+        character.joints[0][0] = 1;
+        // The hips and the leg both turn a quarter turn about Z.
+        let quarter = [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let mut world = vec![neutral(); 52];
+        let mut rest = vec![neutral(); 52];
+        world[0] = quarter;
+        world[44] = quarter;
+        let mut names = vec![String::new(); 52];
+        names[0] = "Hips".to_string();
+        names[44] = "LeftUpLeg".to_string();
+        let posed = character.pose(
+            &world,
+            &rest,
+            &vec![[0.0f32; 3]; 52],
+            &names,
+            [0.0, 0.0, 0.0],
+        );
+        // Hips pivot (0,0,0), leg pivot rotated to (1,0,0), the vertex a metre
+        // further along that rotated leg.
+        assert!((posed[0] - 2.0).abs() < 1e-5, "{posed:?}");
+        assert!(posed[1].abs() < 1e-5, "{posed:?}");
+    }
+
+    /// A character bound in an A-pose must play the clip's own rest angles: the
+    /// bind arm's 45 degrees are swung away before the clip is applied.
+    #[test]
+    fn an_a_pose_arm_is_swung_onto_the_clip_rest() {
+        let down = std::f32::consts::FRAC_1_SQRT_2;
+        let bones = vec![
+            bound("LeftArm", 7, None, [0.0, 0.0, 0.0]),
+            bound("LeftForeArm", 8, Some(0), [down, -down, 0.0]),
+        ];
+        let mut character = handmade(bones, vec![down, -down, 0.0]);
+        character.joints[0][0] = 1;
+        let world = vec![neutral(); 52];
+        let rest = vec![neutral(); 52];
+        // The clip's rest holds the arm out horizontally.
+        let mut rest_positions = vec![[0.0f32; 3]; 52];
+        rest_positions[8] = [1.0, 0.0, 0.0];
+        let mut names = vec![String::new(); 52];
+        names[7] = "LeftArm".to_string();
+        names[8] = "LeftForeArm".to_string();
+        let posed = character.pose(&world, &rest, &rest_positions, &names, [0.0; 3]);
+        // A quarter turn out of the bind, so the forearm joint ends up level.
+        assert!((posed[0] - 1.0).abs() < 1e-5, "{posed:?}");
+        assert!(posed[1].abs() < 1e-5, "{posed:?}");
     }
 }
