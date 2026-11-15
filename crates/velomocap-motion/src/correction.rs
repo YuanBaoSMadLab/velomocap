@@ -868,6 +868,14 @@ fn leg_ik(
         );
         let shin = distance3(joint3(&rest, ankle), joint3(&rest, knee));
         let max_reach = thigh + shin;
+        // The physical minimum reach of the same chain (the solver's 160 degree
+        // flex limit): a target closer than this would fold the leg past what the
+        // joint can do, so it is left alone instead of being forced.
+        let min_reach = {
+            let world = crate::anatomical::forward(body, &clip.poses[0], &rest).0;
+            let knee_local = math::tmul3(&world[hip], &world[knee]);
+            crate::anatomical::minimum_reach(&rest, hip, knee, ankle, &knee_local)
+        };
 
         // One mask for every pass: hysteresis and geometry gates, resolved once.
         let contact = contact_mask(sole, clip, foot_index, ankle, toe, thresholds, fps);
@@ -887,13 +895,19 @@ fn leg_ik(
                     current[1] as f64,
                     current[2] as f64 + (anchors[offset][2] - sole_at[2]) as f64,
                 ];
+                let hip_f = [
+                    hip_pos[0] as f64,
+                    hip_pos[1] as f64,
+                    hip_pos[2] as f64,
+                ];
+                // Too close to the hip for the knee to bend that far: leave the
+                // network pose alone rather than over-folding the leg.
+                if distance3(target, hip_f) < min_reach * 1.0005 {
+                    continue;
+                }
                 let weight = reach_falloff(
                     target,
-                    [
-                        hip_pos[0] as f64,
-                        hip_pos[1] as f64,
-                        hip_pos[2] as f64,
-                    ],
+                    hip_f,
                     max_reach,
                 );
                 if weight <= 0.02 {
