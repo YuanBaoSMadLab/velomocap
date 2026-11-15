@@ -236,6 +236,17 @@ impl BodyModel {
         self.regress_joints(&shaped)
     }
 
+    /// Shaped rest vertices (`vertices * 3`), no pose applied. Exposed for the
+    /// sole-probe geometry, which skins a small vertex subset itself.
+    pub fn shaped_vertices(&self, betas: &[f32]) -> Vec<f32> {
+        self.shape_vertices(betas)
+    }
+
+    /// Linear blend skinning weights, `joints * vertices` row-major.
+    pub fn lbs_weights(&self) -> &[f32] {
+        &self.weights
+    }
+
     /// `v_template + shapedirs · betas` (`vertices * 3`).
     fn shape_vertices(&self, betas: &[f32]) -> Vec<f32> {
         let v = self.num_vertices;

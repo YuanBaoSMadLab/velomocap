@@ -11,6 +11,7 @@ pub mod flow;
 pub mod ik;
 pub mod pipeline;
 pub mod sam;
+pub mod sole;
 pub mod temporal;
 pub mod trajectory;
 

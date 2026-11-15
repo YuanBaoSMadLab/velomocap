@@ -1342,6 +1342,7 @@ fn flow_report(
         floor,
         pelvis_offset: pelvis,
         leg_ik: !no_leg_ik,
+        mesh_sole: false,
         smoothing,
     };
     let correction = velomocap_motion::correction::apply(&mut clip, &model, &settings)?;

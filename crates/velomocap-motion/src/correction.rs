@@ -88,6 +88,11 @@ pub struct CorrectionSettings {
     /// stronger (0 turns it off); 1e-3 removes the network's per-frame noise
     /// while keeping a 0.5 s arm swing intact.
     pub smoothing: f64,
+    /// Use the skinned foot-mesh sole points instead of the joint approximation.
+    /// Off until the probe extraction matches the reference exactly: with the
+    /// current selection the anchor follows the mesh and the quality guard rolls
+    /// the whole correction back.
+    pub mesh_sole: bool,
     /// Run the contact IK on the legs. Off by default: the root correction
     /// already settles and pins the feet, while the per-frame IK on hip and knee
     /// measurably increases the joint jitter (74.8 -> 99.6 mm/s^2 on a turning
@@ -106,6 +111,7 @@ impl Default for CorrectionSettings {
             floor: 0.0,
             pelvis_offset: 0.0,
             leg_ik: true,
+            mesh_sole: false,
             smoothing: 0.0,
         }
     }
@@ -250,6 +256,13 @@ pub fn apply(
         }
     }
     let thresholds = settings.thresholds();
+    // Skinned sole patches: contact points come from the foot mesh, not from
+    // joints, exactly like the reference's SoleGeometry.
+    let sole = if settings.mesh_sole {
+        Sole::build(clip, body)
+    } else {
+        None
+    };
 
     // Smooth the network's per-frame noise before the contacts are detected: the
     // reference plans its root and targets with an acceleration term, and our
@@ -269,7 +282,7 @@ pub fn apply(
     let before = quality(&clip.skeletons, settings.floor);
 
     if settings.foot {
-        foot_lock(clip, settings, &thresholds, &mut report);
+        foot_lock(sole.as_ref(), clip, settings, &thresholds, &mut report);
         ground_feet(clip, body, settings, &thresholds, &mut report);
     }
     if settings.hand {
@@ -278,7 +291,7 @@ pub fn apply(
     // Kimodo's order: end effectors (hands) first, then the contact IK that
     // stabilises the legs on the ground.
     if settings.foot && settings.leg_ik {
-        leg_ik(clip, body, settings, &thresholds, &mut report);
+        leg_ik(sole.as_ref(), clip, body, settings, &thresholds, &mut report);
     }
 
     clip.skeletons = clip
@@ -400,6 +413,7 @@ fn jitter_score(skeletons: &[Skeleton]) -> f32 {
 /// fall back to geometry, which is what the reference does before it has a usable
 /// probability.
 fn contact_mask(
+    sole: Option<&Sole>,
     clip: &FlowClip,
     foot: usize,
     ankle: usize,
@@ -420,9 +434,9 @@ fn contact_mask(
     for frame in 0..count {
         let skeleton = &clip.skeletons[frame];
         height[frame] = joint(skeleton, ankle)[1].min(joint(skeleton, toe)[1]);
-        let point = support_point(clip, frame, ankle, toe);
+        let point = support_point(sole, clip, frame, foot, ankle, toe);
         if frame > 0 {
-            let previous = support_point(clip, frame - 1, ankle, toe);
+            let previous = support_point(sole, clip, frame - 1, foot, ankle, toe);
             let dx = point[0] - previous[0];
             let dz = point[2] - previous[2];
             speed[frame] = (dx * dx + dz * dz).sqrt() * fps;
@@ -491,8 +505,8 @@ fn contact_mask(
             if !(begin..end).all(|frame| holding[frame]) {
                 continue;
             }
-            let before = support_point(clip, begin - 1, ankle, toe);
-            let after = support_point(clip, end, ankle, toe);
+            let before = support_point(sole, clip, begin - 1, foot, ankle, toe);
+            let after = support_point(sole, clip, end, foot, ankle, toe);
             let dx = after[0] - before[0];
             let dz = after[2] - before[2];
             if (dx * dx + dz * dz).sqrt() < 0.04 {
@@ -827,6 +841,7 @@ fn reach_falloff(target: [f64; 3], hip: [f64; 3], max_reach: f64) -> f64 {
 /// not have to carry the whole load. The joint's own orientation is untouched
 /// (only the hip and the knee move), which is what keeps the foot flat.
 fn leg_ik(
+    sole: Option<&Sole>,
     clip: &mut FlowClip,
     body: &BodyModel,
     settings: &CorrectionSettings,
@@ -855,22 +870,22 @@ fn leg_ik(
         let max_reach = thigh + shin;
 
         // One mask for every pass: hysteresis and geometry gates, resolved once.
-        let contact = contact_mask(clip, foot_index, ankle, toe, thresholds, fps);
+        let contact = contact_mask(sole, clip, foot_index, ankle, toe, thresholds, fps);
 
         for (begin, end) in contact_runs(&contact, thresholds.min_run) {
             // Same rolling anchor the root pass uses, so the leg IK and the root
             // agree on where the contact patch should be.
-            let anchors = rolling_anchor(clip, begin, end, ankle, toe, settings.floor);
+            let anchors = rolling_anchor(sole, clip, begin, end, foot_index, ankle, toe, settings.floor);
             for (offset, index) in (begin..end).enumerate() {
                 let current = joint(&clip.skeletons[index], ankle);
-                let sole = support_point(clip, index, ankle, toe);
+                let sole_at = support_point(sole, clip, index, foot_index, ankle, toe);
                 let hip_pos = joint(&clip.skeletons[index], hip);
                 // Move the ankle so that the sole's support point lands back on
                 // the anchor; the ankle itself is free to slide over it.
                 let target = [
-                    current[0] as f64 + (anchors[offset][0] - sole[0]) as f64,
+                    current[0] as f64 + (anchors[offset][0] - sole_at[0]) as f64,
                     current[1] as f64,
-                    current[2] as f64 + (anchors[offset][2] - sole[2]) as f64,
+                    current[2] as f64 + (anchors[offset][2] - sole_at[2]) as f64,
                 ];
                 let weight = reach_falloff(
                     target,
@@ -1051,9 +1066,11 @@ fn rolling_path(
 /// then offset so its median matches the observed support points, and its height
 /// is the floor.
 fn rolling_anchor(
+    sole: Option<&Sole>,
     clip: &FlowClip,
     begin: usize,
     end: usize,
+    foot: usize,
     ankle: usize,
     toe: usize,
     floor: f32,
@@ -1063,7 +1080,7 @@ fn rolling_anchor(
     let mut weights = Vec::with_capacity(frames);
     let mut observed = Vec::with_capacity(frames);
     for frame in begin..end {
-        let (toe_at, heel) = sole_points(clip, frame, ankle, toe);
+        let (toe_at, heel) = sole_points(sole, clip, frame, foot, ankle, toe);
         let weight = support_weight(toe_at, heel);
         separations.push([
             heel[0] - toe_at[0],
@@ -1087,12 +1104,22 @@ fn rolling_anchor(
 /// Kimodo blends these with weights computed from **geometry only** - which of
 /// the two points is lower - so a rolling foot moves its contact point along the
 /// sole instead of sliding the whole foot.
-fn sole_points(clip: &FlowClip, frame: usize, ankle: usize, toe: usize) -> ([f32; 3], [f32; 3]) {
+fn sole_points(
+    sole: Option<&Sole>,
+    clip: &FlowClip,
+    frame: usize,
+    foot: usize,
+    ankle: usize,
+    toe: usize,
+) -> ([f32; 3], [f32; 3]) {
+    // The skinned sole patches when they are available, otherwise the joint
+    // approximation this pass used before the mesh came in.
+    if let Some(sole) = sole {
+        return sole.points(frame, foot);
+    }
     let skeleton = &clip.skeletons[frame];
     let ankle_at = joint(skeleton, ankle);
     let toe_at = joint(skeleton, toe);
-    // Heel: mirror of the toe offset about the ankle, damped so skin noise does
-    // not swing it.
     let heel = [
         ankle_at[0] + (ankle_at[0] - toe_at[0]) * 0.6,
         ankle_at[1] + (ankle_at[1] - toe_at[1]) * 0.6,
@@ -1113,14 +1140,47 @@ fn support_weight(toe: [f32; 3], heel: [f32; 3]) -> f32 {
 }
 
 /// The point of the sole that is actually bearing the weight.
-fn support_point(clip: &FlowClip, frame: usize, ankle: usize, toe: usize) -> [f32; 3] {
-    let (toe_at, heel) = sole_points(clip, frame, ankle, toe);
+fn support_point(
+    sole: Option<&Sole>,
+    clip: &FlowClip,
+    frame: usize,
+    foot: usize,
+    ankle: usize,
+    toe: usize,
+) -> [f32; 3] {
+    let (toe_at, heel) = sole_points(sole, clip, frame, foot, ankle, toe);
     let weight = support_weight(toe_at, heel);
     [
         toe_at[0] * (1.0 - weight) + heel[0] * weight,
         toe_at[1].min(heel[1]),
         toe_at[2] * (1.0 - weight) + heel[2] * weight,
     ]
+}
+
+/// The skinned sole patches for every frame, built once per clip.
+pub struct Sole {
+    probes: Vec<[[[f32; 3]; 2]; 2]>,
+}
+
+impl Sole {
+    pub fn build(clip: &FlowClip, body: &BodyModel) -> Option<Self> {
+        let geometry = crate::sole::SoleGeometry::build(body, &clip.betas).ok()?;
+        let rest = body.rest_joints(&clip.betas);
+        let probes = clip
+            .skeletons
+            .iter()
+            .map(|skeleton| geometry.sample(skeleton, &rest, 0))
+            .collect();
+        Some(Self { probes })
+    }
+
+    /// `(toe side, heel side)` of one foot on one frame.
+    pub fn points(&self, frame: usize, foot: usize) -> ([f32; 3], [f32; 3]) {
+        match self.probes.get(frame) {
+            Some(probes) => (probes[foot.min(1)][1], probes[foot.min(1)][0]),
+            None => ([0.0; 3], [0.0; 3]),
+        }
+    }
 }
 
 /// Kimodo's `airborne_excursions`, simplified to the gate that matters here: a/// stretch where the lowest sole is well above the floor and there is lower
@@ -1163,6 +1223,7 @@ fn flight_frames(clip: &FlowClip, floor: f32) -> Vec<bool> {
 }
 
 fn foot_lock(
+    sole: Option<&Sole>,
     clip: &mut FlowClip,
     settings: &CorrectionSettings,
     thresholds: &Thresholds,
@@ -1194,7 +1255,7 @@ fn foot_lock(
     }
 
     for (foot_index, (ankle, toe)) in feet.into_iter().enumerate() {
-        let contact = contact_mask(clip, foot_index, ankle, toe, thresholds, fps);
+        let contact = contact_mask(sole, clip, foot_index, ankle, toe, thresholds, fps);
         let runs = contact_runs(&contact, thresholds.min_run);
         if runs.is_empty() {
             continue;
@@ -1210,7 +1271,7 @@ fn foot_lock(
             // The anchor is Kimodo's rolling anchor: a continuous no-slip path
             // through the stance, so a foot that rolls from heel to toe keeps its
             // contact patch still instead of jumping at the middle of the run.
-            let path = rolling_anchor(clip, *begin, *end, ankle, toe, ground);
+            let path = rolling_anchor(sole, clip, *begin, *end, foot_index, ankle, toe, ground);
             // Weak presets hold 60% of the correction, and a low network contact
             // probability softens it further instead of dropping the contact.
             let hold =
@@ -1218,7 +1279,7 @@ fn foot_lock(
             report.foot_contacts += 1;
             for (offset, index) in (*begin..*end).enumerate() {
                 anchors[index] = path[offset];
-                support[index] = support_point(clip, index, ankle, toe);
+                support[index] = support_point(sole, clip, index, foot_index, ankle, toe);
                 holds[index] = hold;
             }
         }
