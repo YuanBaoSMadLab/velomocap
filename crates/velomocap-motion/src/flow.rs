@@ -377,7 +377,9 @@ fn finish(
         None => None,
     }
     .unwrap_or_else(placement::Fit::identity);
-    if fit.anchors > 0 {
+    if !clip_cameras.is_empty() {
+        // The rotation is applied even without an anchor: it is the take's
+        // heading, and the offset is simply zero when there is nothing to fit.
         skeletons = placement::apply(&mut poses, body, rest_pelvis, &fit);
     }
 

@@ -119,14 +119,14 @@ pub struct CorrectionSettings {
     /// current selection the anchor follows the mesh and the quality guard rolls
     /// the whole correction back.
     pub mesh_sole: bool,
-    /// Run the contact IK on the legs. Off by default: the root correction
-    /// already settles and pins the feet, while the per-frame IK on hip and knee
-    /// measurably increases the joint jitter (74.8 -> 99.6 mm/s^2 on a turning
-    /// clip, 93.3 with it off). Turn it on for clips with strong foot pivots.
+    /// Run the contact IK on the legs. On by default (the reference always runs
+    /// its `DoContactIK`); it pins each stance's ankle to the rolling anchor, but
+    /// it never moves the body — the root height belongs to `root_height`.
     pub leg_ik: bool,
     /// Plan the root height over the window with the leg reach bounds and the
     /// swing clearance (`contact_pose_plan._optimise_window`). On by default: the
-    /// reference always runs this pass after its ground settle.
+    /// reference's fifth vertical step, after the drop, lift, offset and
+    /// clearance.
     pub pose_plan: bool,
 }
 

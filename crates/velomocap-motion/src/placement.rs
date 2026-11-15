@@ -247,8 +247,18 @@ pub fn fit(
         seen[anchor.frame] = true;
         usable.push(*anchor);
     }
-    if usable.is_empty() || usable.len() > ANCHOR_FRAMES {
-        return None;
+    if usable.is_empty() {
+        // No usable anchor is not a bad take: the heading transport still has to
+        // happen, there is just nothing to fit the offset against.
+        return Some(Fit {
+            rotation: q,
+            offset: [0.0; 3],
+            camera_height: 0.0,
+            scene_basis: shared,
+            anchors: 0,
+            residual_mean: 0.0,
+            residual_max: 0.0,
+        });
     }
     let mut difference = [Vec::with_capacity(usable.len()), Vec::new(), Vec::new()];
     for anchor in &usable {
@@ -601,11 +611,16 @@ mod tests {
         );
     }
 
+    /// Without an anchor there is nothing to fit, but the heading transport still
+    /// has to happen — it is what places a later take into the scene.
     #[test]
-    fn no_anchors_means_no_offset() {
+    fn no_anchors_means_no_offset_but_keeps_the_heading() {
         let camera = vec![extrinsic(identity()); 3];
         let pelvis = vec![[0.0, 1.0, 0.0]; 3];
-        assert!(fit(&pelvis, &camera, extrinsic(identity()), &[]).is_none());
+        let fit = fit(&pelvis, &camera, extrinsic(identity()), &[]).expect("a fit");
+        assert_eq!(fit.anchors, 0);
+        assert_eq!(fit.offset, [0.0; 3]);
+        assert!((fit.rotation[0][0] - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -616,6 +631,8 @@ mod tests {
             frame: 0,
             point: [0.0, 1.0, -0.5],
         }];
-        assert!(fit(&pelvis, &camera, extrinsic(identity()), &anchors).is_none());
+        let fit = fit(&pelvis, &camera, extrinsic(identity()), &anchors).expect("a fit");
+        assert_eq!(fit.anchors, 0, "an anchor behind the camera must not be used");
+        assert_eq!(fit.offset, [0.0; 3]);
     }
 }
