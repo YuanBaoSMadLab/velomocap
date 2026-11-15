@@ -454,22 +454,40 @@ impl Gltf {
     }
 
     fn read_weights(&self, accessor: usize) -> Result<Vec<[f32; 4]>> {
-        let (_, data, offset, count, stride) = self.view(accessor)?;
-        let stride = if stride == 0 { 16 } else { stride };
+        let (accessor_value, data, offset, count, stride) = self.view(accessor)?;
+        // Real files store the weights as normalised unsigned shorts or bytes to
+        // save space (Mixamo and UE5 exports both do), so the component type
+        // decides the width and the scale. Assuming floats read half the
+        // vertices and made the counts disagree with POSITION.
+        let kind = accessor_value
+            .get("componentType")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5126);
+        let (width, scale) = match kind {
+            5121 => (1usize, 1.0 / 255.0),
+            5123 => (2, 1.0 / 65535.0),
+            _ => (4, 1.0),
+        };
+        let stride = if stride == 0 { width * 4 } else { stride };
         let mut out = Vec::with_capacity(count);
         for index in 0..count {
             let at = offset + index * stride;
-            if at + 16 > data.len() {
+            if at + width * 4 > data.len() {
                 break;
             }
             let mut weights = [0.0f32; 4];
             for slot in 0..4 {
-                weights[slot] = f32::from_le_bytes([
-                    data[at + slot * 4],
-                    data[at + slot * 4 + 1],
-                    data[at + slot * 4 + 2],
-                    data[at + slot * 4 + 3],
-                ]);
+                let start = at + slot * width;
+                weights[slot] = match width {
+                    1 => data[start] as f32 * scale,
+                    2 => u16::from_le_bytes([data[start], data[start + 1]]) as f32 * scale,
+                    _ => f32::from_le_bytes([
+                        data[start],
+                        data[start + 1],
+                        data[start + 2],
+                        data[start + 3],
+                    ]),
+                };
             }
             out.push(weights);
         }
@@ -677,6 +695,26 @@ mod tests {
         out.extend_from_slice(b"BIN\0");
         out.extend_from_slice(&bin);
         out
+    }
+
+    /// Loads a real character when `VELOMOCAP_CHARACTER` points at one, so the
+    /// reader can be checked against the avatars people actually have.
+    #[test]
+    fn a_real_character_file_loads() {
+        let Some(path) = std::env::var_os("VELOMOCAP_CHARACTER") else {
+            return;
+        };
+        let character = Character::load(std::path::Path::new(&path)).expect("load");
+        eprintln!(
+            "{}: {} bones ({} matched), {} vertices, {} faces, unmatched {:?}",
+            character.name,
+            character.bones.len(),
+            character.matched(),
+            character.vertex_count(),
+            character.faces.len(),
+            character.unmatched()
+        );
+        assert!(character.vertex_count() > 0);
     }
 
     #[test]

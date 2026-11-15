@@ -856,15 +856,35 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                     ));
                     eprintln!("{line}");
                 }
-                let trail: Vec<[f32; 3]> = people                    .get(selected)
-                    .map(|person| {
-                        person
-                            .frames
+                // The trail must belong to the body that is on screen. It used to
+                // come from the per-frame MHR keypoints, which live in the camera
+                // space of the reconstruction, while the drawn body is the placed
+                // FlowHMR clip — so the path floated far away from the character.
+                let trail: Vec<[f32; 3]> = flow
+                    .get(selected)
+                    .filter(|clip| !clip.skeletons.is_empty())
+                    .map(|clip| {
+                        clip.skeletons
                             .iter()
-                            .flatten()
-                            .filter(|frame| frame.joints.len() >= 3)
-                            .map(|frame| [frame.joints[0], frame.joints[1], frame.joints[2]])
+                            .map(|skeleton| {
+                                [
+                                    skeleton.positions[0],
+                                    skeleton.positions[1],
+                                    skeleton.positions[2],
+                                ]
+                            })
                             .collect()
+                    })
+                    .or_else(|| {
+                        people.get(selected).map(|person| {
+                            person
+                                .frames
+                                .iter()
+                                .flatten()
+                                .filter(|frame| frame.joints.len() >= 3)
+                                .map(|frame| [frame.joints[0], frame.joints[1], frame.joints[2]])
+                                .collect()
+                        })
                     })
                     .unwrap_or_default();
                 let scene = Scene {

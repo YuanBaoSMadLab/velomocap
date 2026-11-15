@@ -1325,6 +1325,19 @@ fn flow_report(
             );
             track
         }
+        // A fixed camera needs no estimation at all: running VGGT for a track
+        // that is then frozen to its first frame cost a full model load and, on
+        // a machine with another run resident, ran out of device memory.
+        None if static_camera => {
+            let tools = velomocap_video::Tools::discover()?;
+            let info = velomocap_video::probe(&tools, &video)?;
+            println!("camera: static, {}x{}", info.width, info.height);
+            velomocap_infer::CameraTrack::static_camera(
+                capture.frames.max(1),
+                info.width,
+                info.height,
+            )
+        }
         None => {
             let tools = velomocap_video::Tools::discover()?;
             let mut vggt = VggtCamera::load(VggtConfig {
