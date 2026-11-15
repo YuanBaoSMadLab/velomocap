@@ -22,6 +22,7 @@
 //! | `source_reach_gap` + reach gain | `anatomical::source_reach_gap` in `hand_lock` |
 //! | `palm_offsets`, `samples`, `plan` (palm contacts) | `palm::PalmGeometry`, `palm::plan` |
 //! | `contact_arm_plan.solve` (collar depression / swivel / wrist trim / elbow correction) | `arm_plan::Plan::solve`, applied by `plan_arm_stance` |
+//! | `contact_pose_plan._optimise_window` (root height against the reach bounds) | `pose_plan::plan`, applied by `pose_plan_window` |
 //! | `scipy.optimize.least_squares` (both planning passes) | `solver::minimise` |
 //!
 //! Known differences that are **not** ported:
@@ -30,7 +31,7 @@
 //! | --- | --- |
 //! | `contact_arm_plan.solve`'s two anchor x/z variables per stance | they let two overlapping palm supports be satisfied at once; this pass pins one palm at a time |
 //! | the world-fixed palm offset used inside the reference's `predict` | kept live here instead (`palm = wrist + R_upper·R_elbow·R_wrist_local·offset`), because a fixed world offset no longer matches the palm the applied pose produces once the arm swings |
-//! | `contact_pose_plan._optimise_window` (`scipy.optimize.least_squares`, 60 iterations, pose/velocity/acceleration/root sigmas) | the same objective is solved by `temporal::plan_series`; the window optimiser's extra collar/arm/swing coupling variables need a palm support to be meaningful |
+//! | the pose plan's per-swing-target height variables and its predicted (flex, hip rotation) state | the state exists to regularise the joint solve; this port bounds the root against the same `reach`/`minimum_reach` limits directly, and measures neutral on both fixtures |
 //! | `CorrectJointRotations` | no counterpart on purpose: it only moves a bone whose `fullBodyMask` is set, and the reference's own call passes a mask of zeros (`RGBMocap/mocap/correction.py` builds `c` from the contact array and passes `zero` for every body mask), so it is a no-op in that path |
 //!
 //! `DoEffectorIK` is implemented as the position pin in `hand_lock`; its optional
@@ -112,6 +113,10 @@ pub struct CorrectionSettings {
     /// measurably increases the joint jitter (74.8 -> 99.6 mm/s^2 on a turning
     /// clip, 93.3 with it off). Turn it on for clips with strong foot pivots.
     pub leg_ik: bool,
+    /// Plan the root height over the window with the leg reach bounds and the
+    /// swing clearance (`contact_pose_plan._optimise_window`). On by default: the
+    /// reference always runs this pass after its ground settle.
+    pub pose_plan: bool,
 }
 
 impl Default for CorrectionSettings {
@@ -125,6 +130,7 @@ impl Default for CorrectionSettings {
             floor: 0.0,
             pelvis_offset: 0.0,
             leg_ik: true,
+            pose_plan: true,
             mesh_sole: true,
             smoothing: 0.0,
         }
@@ -298,6 +304,9 @@ pub fn apply(
     if settings.foot {
         foot_lock(sole.as_ref(), clip, settings, &thresholds, &mut report);
         ground_feet(clip, body, settings, &thresholds, &mut report);
+        if settings.pose_plan {
+            pose_plan_window(clip, body, settings, &mut report);
+        }
     }
     if settings.hand {
         hand_lock(clip, body, settings, &mut report);
@@ -686,6 +695,81 @@ fn ground_feet(
             clip.skeletons[frame] = body.forward_joints(&clip.poses[frame]);
         }
     }
+}
+
+/// Plan the root height over the window (`contact_pose_plan._optimise_window`).
+///
+/// Runs after the ground pass has settled the body and before the leg IK, which
+/// is the reference's order: the plan keeps the *predicted* leg solve inside the
+/// chain's reach bounds and lifts a free foot out of the floor, then the leg solve
+/// runs against the planned root.
+fn pose_plan_window(
+    clip: &mut FlowClip,
+    body: &BodyModel,
+    settings: &CorrectionSettings,
+    report: &mut CorrectionReport,
+) {
+    let count = clip.skeletons.len();
+    if count < 3 {
+        return;
+    }
+    let rest = body.rest_joints(&clip.betas);
+    let legs = [(1usize, 4usize, 7usize), (2, 5, 8)];
+    let flight = flight_frames(clip, settings.floor);
+    let mut frames = Vec::with_capacity(count);
+    for frame in 0..count {
+        let (world, positions) = crate::anatomical::forward(body, &clip.poses[frame], &rest);
+        let mut active = [false; 2];
+        let mut lowest = f64::MAX;
+        for (leg, (hip, knee, ankle)) in legs.iter().enumerate() {
+            let sole = positions[*ankle][1]
+                .min(positions[if *ankle == LEFT_ANKLE { LEFT_FOOT } else { RIGHT_FOOT }][1]);
+            lowest = lowest.min(sole);
+            active[leg] = sole - settings.floor as f64 <= 0.02;
+            let _ = (hip, knee);
+        }
+        let mut high = [0.0f64; 2];
+        let mut low = [0.0f64; 2];
+        for (leg, (hip, knee, ankle)) in legs.iter().enumerate() {
+            let knee_local = match body.parents[*knee] {
+                parent if parent >= 0 => math::tmul3(&world[parent as usize], &world[*knee]),
+                _ => world[*knee],
+            };
+            high[leg] = crate::anatomical::reach(&rest, *hip, *knee, *ankle, &knee_local);
+            low[leg] = crate::anatomical::minimum_reach(&rest, *hip, *knee, *ankle, &knee_local);
+        }
+        frames.push(crate::pose_plan::Frame {
+            base: clip.poses[frame].translation[1] as f64,
+            hips: [positions[1], positions[2]],
+            ankles: [positions[7], positions[8]],
+            lowest,
+            active,
+            high,
+            low,
+            flight: flight[frame],
+        });
+    }
+    let planned = crate::pose_plan::plan(
+        &frames,
+        settings.floor as f64,
+        clip.fps as f64,
+        settings.mode == CorrectionMode::Flat,
+    );
+    let mut moved = 0.0f32;
+    for frame in 0..count {
+        let delta = (planned[frame] - frames[frame].base) as f32;
+        if delta.abs() < 1e-6 {
+            continue;
+        }
+        moved = moved.max(delta.abs());
+        clip.poses[frame].translation[1] += delta;
+    }
+    if moved > 0.0 {
+        for frame in 0..count {
+            clip.skeletons[frame] = body.forward_joints(&clip.poses[frame]);
+        }
+    }
+    report.vertical_shift = report.vertical_shift.max(moved);
 }
 
 /// How strongly a run is held, from the network's own contact probabilities.

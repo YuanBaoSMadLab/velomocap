@@ -12,6 +12,7 @@ pub mod flow;
 pub mod ik;
 pub mod palm;
 pub mod pipeline;
+pub mod pose_plan;
 pub mod retarget;
 pub mod sam;
 pub mod sole;

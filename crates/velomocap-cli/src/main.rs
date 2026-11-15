@@ -213,6 +213,10 @@ enum Command {
         /// the reference's DoContactIK).
         #[arg(long)]
         no_leg_ik: bool,
+        /// Skip the root-height plan window (on by default, like the reference's
+        /// contact_pose_plan pass).
+        #[arg(long)]
+        no_pose_plan: bool,
         /// Use the skinned foot-mesh sole points as the contact source.
         #[arg(long)]
         joint_sole: bool,
@@ -493,6 +497,7 @@ fn main() -> Result<()> {
             no_foot,
             hand_lock,
             no_leg_ik,
+            no_pose_plan,
             joint_sole,
             smooth,
             lock_preset,
@@ -534,6 +539,7 @@ fn main() -> Result<()> {
             no_foot,
             hand_lock,
             no_leg_ik,
+            no_pose_plan,
             joint_sole,
             smooth,
             &lock_preset,
@@ -1130,6 +1136,7 @@ fn flow_report(
     no_foot: bool,
     hand_lock: bool,
     no_leg_ik: bool,
+    no_pose_plan: bool,
     joint_sole: bool,
     smoothing: f64,
     lock_preset: &str,
@@ -1353,6 +1360,7 @@ fn flow_report(
         floor,
         pelvis_offset: pelvis,
         leg_ik: !no_leg_ik,
+        pose_plan: !no_pose_plan,
         mesh_sole: !joint_sole,
         smoothing,
     };
