@@ -257,7 +257,8 @@ enum Command {
         /// Smooth the estimated camera rotation over time.
         #[arg(long)]
         refine_camera: bool,
-        /// Vertical shift applied to the clip, metres.
+        /// Pelvis height offset from the automatic height, metres: positive only
+        /// gives back the reach drop, negative lowers the body (-0.25..0.25).
         #[arg(long, default_value_t = 0.0)]
         pelvis: f32,
         /// Stop after this many frames (0 = whole video).
@@ -563,6 +564,12 @@ fn main() -> Result<()> {
             if let Some(path) = locks.as_deref() {
                 anyhow::ensure!(path.is_file(), "{} does not exist", path.display());
             }
+            // The reference rejects an out-of-range offset instead of clamping
+            // it (`correction_settings.correction_options`).
+            anyhow::ensure!(
+                (-0.25..=0.25).contains(&pelvis),
+                "--pelvis must be between -0.25 and +0.25 m"
+            );
             flow_report(
             &video,
             &detector,

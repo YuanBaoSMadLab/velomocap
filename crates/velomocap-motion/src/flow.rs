@@ -29,6 +29,7 @@ use velomocap_infer::{
     CameraTrack, GeneratedMotion, MotionConfig, MotionGenerator, Narrowband,
 };
 
+use crate::placement;
 use crate::sam::{PersonFrame, PersonTrack};
 
 /// Narrowband attention windows from `models/flowhmr/config.yml`.
@@ -100,11 +101,13 @@ pub struct FlowClip {
     pub trans: Vec<[f32; 3]>,
     pub betas: Vec<f32>,
     pub foot_contacts: Vec<[f32; 4]>,
-    /// Height subtracted so the first frame's lowest point sits on `y = 0`.
+    /// Height subtracted so the planted soles sit on `y = 0`.
     pub floor: f32,
-    /// Whether the floor came from the mesh (the reference) or the joints.
-    pub floor_from_mesh: bool,
-    /// X/Z placement offset applied to reach the scene.
+    /// Whether the floor came from the planted contact soles (`flow_floor`) or
+    /// from the mesh fallback, which is only used when nothing was planted.
+    pub floor_from_contacts: bool,
+    /// Rigid placement offset (`flow_placement`), with `y` dropped so FlowHMR's
+    /// own height survives.
     pub offset: [f32; 3],
     /// Clip frame indices the motion was built from.
     pub source_frames: Vec<usize>,
@@ -321,7 +324,6 @@ fn finish(
     let trans = motion.trans_y180();
     let betas = motion.betas.clone();
     let mut poses = Vec::with_capacity(count);
-    let mut skeletons = Vec::with_capacity(count);
     for index in 0..count {
         let mut pose = Pose::neutral(body.num_joints, body.num_betas);
         pose.root = angles[index][0];
@@ -331,14 +333,67 @@ fn finish(
         }
         pose.betas = betas.clone();
         pose.translation = trans[index];
-        skeletons.push(body.forward_joints(&pose));
         poses.push(pose);
     }
+    let mut skeletons: Vec<Skeleton> = poses.iter().map(|pose| body.forward_joints(pose)).collect();
 
-    // Reference `v2m_inference`: drop the origin clip to the floor using the
-    // lowest *mesh* vertex of the first frame, so the model's own vertical
-    // datum never reaches the export.
-    let (floor, floor_from_mesh) = floor_offset(body, &poses);
+    // `flow_placement.ensure`: transport the take's world-vertical heading into
+    // the scene's (`q`), rotate the root by it and add the median SAM-anchor
+    // offset. FlowHMR's height is retained — the floor is what decides the
+    // vertical datum, and it is measured next from the contact soles.
+    let up = camera.to_y_up();
+    let mut clip_cameras = Vec::with_capacity(count);
+    for index in &frames {
+        anyhow::ensure!(
+            *index < up.len(),
+            "camera track has no y-up extrinsic for frame {index}"
+        );
+        clip_cameras.push(up[*index]);
+    }
+    let pelvis: Vec<[f32; 3]> = skeletons
+        .iter()
+        .map(|skeleton: &Skeleton| skeleton.joint(0))
+        .collect();
+    let mut anchor_rows = Vec::new();
+    for (slot, index) in frames.iter().enumerate().take(ANCHOR_FRAMES) {
+        let Some(anchor) = track
+            .frames
+            .get(*index)
+            .and_then(|frame| frame.as_ref())
+            .map(|frame| frame.anchor_cam)
+        else {
+            continue;
+        };
+        anchor_rows.push(placement::Anchor {
+            frame: slot,
+            point: anchor,
+        });
+    }
+    let rest = body.rest_joints(&betas);
+    anyhow::ensure!(rest.len() >= 3, "the SMPL-H model regressed no pelvis");
+    let rest_pelvis = [rest[0] as f64, rest[1] as f64, rest[2] as f64];
+    let fit = match clip_cameras.first() {
+        Some(first) => placement::fit(&pelvis, &clip_cameras, *first, &anchor_rows),
+        None => None,
+    }
+    .unwrap_or_else(placement::Fit::identity);
+    if fit.anchors > 0 {
+        skeletons = placement::apply(&mut poses, body, rest_pelvis, &fit);
+    }
+
+    // `flow_floor.resolve`: the plane is the 5% quantile of the *planted* sole
+    // heights, so the body is dropped by exactly that and stands on `y = 0`.
+    let floor = floor_estimate(body, &betas, &skeletons, &motion.foot_contacts, fps);
+    let (floor, floor_from_contacts) = match floor {
+        Some(estimate) => (estimate, true),
+        None => {
+            // No reliably planted sole anywhere: the reference keeps its datum
+            // and warns, and so does this. The mesh fallback keeps the body on
+            // the grid instead of leaving it where FlowHMR guessed.
+            let (low, _) = floor_offset(body, &poses);
+            (low, false)
+        }
+    };
     if floor != 0.0 {
         for pose in poses.iter_mut() {
             pose.translation[1] -= floor;
@@ -350,19 +405,6 @@ fn finish(
         }
     }
 
-    let (offset, anchors) = placement(&frames, track, camera, &skeletons)?;
-    if offset != [0.0; 3] {
-        for pose in poses.iter_mut() {
-            pose.translation[0] += offset[0];
-            pose.translation[2] += offset[2];
-        }
-        for skeleton in skeletons.iter_mut() {
-            for point in skeleton.positions.chunks_exact_mut(3) {
-                point[0] += offset[0];
-                point[2] += offset[2];
-            }
-        }
-    }
     let anchor_residual = residual(&frames, track, camera, &skeletons);
 
     Ok(FlowClip {
@@ -374,15 +416,16 @@ fn finish(
         betas,
         foot_contacts: motion.foot_contacts,
         floor,
-        floor_from_mesh,
-        offset,
+        floor_from_contacts,
+        offset: fit.offset.map(|value| value as f32),
         source_frames: frames,
-        anchors,
+        anchors: fit.anchors,
         anchor_residual,
     })
 }
 
-/// Root-mean-square distance between the placed pelvis and each SAM anchor.
+/// Root-mean-square distance between the placed pelvis and each SAM anchor, per
+/// axis, in the take's world frame — the frame the offset was fitted in.
 fn residual(
     frames: &[usize],
     track: &PersonTrack,
@@ -404,13 +447,10 @@ fn residual(
         let Some(extrinsic) = up.get(*index) else {
             continue;
         };
+        let seen = placement::anchor_point(extrinsic, anchor);
         let pelvis = skeletons[slot].joint(0);
         for axis in 0..3 {
-            let mut rotated = 0.0f32;
-            for k in 0..3 {
-                rotated += extrinsic[k][axis] * anchor[k];
-            }
-            let difference = (rotated - pelvis[axis]) as f64;
+            let difference = seen[axis] - pelvis[axis] as f64;
             sum[axis] += difference * difference;
         }
         count += 1;
@@ -425,13 +465,13 @@ fn residual(
     ]
 }
 
-/// The clip's floor: the lowest point the body reaches, in metres.
+/// The clip's floor when no sole is reliably planted, in metres.
 ///
-/// The reference (`v2m_inference`) measures this on **frame 0 only**. That only
-/// works when frame 0 is a planted pose; a generated clip whose first frame has
-/// the legs tucked would then sink the rest of the clip through the floor. The
-/// minimum over the first [`ANCHOR_FRAMES`] frames is the same quantity without
-/// that failure mode, so it is what the export uses.
+/// `flow_floor.resolve` is the authority and this is only its fallback: the
+/// reference keeps the FlowHMR datum with a warning when it finds no contact
+/// samples, which would leave the body wherever the network put it. Dropping the
+/// lowest mesh point of the first [`ANCHOR_FRAMES`] frames keeps the character on
+/// the grid; the flag says which path produced the number.
 fn floor_offset(body: &BodyModel, poses: &[Pose]) -> (f32, bool) {
     let lowest = |values: &[f32]| -> f32 {
         values
@@ -461,62 +501,29 @@ fn floor_offset(body: &BodyModel, poses: &[Pose]) -> (f32, bool) {
     (if low.is_finite() { low } else { 0.0 }, false)
 }
 
-/// `flow_placement`: median X/Z offset that puts FlowHMR on the SAM anchors.
+/// `flow_floor.resolve`: the plane the actor actually stands on.
 ///
-/// The anchor is the SAM MHR hips in camera coordinates; rotating it by the
-/// transpose of VGGT's camera-from-world gives it in FlowHMR's y-up world. The
-/// difference to FlowHMR's own pelvis is taken on X and Z only — FlowHMR's
-/// height is kept, exactly as the reference does.
-fn placement(
-    frames: &[usize],
-    track: &PersonTrack,
-    camera: &CameraTrack,
+/// The 5% quantile of the **planted** sole heights — not the lowest point the
+/// body reaches — so one bad frame cannot lift the whole clip, and a swinging
+/// foot is never a floor sample. `None` when nothing was ever planted.
+fn floor_estimate(
+    body: &BodyModel,
+    betas: &[f32],
     skeletons: &[Skeleton],
-) -> Result<([f32; 3], usize)> {
-    let up = camera.to_y_up();
-    let mut differences: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    let mut anchors = 0usize;
-    for (slot, index) in frames.iter().enumerate().take(ANCHOR_FRAMES) {
-        let Some(anchor) = track
-            .frames
-            .get(*index)
-            .and_then(|frame| frame.as_ref())
-            .map(|frame| frame.anchor_cam)
-        else {
-            continue;
-        };
-        let Some(extrinsic) = up.get(*index) else {
-            continue;
-        };
-        let pelvis = skeletons[slot].joint(0);
-        for axis in 0..3 {
-            // (R^T · anchor)[axis] = sum_k R[k][axis] · anchor[k]
-            let mut rotated = 0.0f32;
-            for k in 0..3 {
-                rotated += extrinsic[k][axis] * anchor[k];
-            }
-            differences[axis].push(rotated - pelvis[axis]);
-        }
-        anchors += 1;
+    contacts: &[[f32; 4]],
+    fps: f32,
+) -> Option<f32> {
+    let sole = crate::correction::Sole::for_shape(body, betas)?;
+    let rows: Vec<crate::contacts::Probes> = skeletons
+        .iter()
+        .map(|skeleton: &Skeleton| sole.row(skeleton))
+        .collect();
+    let landed = crate::floor::resolve(&rows, contacts, fps);
+    if landed.is_reliable() {
+        Some(landed.height)
+    } else {
+        None
     }
-    if anchors == 0 {
-        return Ok(([0.0; 3], 0));
-    }
-    let median = |values: &mut Vec<f32>| -> f32 {
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let mid = values.len() / 2;
-        if values.len() % 2 == 0 {
-            0.5 * (values[mid - 1] + values[mid])
-        } else {
-            values[mid]
-        }
-    };
-    let offset = [
-        median(&mut differences[0]),
-        0.0,
-        median(&mut differences[2]),
-    ];
-    Ok((offset, anchors))
 }
 
 /// Everything the BVH writer needs, without the body model.
@@ -934,10 +941,13 @@ pub fn summarise(clip: &FlowClip) -> Vec<String> {
         clip.betas.first().copied().unwrap_or(0.0)
     ));
     lines.push(format!(
-        "floor {:.3} m from the {} of the first {} frames",
+        "floor {:.3} m ({})",
         clip.floor,
-        if clip.floor_from_mesh { "mesh" } else { "joints" },
-        ANCHOR_FRAMES.min(count)
+        if clip.floor_from_contacts {
+            "5% quantile of the planted soles"
+        } else {
+            "mesh fallback: no reliable contact"
+        }
     ));
     lines.push(format!(
         "anchor residual rms x {:.3} z {:.3} m (y {:.3} m is FlowHMR's own height, by design)",

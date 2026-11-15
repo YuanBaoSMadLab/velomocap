@@ -7,16 +7,18 @@
 //! | --- | --- |
 //! | `IK::TwoBoneIk`, `IK::OneBoneIk` | `ik::two_bone_ik`, `ik::one_bone_ik` |
 //! | `TrajectoryCorrector` (ADMM) | `trajectory.rs` |
-//! | `CorrectHipsY` | `ground_feet` |
 //! | `CorrectHipsXZ` + `velocity_weights` | `foot_lock`, `velocity_weights` |
+//! | `prepare_contacts` (flat mode) | `contacts::prepare`, applied by `detect` |
+//! | `airborne_excursions` | `contacts` (it owns the flight mask) |
+//! | `reachable_pelvis_drop` / `reachable_pelvis_lift` + their envelope | `root_height::plan` |
+//! | `pelvis_offset` (`Pelvis Height Offset (from Auto)`) | `root_height::plan`, step 3 |
+//! | the airborne clearance term | `root_height::plan`, step 4 |
 //! | `DoContactIK` + `TargetReachFalloff` | `leg_ik`, `reach_falloff` |
 //! | `PRESETS` (`correction_settings.py`) | `Thresholds` |
 //! | `support_weights` / `support_samples` | `support_weight`, `support_point` |
-//! | `airborne_excursions` | `flight_frames` |
 //! | `rolling_anchor` | `rolling_anchor`, `rolling_path` |
 //! | `couple_anchors` | `couple_anchor_offsets` |
 //! | `smooth_auto_handoffs` / `_hermite` | `smooth_handoffs`, `hermite` |
-//! | `reachable_pelvis_lift` / `reachable_pelvis_drop` | capped lift and drop in `leg_ik` |
 //! | `anatomical_ik.solve_legs`, `reach_lengths`, `minimum_reach_lengths` | `anatomical` |
 //! | `SoleGeometry` | `sole::SoleGeometry` (default) |
 //! | `source_reach_gap` + reach gain | `anatomical::source_reach_gap` in `hand_lock` |
@@ -24,6 +26,12 @@
 //! | `contact_arm_plan.solve` (collar depression / swivel / wrist trim / elbow correction) | `arm_plan::Plan::solve`, applied by `plan_arm_stance` |
 //! | `contact_pose_plan._optimise_window` (root height against the reach bounds) | `pose_plan::plan`, applied by `pose_plan_window` |
 //! | `scipy.optimize.least_squares` (both planning passes) | `solver::minimise` |
+//!
+//! The vertical chain is the reference's five steps, in its order: the X/Z pin
+//! (`foot_lock`), then `root_height` (drop → lift → user offset → airborne
+//! clearance), then the pose plan, then the leg solve. There is deliberately no
+//! "drop the lowest point onto the floor" pass: the floor is measured *from* the
+//! contact soles (`crate::floor`), so the body is already standing on it.
 //!
 //! Known differences that are **not** ported:
 //!
@@ -33,6 +41,7 @@
 //! | the world-fixed palm offset used inside the reference's `predict` | kept live here instead (`palm = wrist + R_upper·R_elbow·R_wrist_local·offset`), because a fixed world offset no longer matches the palm the applied pose produces once the arm swings |
 //! | the pose plan's per-swing-target height variables and its predicted (flex, hip rotation) state | the state exists to regularise the joint solve; this port bounds the root against the same `reach`/`minimum_reach` limits directly, and measures neutral on both fixtures |
 //! | `CorrectJointRotations` | no counterpart on purpose: it only moves a bone whose `fullBodyMask` is set, and the reference's own call passes a mask of zeros (`RGBMocap/mocap/correction.py` builds `c` from the contact array and passes `zero` for every body mask), so it is a no-op in that path |
+//! | the turning-pivot gate below | not in the reference: a run whose foot heading swings faster than 240 deg/s is released instead of pinned. Our network pivots on the ball of the foot in a turn far more than the reference's does, and pinning it there is visible jitter |
 //!
 //! `DoEffectorIK` is implemented as the position pin in `hand_lock`; its optional
 //! "keep the wrist orientation" branch is not needed because the IK only moves
@@ -40,8 +49,8 @@
 //!
 //! * Feet are pinned through the trajectory corrector: the contact frames are
 //!   pins, the rest is free, and the velocity/acceleration weights keep the root
-//!   from kinking where a contact run starts. Only X/Z move; the vertical
-//!   placement belongs to the floor solve.
+//!   from kinking where a contact run starts. Only X/Z move here; the vertical
+//!   placement belongs to `root_height` (reach) and `crate::floor` (the plane).
 //! * Hands are pinned through the window planner: `palm::plan` decides which
 //!   frames are supports, `arm_plan::Plan::solve` moves the collar, the shoulder
 //!   and the elbow of the whole stance at once, and the ramp frames around it get
@@ -97,7 +106,9 @@ pub struct CorrectionSettings {
     pub preset: LockPreset,
     /// Ground height in metres.
     pub floor: f32,
-    /// Vertical shift applied to the whole clip.
+    /// The reference's "Pelvis Height Offset (from Auto)", metres. Positive may
+    /// only give back the reach drop `root_height` applied; negative lowers the
+    /// body, faded by the contact strength so an airborne take is not moved.
     pub pelvis_offset: f32,
     /// Temporal smoothing weight applied before the contact passes. Smaller is
     /// stronger (0 turns it off); 1e-3 removes the network's per-frame noise
@@ -140,80 +151,38 @@ impl Default for CorrectionSettings {
 /// Solver parameters, mapped from the reference's `PRESETS` table
 /// (`correction_settings.py`).
 pub struct Thresholds {
-    /// How close to the ground a sole must be to count as planted.
-    pub contact_height: f32,
-    /// Horizontal speed above which a low foot is sliding, not planted.
-    pub contact_speed: f32,
-    /// Frames a correction fades in and out over.
-    pub blend_frames: usize,
     /// Hard cap on how far a frame may be moved (`anchor_drift`).
     pub max_correction: f32,
-    /// Shortest contact run that is kept (`minimum`).
-    pub min_run: usize,
     /// How much of the correction is applied (`strength`: weak holds 60%).
     pub strength: f32,
-    /// Dropouts shorter than this are bridged (`gap`).
-    pub bridge_frames: usize,
     /// Contact probability needed for a full-strength hold (`confidence`).
     pub confidence: f32,
-    /// Lower probability that keeps an existing stance alive (`release`). This
-    /// hysteresis is what stops the contact mask from flickering frame to frame,
-    /// which is what a per-frame pin turns into visible twitching.
-    pub release: f32,
-    /// Geometry gate for entering a contact, in metres per second. The network's
-    /// own probabilities are noisy, so a moving foot must never enter.
-    pub entry_speed: f32,
-    /// Vertical speed gate for entering a contact.
-    pub entry_vertical: f32,
-    /// How far above the foot's own lowest point a frame may be and still count.
-    pub entry_height: f32,
+    /// The contact gate itself: `confidence`, `release`, `minimum` and `gap`.
+    pub contacts: crate::contacts::Config,
 }
 
 impl CorrectionSettings {
     pub fn thresholds(&self) -> Thresholds {
         match self.preset {
-            // The reference calls these strong / normal / weak.
+            // The reference calls these strong / normal / weak. Its `gap` is a
+            // preset-level decision: only `strong` bridges a grounded dropout.
             LockPreset::Tight => Thresholds {
-                contact_height: 0.035,
-                contact_speed: 0.03,
-                blend_frames: 4,
                 max_correction: 0.20,
-                min_run: 2,
                 strength: 1.0,
-                bridge_frames: 2,
                 confidence: 0.65,
-                release: 0.5,
-                entry_speed: 0.25,
-                entry_vertical: 0.5,
-                entry_height: 0.06,
+                contacts: crate::contacts::Config::strong(),
             },
             LockPreset::Normal => Thresholds {
-                contact_height: 0.07,
-                contact_speed: 0.06,
-                blend_frames: 3,
                 max_correction: 0.12,
-                min_run: 2,
                 strength: 1.0,
-                bridge_frames: 2,
                 confidence: 0.65,
-                release: 0.65,
-                entry_speed: 0.25,
-                entry_vertical: 0.5,
-                entry_height: 0.06,
+                contacts: crate::contacts::Config::normal(),
             },
             LockPreset::Loose => Thresholds {
-                contact_height: 0.12,
-                contact_speed: 0.12,
-                blend_frames: 2,
                 max_correction: 0.12,
-                min_run: 1,
                 strength: 0.6,
-                bridge_frames: 0,
                 confidence: 0.75,
-                release: 0.75,
-                entry_speed: 0.25,
-                entry_vertical: 0.5,
-                entry_height: 0.06,
+                contacts: crate::contacts::Config::weak(),
             },
         }
     }
@@ -227,8 +196,10 @@ pub struct CorrectionReport {
     pub ik_frames: usize,
     /// Worst distance between a solved wrist and its pinned target.
     pub max_hand_error: f32,
-    /// Largest vertical correction applied by the ground pass.
+    /// Largest vertical correction applied by the root pass.
     pub vertical_shift: f32,
+    /// Largest pelvis drop needed to span a contact (`reachable_pelvis_drop`).
+    pub pelvis_drop: f32,
     /// Largest pelvis lift needed to reach a contact (`reachable_pelvis_lift`).
     pub pelvis_lift: f32,
     /// Jitter (99th percentile of the joint second difference) before the pass.
@@ -259,13 +230,14 @@ impl CorrectionReport {
 
     pub fn line(&self) -> String {
         let mut out = format!(
-            "correction: {} foot contacts, {} hand contacts, {} IK frames, max shift {:.3} m, hand residual {:.1} mm, ground {:+.3} m, pelvis lift {:.3} m, jitter {:.1}->{:.1} mm",
+            "correction: {} foot contacts, {} hand contacts, {} IK frames, max shift {:.3} m, hand residual {:.1} mm, root {:+.3} m (drop {:.3}, lift {:.3}), jitter {:.1}->{:.1} mm",
             self.foot_contacts,
             self.hand_contacts,
             self.ik_frames,
             self.max_shift,
             self.max_hand_error * 1000.0,
             self.vertical_shift,
+            self.pelvis_drop,
             self.pelvis_lift,
             self.jitter_before * 1000.0,
             self.jitter_after * 1000.0
@@ -301,11 +273,6 @@ pub fn apply_with_locks(
     if !settings.enabled {
         return Ok(report);
     }
-    if settings.pelvis_offset != 0.0 {
-        for pose in &mut clip.poses {
-            pose.translation[1] += settings.pelvis_offset;
-        }
-    }
     let thresholds = settings.thresholds();
     // Skinned sole patches: contact points come from the foot mesh, not from
     // joints, exactly like the reference's SoleGeometry.
@@ -332,11 +299,32 @@ pub fn apply_with_locks(
     let source_skeletons = clip.skeletons.clone();
     let before = quality(&clip.skeletons, settings.floor);
 
+    // One detection for the whole clip: the contacts, the airborne arcs and the
+    // floor they imply. Every pass below reads this instead of re-detecting, so
+    // the root plan, the pin and the leg solve cannot disagree about a stance.
+    // Only the foot passes need it, so `--no-foot` does not pay for the skinning.
+    let mut detected = Detection::empty(settings.floor);
     if settings.foot {
-        foot_lock(sole.as_ref(), clip, settings, locks, &thresholds, &mut report);
-        ground_feet(clip, body, settings, &thresholds, &mut report);
+        detected = detect(sole.as_ref(), clip, settings, &thresholds);
+        for foot in 0..2 {
+            report.detected[foot] = foot_runs(&detected.prepared.active, foot)
+                .into_iter()
+                .map(|(begin, end)| [begin, end])
+                .collect();
+        }
+    }
+
+    let mut foot = FootPass {
+        support: vec![[false; 2]; clip.skeletons.len()],
+        holds: vec![[0.0; 2]; clip.skeletons.len()],
+    };
+    if settings.foot {
+        foot = foot_lock(sole.as_ref(), clip, settings, locks, &thresholds, &detected, &mut report);
+        // The reference's vertical chain: drop, lift, the user's own offset and
+        // the airborne clearance, all before the pose plan sees the root.
+        root_height_pass(clip, body, settings, &foot, &detected, &mut report);
         if settings.pose_plan {
-            pose_plan_window(clip, body, settings, &mut report);
+            pose_plan_window(clip, body, settings, &foot, &detected, &mut report);
         }
     }
     if settings.hand {
@@ -345,7 +333,7 @@ pub fn apply_with_locks(
     // Kimodo's order: end effectors (hands) first, then the contact IK that
     // stabilises the legs on the ground.
     if settings.foot && settings.leg_ik {
-        leg_ik(sole.as_ref(), clip, body, settings, &thresholds, &mut report);
+        leg_ik(sole.as_ref(), clip, body, settings, &thresholds, &foot, &mut report);
     }
 
     clip.skeletons = clip
@@ -453,178 +441,128 @@ fn jitter_score(skeletons: &[Skeleton]) -> f32 {
     values[index]
 }
 
-/// The contact mask for one foot, built once and shared by every pass.
-///
-/// This is the part of the reference that makes the result *stable*: contacts are
-/// resolved once, with hysteresis (`confidence` to enter, `release` to stay),
-/// geometry gates (a moving foot never enters), bridging of short dropouts, and a
-/// minimum duration. A mask that flickers frame to frame turns a per-frame pin
-/// into visible twitching, which is exactly what a plain threshold produces.
-///
-/// The network's own contact probabilities are used when the head is actually
-/// informative: on some FlowHMR outputs the four channels never rise above a few
-/// tenths, and gating on them would drop every contact. In that case the gates
-/// fall back to geometry, which is what the reference does before it has a usable
-/// probability.
-fn contact_mask(
+/// One frame's sole probes, in the layout `contacts::prepare` expects: per foot
+/// the toe-side then heel-side patch (it reduces each foot to a minimum and a
+/// mean, so the order inside a foot does not matter).
+fn sole_row(sole: Option<&Sole>, clip: &FlowClip, frame: usize) -> crate::contacts::Probes {
+    let mut row = [[[0.0f32; 3]; 2]; 2];
+    for (foot, (ankle, toe)) in [(LEFT_ANKLE, LEFT_FOOT), (RIGHT_ANKLE, RIGHT_FOOT)]
+        .into_iter()
+        .enumerate()
+    {
+        let (toe_at, heel) = sole_points(sole, clip, frame, foot, ankle, toe);
+        row[foot] = [toe_at, heel];
+    }
+    row
+}
+
+fn probe_rows(sole: Option<&Sole>, clip: &FlowClip) -> Vec<crate::contacts::Probes> {
+    (0..clip.skeletons.len())
+        .map(|frame| sole_row(sole, clip, frame))
+        .collect()
+}
+
+/// Runs of one foot's contact mask.
+fn foot_runs(active: &[[bool; 2]], foot: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < active.len() {
+        if !active[index][foot] {
+            index += 1;
+            continue;
+        }
+        let begin = index;
+        while index < active.len() && active[index][foot] {
+            index += 1;
+        }
+        out.push((begin, index));
+    }
+    out
+}
+
+/// The clip's contacts, airborne arcs and the floor they imply, resolved once.
+pub struct Detection {
+    pub prepared: crate::contacts::Prepared,
+    pub rows: Vec<crate::contacts::Probes>,
+}
+
+impl Detection {
+    /// No detection at all, for a pass that does not correct the feet.
+    fn empty(floor: f32) -> Self {
+        Self {
+            prepared: crate::contacts::Prepared {
+                active: Vec::new(),
+                flight: Vec::new(),
+                floor,
+                samples: 0,
+            },
+            rows: Vec::new(),
+        }
+    }
+}
+
+/// Contact detection: `prepare_contacts` plus the one gate the reference does not
+/// have (see the module docs), so every pass below agrees on what is planted.
+fn detect(
     sole: Option<&Sole>,
     clip: &FlowClip,
-    foot: usize,
-    ankle: usize,
-    toe: usize,
+    settings: &CorrectionSettings,
     thresholds: &Thresholds,
-    fps: f32,
-) -> Vec<bool> {
+) -> Detection {
+    let rows = probe_rows(sole, clip);
+    let fps = clip.fps.max(1.0);
+    let mut prepared = crate::contacts::prepare(
+        &rows,
+        &clip.foot_contacts,
+        fps,
+        &thresholds.contacts,
+        Some(settings.floor),
+    );
+    release_pivots(clip, fps, &mut prepared);
+    Detection { prepared, rows }
+}
+
+/// A turning clip pivots on the ball of the foot while the sole stays down.
+/// Pinning such a stance horizontally fights the motion and reads as jitter, so a
+/// run whose foot heading swings faster than 240 deg/s is released.
+///
+/// This is a deliberate addition: it is not in the reference, whose network does
+/// not pivot this hard on a turn. `contacts::prepare` is left alone so the floor
+/// estimate still sees every stance the geometry found.
+fn release_pivots(clip: &FlowClip, fps: f32, prepared: &mut crate::contacts::Prepared) {
     let count = clip.skeletons.len();
-    let mut active = vec![false; count];
-    if count == 0 {
-        return active;
+    if count < 2 {
+        return;
     }
-    let mut height = vec![0.0f32; count];
-    let mut speed = vec![0.0f32; count];
-    let mut vertical = vec![0.0f32; count];
-    let mut heading = vec![0.0f32; count];
-    let mut confidence = vec![0.0f32; count];
-    for frame in 0..count {
-        let skeleton = &clip.skeletons[frame];
-        height[frame] = joint(skeleton, ankle)[1].min(joint(skeleton, toe)[1]);
-        let point = support_point(sole, clip, frame, foot, ankle, toe);
-        if frame > 0 {
-            let previous = support_point(sole, clip, frame - 1, foot, ankle, toe);
-            let dx = point[0] - previous[0];
-            let dz = point[2] - previous[2];
-            speed[frame] = (dx * dx + dz * dz).sqrt() * fps;
-            vertical[frame] = (height[frame] - height[frame - 1]).abs() * fps;
+    for (foot, (ankle, toe)) in [(LEFT_ANKLE, LEFT_FOOT), (RIGHT_ANKLE, RIGHT_FOOT)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut heading = vec![0.0f32; count];
+        for frame in 0..count {
+            let ankle_at = joint(&clip.skeletons[frame], ankle);
+            let toe_at = joint(&clip.skeletons[frame], toe);
+            heading[frame] = (toe_at[2] - ankle_at[2]).atan2(toe_at[0] - ankle_at[0]);
         }
-        // The four channels are two per foot in the reference (`reshape(n,2,2)`);
-        // which pair belongs to which foot differs between checkpoints, so take
-        // the foot's own pair and fall back to the largest of the row.
-        let row = clip.foot_contacts.get(frame).copied().unwrap_or([0.0; 4]);
-        let pair = if foot == 0 {
-            [row[0], row[1]]
-        } else {
-            [row[2], row[3]]
-        };
-        confidence[frame] = pair[0].max(pair[1]);
-        // Foot heading in the ground plane: a foot that pivots during a turn is
-        // not a horizontal pin, it is a pivot, and pinning it fights the motion.
-        let direction = [
-            joint(skeleton, toe)[0] - joint(skeleton, ankle)[0],
-            joint(skeleton, toe)[2] - joint(skeleton, ankle)[2],
-        ];
-        heading[frame] = direction[1].atan2(direction[0]);
-    }
-    // Only trust the probabilities when this clip actually produces them.
-    let best = confidence.iter().cloned().fold(0.0f32, f32::max);
-    let use_probability = best >= thresholds.confidence * 0.9;
-
-    let lowest = height.iter().cloned().fold(f32::MAX, f32::min);
-    let mut entry = vec![false; count];
-    let mut holding = vec![false; count];
-    for frame in 0..count {
-        // The foot has to be near its own lowest point *and* near the floor:
-        // without usable contact probabilities, geometry alone has to be
-        // conservative or a turning clip gets pinned while it is still walking.
-        let geometry = speed[frame] < thresholds.entry_speed
-            && vertical[frame] < thresholds.entry_vertical
-            && height[frame] - lowest < thresholds.entry_height
-            && height[frame] <= lowest + thresholds.contact_height;
-        entry[frame] = geometry
-            && (!use_probability || confidence[frame] > thresholds.confidence);
-        holding[frame] = speed[frame] < 0.25
-            && vertical[frame] < thresholds.entry_vertical
-            && (height[frame] - lowest).abs() < 0.04
-            && (!use_probability || confidence[frame] > thresholds.release);
-    }
-    active.copy_from_slice(&entry);
-
-    // Bridge a brief dropout only between two existing stances, close to the
-    // floor and without a step: never across a lifted foot.
-    let gap_frames = thresholds.bridge_frames;
-    if gap_frames > 0 {
-        let mut index = 0;
-        while index < count {
-            if active[index] {
-                index += 1;
-                continue;
+        for (begin, end) in foot_runs(&prepared.active, foot) {
+            let mut fastest = 0.0f32;
+            for frame in begin + 1..end {
+                let mut delta = heading[frame] - heading[frame - 1];
+                while delta > std::f32::consts::PI {
+                    delta -= std::f32::consts::TAU;
+                }
+                while delta < -std::f32::consts::PI {
+                    delta += std::f32::consts::TAU;
+                }
+                fastest = fastest.max(delta.abs() * fps);
             }
-            let begin = index;
-            while index < count && !active[index] {
-                index += 1;
-            }
-            let end = index;
-            if begin == 0 || end == count || end - begin > gap_frames {
-                continue;
-            }
-            if !(begin..end).all(|frame| holding[frame]) {
-                continue;
-            }
-            let before = support_point(sole, clip, begin - 1, foot, ankle, toe);
-            let after = support_point(sole, clip, end, foot, ankle, toe);
-            let dx = after[0] - before[0];
-            let dz = after[2] - before[2];
-            if (dx * dx + dz * dz).sqrt() < 0.04 {
-                for hit in &mut active[begin..end] {
-                    *hit = true;
+            if fastest > 240.0f32.to_radians() {
+                for frame in begin..end {
+                    prepared.active[frame][foot] = false;
                 }
             }
         }
     }
-
-    // Hysteresis: a stance that already exists survives while the foot only
-    // *holds*, which is what stops the mask from chattering on a noisy frame.
-    let runs: Vec<(usize, usize)> = contact_runs(&active, 1);
-    for (begin, end) in runs {
-        let mut first = begin;
-        while first > 0 && holding[first - 1] && !active[first - 1] {
-            first -= 1;
-            active[first] = true;
-        }
-        let mut last = end;
-        while last < count && holding[last] && !active[last] {
-            active[last] = true;
-            last += 1;
-        }
-    }
-
-    // Minimum duration, then the airborne gate.
-    let minimum = thresholds.min_run.max(2);
-    for (begin, end) in contact_runs(&active, 1) {
-        if end - begin < minimum {
-            for hit in &mut active[begin..end] {
-                *hit = false;
-            }
-        }
-    }
-    let flight = flight_frames(clip, lowest);
-    for frame in 0..count {
-        if flight[frame] {
-            active[frame] = false;
-        }
-    }
-
-    // A turning clip pivots on the ball of the foot while the sole stays down.
-    // Pinning such a stance horizontally fights the motion and shows up as
-    // jitter, so a run whose heading swings faster than 240 deg/s is not a pin.
-    for (begin, end) in contact_runs(&active, 1) {
-        let mut fastest = 0.0f32;
-        for frame in begin + 1..end {
-            let mut delta = heading[frame] - heading[frame - 1];
-            while delta > std::f32::consts::PI {
-                delta -= std::f32::consts::TAU;
-            }
-            while delta < -std::f32::consts::PI {
-                delta += std::f32::consts::TAU;
-            }
-            fastest = fastest.max(delta.abs() * fps);
-        }
-        if fastest > 240.0f32.to_radians() {
-            for hit in &mut active[begin..end] {
-                *hit = false;
-            }
-        }
-    }
-    active
 }
 
 /// Kimodo's velocity weights: slow motion is preserved more strongly, so a
@@ -648,79 +586,89 @@ fn velocity_weights(clip: &FlowClip) -> Vec<f64> {
     weights
 }
 
-/// Vertical correction, ported from Kimodo's `CorrectHipsY`: the frames where a
-/// sole is on the ground are pins, the rest is free, and the position, velocity
-/// and acceleration weights keep the height a smooth curve instead of the
-/// per-frame snapping that made the body bob.
-fn ground_feet(
+/// The reference's vertical chain, steps 1–4: the reach drop, the reach lift, the
+/// user's own pelvis offset and the airborne clearance (`correction.py`).
+///
+/// Step 5 is [`pose_plan_window`], which runs afterwards on the root this
+/// produced. Nothing here pins the body to the floor: the floor was measured from
+/// these very contacts (`crate::floor`), so the soles already stand on it and a
+/// "lowest point onto the plane" pass would fight the reach bounds.
+fn root_height_pass(
     clip: &mut FlowClip,
     body: &BodyModel,
     settings: &CorrectionSettings,
-    thresholds: &Thresholds,
+    foot: &FootPass,
+    detection: &Detection,
     report: &mut CorrectionReport,
 ) {
     let count = clip.skeletons.len();
-    if count < 3 {
+    if count < 2 {
         return;
     }
-    let feet = [(LEFT_ANKLE, LEFT_FOOT), (RIGHT_ANKLE, RIGHT_FOOT)];
-    let tolerance = thresholds.contact_height;
-    let mut margins = vec![-1.0f64; count];
-    let mut observation = vec![0.0f64; count];
-    let mut pinned = 0usize;
+    let rest = body.rest_joints(&clip.betas);
+    let legs = [(1usize, 4usize, 7usize), (2, 5, 8)];
+    let mut frames = Vec::with_capacity(count);
     for frame in 0..count {
-        let mut stack = [0.0f32; 2];
-        let mut lowest = f32::MAX;
-        for (slot, (ankle, toe)) in feet.iter().enumerate() {
-            let at = joint(&clip.skeletons[frame], *ankle)[1].min(joint(&clip.skeletons[frame], *toe)[1]);
-            stack[slot] = at;
-            lowest = lowest.min(at);
+        let (world, positions) = crate::anatomical::forward(body, &clip.poses[frame], &rest);
+        let mut high = [0.0f64; 2];
+        let mut low = [0.0f64; 2];
+        for (leg, (hip, knee, ankle)) in legs.iter().enumerate() {
+            let knee_local = match body.parents[*knee] {
+                parent if parent >= 0 => math::tmul3(&world[parent as usize], &world[*knee]),
+                _ => world[*knee],
+            };
+            high[leg] = crate::anatomical::reach(&rest, *hip, *knee, *ankle, &knee_local);
+            low[leg] = crate::anatomical::minimum_reach(&rest, *hip, *knee, *ankle, &knee_local);
         }
-        // Only the lowest sole decides: a stepping foot is not a pin.
-        let gap = lowest - settings.floor;
-        // A swing frame whose sole would clip through the floor gets a bounded
-        // clearance target (`min(max(floor - height, 0), .12)` in the reference's
-        // swing guard). It is not a pin, so the corrector blends it.
-        let clearance = if gap < -0.01 {
-            (-gap).min(0.12)
-        } else {
-            0.0
-        };
-        observation[frame] = (clip.poses[frame].translation[1] - gap + clearance) as f64;
-        if gap <= tolerance {
-            margins[frame] = 0.0;
-            pinned += 1;
-        }
+        let row = &detection.rows[frame];
+        let lowest = row[0][0][1]
+            .min(row[0][1][1])
+            .min(row[1][0][1])
+            .min(row[1][1][1]);
+        let active = foot.support[frame];
+        frames.push(crate::root_height::Frame {
+            hips: [positions[LEFT_HIP], positions[RIGHT_HIP]],
+            targets: [positions[LEFT_ANKLE], positions[RIGHT_ANKLE]],
+            high,
+            low,
+            active,
+            flight: detection.prepared.flight.get(frame).copied().unwrap_or(false),
+            lowest: lowest as f64,
+            // `contact_strength(...).max(axis=1)`: how firmly this frame is held,
+            // which is what a negative user offset fades with.
+            strength: if active[0] || active[1] {
+                foot.holds[frame][0].max(foot.holds[frame][1])
+            } else {
+                0.0
+            },
+        });
     }
-    if pinned < 2 {
-        return;
-    }
-
-    // Kimodo's weights for the vertical pass: position x10, velocity x1,
-    // acceleration x0.1.
-    let reference: Vec<f64> = clip.poses.iter().map(|pose| pose.translation[1] as f64).collect();
-    let corrector = crate::trajectory::TrajectoryCorrector::new(
-        &margins,
-        POS_WEIGHT * 10.0,
-        VEL_WEIGHT,
-        ACC_WEIGHT * 0.1,
-        &[],
-        60,
+    let delta = crate::root_height::plan(
+        &frames,
+        settings.floor as f64,
+        clip.fps as f64,
+        settings.mode == CorrectionMode::Flat,
+        settings.pelvis_offset as f64,
     );
-    let corrected = corrector.interpolate(&observation, &reference);
-    let cap = thresholds.max_correction as f64;
     let mut moved = 0.0f32;
+    let mut dropped = 0.0f32;
+    let mut lifted = 0.0f32;
     for frame in 0..count {
-        let delta = (corrected[frame] - reference[frame]).clamp(-cap, cap);
-        moved = moved.max(delta.abs() as f32);
-        clip.poses[frame].translation[1] += delta as f32;
+        let shift = delta[frame] as f32;
+        if shift == 0.0 {
+            continue;
+        }
+        if shift < 0.0 {
+            dropped = dropped.max(-shift);
+        } else {
+            lifted = lifted.max(shift);
+        }
+        moved = moved.max(shift.abs());
+        clip.poses[frame].translation[1] += shift;
     }
-    report.vertical_shift = moved;
-    // The skeletons must follow immediately. The hand pass and the leg IK run
-    // next and read them; leaving them stale was what made two individually
-    // harmless passes add up to 25 mm of jitter on a turning clip, because the
-    // hands were pinned to targets measured before the body settled onto the
-    // floor.
+    report.vertical_shift = report.vertical_shift.max(moved);
+    report.pelvis_drop = dropped;
+    report.pelvis_lift = lifted;
     if moved > 0.0 {
         for frame in 0..count {
             clip.skeletons[frame] = body.forward_joints(&clip.poses[frame]);
@@ -730,14 +678,17 @@ fn ground_feet(
 
 /// Plan the root height over the window (`contact_pose_plan._optimise_window`).
 ///
-/// Runs after the ground pass has settled the body and before the leg IK, which
-/// is the reference's order: the plan keeps the *predicted* leg solve inside the
-/// chain's reach bounds and lifts a free foot out of the floor, then the leg solve
-/// runs against the planned root.
+/// The fifth and last step of the reference's vertical chain, running after
+/// [`root_height_pass`] has applied the reach drop, the lift, the user offset and
+/// the airborne clearance, and before the leg IK. It keeps the *predicted* leg
+/// solve inside the chain's reach bounds and lifts a free foot out of the floor
+/// on top of that root, so the leg solve runs against the planned height.
 fn pose_plan_window(
     clip: &mut FlowClip,
     body: &BodyModel,
     settings: &CorrectionSettings,
+    foot: &FootPass,
+    detection: &Detection,
     report: &mut CorrectionReport,
 ) {
     let count = clip.skeletons.len();
@@ -746,19 +697,15 @@ fn pose_plan_window(
     }
     let rest = body.rest_joints(&clip.betas);
     let legs = [(1usize, 4usize, 7usize), (2, 5, 8)];
-    let flight = flight_frames(clip, settings.floor);
     let mut frames = Vec::with_capacity(count);
     for frame in 0..count {
         let (world, positions) = crate::anatomical::forward(body, &clip.poses[frame], &rest);
-        let mut active = [false; 2];
-        let mut lowest = f64::MAX;
-        for (leg, (hip, knee, ankle)) in legs.iter().enumerate() {
-            let sole = positions[*ankle][1]
-                .min(positions[if *ankle == LEFT_ANKLE { LEFT_FOOT } else { RIGHT_FOOT }][1]);
-            lowest = lowest.min(sole);
-            active[leg] = sole - settings.floor as f64 <= 0.02;
-            let _ = (hip, knee);
-        }
+        let row = &detection.rows[frame];
+        let lowest = row[0][0][1]
+            .min(row[0][1][1])
+            .min(row[1][0][1])
+            .min(row[1][1][1]);
+        let active = foot.support[frame];
         let mut high = [0.0f64; 2];
         let mut low = [0.0f64; 2];
         for (leg, (hip, knee, ankle)) in legs.iter().enumerate() {
@@ -773,11 +720,11 @@ fn pose_plan_window(
             base: clip.poses[frame].translation[1] as f64,
             hips: [positions[1], positions[2]],
             ankles: [positions[7], positions[8]],
-            lowest,
+            lowest: lowest as f64,
             active,
             high,
             low,
-            flight: flight[frame],
+            flight: detection.prepared.flight.get(frame).copied().unwrap_or(false),
         });
     }
     let planned = crate::pose_plan::plan(
@@ -983,6 +930,7 @@ fn leg_ik(
     body: &BodyModel,
     settings: &CorrectionSettings,
     thresholds: &Thresholds,
+    foot: &FootPass,
     report: &mut CorrectionReport,
 ) {
     let fps = clip.fps.max(1.0);
@@ -996,8 +944,6 @@ fn leg_ik(
         (2, 5, 8, 11), // right hip, knee, ankle, toe
     ];
     let cap = thresholds.max_correction.min(0.05) as f64;
-    let mut lifts = vec![0.0f32; count];
-    let mut drops = vec![0.0f32; count];
     for (foot_index, (hip, knee, ankle, toe)) in legs.into_iter().enumerate() {
         // Bone lengths from the rest pose: the reach limit for the falloff.
         let thigh = distance3(
@@ -1015,10 +961,8 @@ fn leg_ik(
             crate::anatomical::minimum_reach(&rest, hip, knee, ankle, &knee_local)
         };
 
-        // One mask for every pass: hysteresis and geometry gates, resolved once.
-        let contact = contact_mask(sole, clip, foot_index, ankle, toe, thresholds, fps);
-
-        for (begin, end) in contact_runs(&contact, thresholds.min_run) {
+        // The same runs the root pass holds on: contact timing resolved once.
+        for (begin, end) in foot_runs(&foot.support, foot_index) {
             // Same rolling anchor the root pass uses, so the leg IK and the root
             // agree on where the contact patch should be.
             let anchors = rolling_anchor(sole, clip, begin, end, foot_index, ankle, toe, settings.floor);
@@ -1067,35 +1011,9 @@ fn leg_ik(
                 }
                 let weight = weights[offset];
                 if weight <= 0.02 {
-                    // Kimodo's `reachable_pelvis_lift`: when the contact is out of
-                    // reach the pelvis is raised by the shortfall, never by more
-                    // than 12 cm, instead of leaving the leg straight and the foot
-                    // floating.
-                    let shortfall = distance3(
-                        target,
-                        [
-                            hip_pos[0] as f64,
-                            hip_pos[1] as f64,
-                            hip_pos[2] as f64,
-                        ],
-                    ) - max_reach * 0.999;
-                    if shortfall > 0.0 {
-                        lifts[index] = lifts[index].max(shortfall.min(0.12) as f32);
-                    }
-                    // The other side of the same bound: when the target sits
-                    // further below the hip than the leg can span, the reference
-                    // lowers the pelvis, capped at 25 cm.
-                    let dx = target[0] - hip_pos[0] as f64;
-                    let dz = target[2] - hip_pos[2] as f64;
-                    let horizontal = (dx * dx + dz * dz).sqrt();
-                    let vertical = hip_pos[1] as f64 - target[1];
-                    let limit = (max_reach * max_reach - horizontal * horizontal).max(0.0).sqrt();
-                    if horizontal < max_reach && vertical > 0.0 {
-                        let needed = (vertical - limit).clamp(0.0, 0.25);
-                        if needed > 0.0 {
-                            drops[index] = drops[index].max(needed as f32);
-                        }
-                    }
+                    // Out of reach: the root chain (`root_height`) has already
+                    // moved the pelvis as far as the bounds allow, so this frame
+                    // is left alone rather than levering the body again here.
                     continue;
                 }
                 // Clamp the *target* instead of rejecting the frame: a frame that
@@ -1114,11 +1032,6 @@ fn leg_ik(
                 if want[0].abs() + want[2].abs() < 1e-5 {
                     continue;
                 }
-                let blended = [
-                    (current[0] as f64 + want[0]) as f32,
-                    current[1],
-                    (current[2] as f64 + want[2]) as f32,
-                ];
                 let source = clip.poses[index].clone();
                 let (world, positions) = crate::anatomical::forward(body, &clip.poses[index], &rest);
                 if let Some(anatomy) = crate::anatomical::solve_leg(
@@ -1153,32 +1066,6 @@ fn leg_ik(
         }
     }
 
-    // Apply the collected pelvis lifts and rebuild the skeletons that saw them.
-    let mut lifted = 0.0f32;
-    for index in 0..count {
-        if lifts[index] <= 0.0 {
-            continue;
-        }
-        clip.poses[index].translation[1] += lifts[index];
-        clip.skeletons[index] = body.forward_joints(&clip.poses[index]);
-        lifted = lifted.max(lifts[index]);
-    }
-    report.pelvis_lift = lifted;
-}
-
-/// The reference's reachable_pelvis_drop: how far the pelvis has to come down
-/// so a target below the hip is still within the leg's vertical span. Capped at
-/// 25 cm, and zero when the target is reachable or above the hip.
-fn pelvis_drop(hip: [f64; 3], target: [f64; 3], max_reach: f64) -> f64 {
-    let dx = target[0] - hip[0];
-    let dz = target[2] - hip[2];
-    let horizontal = (dx * dx + dz * dz).sqrt();
-    let vertical = hip[1] - target[1];
-    if horizontal >= max_reach || vertical <= 0.0 {
-        return 0.0;
-    }
-    let limit = (max_reach * max_reach - horizontal * horizontal).max(0.0).sqrt();
-    (vertical - limit).clamp(0.0, 0.25)
 }
 
 /// Gaussian smoothing of a per-frame IK weight along a stance, sigma =
@@ -1250,34 +1137,12 @@ fn joint3(rest: &[f32], index: usize) -> [f64; 3] {
     ]
 }
 
-fn joint(skeleton: &Skeleton, index: usize) -> [f32; 3] {    [
+fn joint(skeleton: &Skeleton, index: usize) -> [f32; 3] {
+    [
         skeleton.positions[index * 3],
         skeleton.positions[index * 3 + 1],
         skeleton.positions[index * 3 + 2],
     ]
-}
-
-fn contact_runs(contact: &[bool], min_run: usize) -> Vec<(usize, usize)> {
-    let mut runs = Vec::new();
-    let mut start = None;
-    for (index, hit) in contact.iter().enumerate() {
-        match (hit, start) {
-            (true, None) => start = Some(index),
-            (false, Some(begin)) => {
-                if index - begin >= min_run {
-                    runs.push((begin, index));
-                }
-                start = None;
-            }
-            _ => {}
-        }
-    }
-    if let Some(begin) = start {
-        if contact.len() - begin >= min_run {
-            runs.push((begin, contact.len()));
-        }
-    }
-    runs
 }
 
 /// The integration step of `rolling_anchor`, split out so it can be tested
@@ -1411,8 +1276,6 @@ fn support_point(
     ]
 }
 
-/// The skinned sole patches for every frame, built once per clip.
-/// ground on both sides is a jump, so it must not be pinned as a contact.
 /// The skinned sole patches, sampled from the current skeletons so they follow
 /// every pose change the passes make.
 pub struct Sole {
@@ -1422,9 +1285,27 @@ pub struct Sole {
 
 impl Sole {
     pub fn build(clip: &FlowClip, body: &BodyModel) -> Option<Self> {
-        let geometry = crate::sole::SoleGeometry::build(body, &clip.betas).ok()?;
-        let rest = body.rest_joints(&clip.betas);
+        Self::for_shape(body, &clip.betas)
+    }
+
+    /// The same geometry from a shape alone, for a clip that has not been built
+    /// yet (the floor pass runs on poses and skeletons before the clip exists).
+    pub fn for_shape(body: &BodyModel, betas: &[f32]) -> Option<Self> {
+        let geometry = crate::sole::SoleGeometry::build(body, betas).ok()?;
+        let rest = body.rest_joints(betas);
         Some(Self { geometry, rest })
+    }
+
+    /// Both feet at once: per foot the toe-side then heel-side patch. One
+    /// skinning pass instead of one per foot.
+    pub fn row(&self, skeleton: &Skeleton) -> [[[f32; 3]; 2]; 2] {
+        let probes = self.geometry.sample(skeleton, &self.rest, 0);
+        // `sample` returns [back, front] per foot; the rest of the pass wants
+        // (toe side, heel side).
+        [
+            [probes[0][1], probes[0][0]],
+            [probes[1][1], probes[1][0]],
+        ]
     }
 
     /// (toe side, heel side) of one foot on one frame, from the frame's
@@ -1435,42 +1316,22 @@ impl Sole {
     }
 }
 
-/// ground on both sides is a jump, so it must not be pinned as a contact.
-fn flight_frames(clip: &FlowClip, floor: f32) -> Vec<bool> {
-    let count = clip.skeletons.len();
-    let mut flight = vec![false; count];
-    if count < 5 {
-        return flight;
-    }
-    let mut lowest = vec![f32::MAX; count];
-    for frame in 0..count {
-        for (ankle, toe) in [(LEFT_ANKLE, LEFT_FOOT), (RIGHT_ANKLE, RIGHT_FOOT)] {
-            let at = joint(&clip.skeletons[frame], ankle)[1].min(joint(&clip.skeletons[frame], toe)[1]);
-            lowest[frame] = lowest[frame].min(at);
+/// What the foot pin found, so the root plan can measure reach against the same
+/// frames that are actually being held.
+pub struct FootPass {
+    /// Per frame, per foot: a pin is in force.
+    pub support: Vec<[bool; 2]>,
+    /// Per frame, per foot: the hold strength behind that pin (0 = no pin).
+    pub holds: Vec<[f32; 2]>,
+}
+
+impl FootPass {
+    fn empty(frames: usize) -> Self {
+        Self {
+            support: vec![[false; 2]; frames],
+            holds: vec![[0.0; 2]; frames],
         }
     }
-    let reach = ((clip.fps.max(1.0) * 4.0) as usize).clamp(2, count);
-    let mut index = 0;
-    while index < count {
-        if lowest[index] - floor <= 0.15 {
-            index += 1;
-            continue;
-        }
-        let begin = index;
-        while index < count && lowest[index] - floor > 0.15 {
-            index += 1;
-        }
-        let end = index;
-        // Needs lower ground (or the clip boundary) on both sides to be an arc.
-        let before = begin == 0 || (0..begin).any(|frame| lowest[frame] - floor <= 0.15);
-        let after = end == count || (end..count).any(|frame| lowest[frame] - floor <= 0.15);
-        if before && after && end - begin <= reach {
-            for hit in &mut flight[begin..end] {
-                *hit = true;
-            }
-        }
-    }
-    flight
 }
 
 fn foot_lock(
@@ -1479,12 +1340,14 @@ fn foot_lock(
     settings: &CorrectionSettings,
     locks: &crate::locks::ContactTracks,
     thresholds: &Thresholds,
+    detection: &Detection,
     report: &mut CorrectionReport,
-) {
+) -> FootPass {
     let fps = clip.fps.max(1.0);
     let count = clip.skeletons.len();
+    let mut pass = FootPass::empty(count);
     if count < 2 {
-        return;
+        return pass;
     }
     let feet: [(usize, usize); 2] = [(LEFT_ANKLE, LEFT_FOOT), (RIGHT_ANKLE, RIGHT_FOOT)];
     let mut pinned = vec![false; count];
@@ -1512,15 +1375,10 @@ fn foot_lock(
         // both feet at once; per track is the same thing for the editor's
         // workflow and keeps an untouched foot on its own detection.
         let manual = locks.runs(foot_index, count);
-        let contact = contact_mask(sole, clip, foot_index, ankle, toe, thresholds, fps);
         let runs = match &manual {
             Some(runs) => runs.clone(),
-            None => contact_runs(&contact, thresholds.min_run),
+            None => foot_runs(&detection.prepared.active, foot_index),
         };
-        if manual.is_none() {
-            // The editor's baseline: what detection found, before any drawing.
-            report.detected[foot_index] = runs.iter().map(|(a, b)| [*a, *b]).collect();
-        }
         if runs.is_empty() {
             continue;
         }
@@ -1552,6 +1410,8 @@ fn foot_lock(
                 anchors[index] = path[offset];
                 support[index] = support_point(sole, clip, index, foot_index, ankle, toe);
                 holds[index] = hold;
+                pass.support[index][foot_index] = true;
+                pass.holds[index][foot_index] = hold;
             }
         }
 
@@ -1562,8 +1422,8 @@ fn foot_lock(
         for (stance, (begin, end)) in runs.iter().enumerate() {
             let adjustment = adjustments[stance];
             for index in *begin..*end {
-                // Horizontal only: the vertical placement is solved when the clip
-                // is dropped onto its floor.
+                // Horizontal only: the vertical placement belongs to the root
+                // chain, which measures reach against the legs, not the plane.
                 local_x[index] = (anchors[index][0] + adjustment[0] - support[index][0]) as f64
                     * holds[index] as f64;
                 local_z[index] = (anchors[index][2] + adjustment[1] - support[index][2]) as f64
@@ -1591,7 +1451,7 @@ fn foot_lock(
     }
 
     if !pinned.iter().any(|hit| *hit) {
-        return;
+        return pass;
     }
 
     // Kimodo's trajectory corrector: the contact frames are pins (margin 0), the
@@ -1605,7 +1465,7 @@ fn foot_lock(
         }
     }
     if !margins.iter().any(|margin| *margin == 0.0) {
-        return;
+        return pass;
     }
     let reference = vec![0.0f64; count];
     // Kimodo's velocity weights: standing still is weighted up so the root does
@@ -1636,6 +1496,7 @@ fn foot_lock(
             clip.poses[index].translation[axis] += delta[axis] as f32;
         }
     }
+    pass
 }
 
 fn hand_lock(
@@ -2451,7 +2312,7 @@ mod tests {
                 betas: vec![0.0; 16],
                 foot_contacts: Vec::new(),
                 floor: 0.0,
-                floor_from_mesh: false,
+                floor_from_contacts: false,
                 offset: [0.0; 3],
                 source_frames: (0..frames).collect(),
                 anchors: 0,
@@ -2463,27 +2324,31 @@ mod tests {
         let mut tracks = crate::locks::ContactTracks::automatic();
         let mut report = CorrectionReport::default();
         let mut clip = build(&body);
-        foot_lock(None, &mut clip, &settings, &tracks, &thresholds, &mut report);
+        let detected = detect(None, &clip, &settings, &thresholds);
+        foot_lock(None, &mut clip, &settings, &tracks, &thresholds, &detected, &mut report);
         assert_eq!(report.foot_contacts, 0, "a sliding clip has no stance");
         tracks.set_track(crate::locks::LEFT_FOOT, vec![[4, 12]]);
         tracks.set_track(crate::locks::RIGHT_FOOT, vec![[16, 24]]);
         let mut report = CorrectionReport::default();
         let mut clip = build(&body);
-        foot_lock(None, &mut clip, &settings, &tracks, &thresholds, &mut report);
+        let detected = detect(None, &clip, &settings, &thresholds);
+        foot_lock(None, &mut clip, &settings, &tracks, &thresholds, &detected, &mut report);
         assert_eq!(report.foot_contacts, 2, "one run per locked foot");
 
         // Emptying a track is not "back to automatic": it says no contact.
         tracks.set_track(crate::locks::LEFT_FOOT, Vec::new());
         let mut report = CorrectionReport::default();
         let mut clip = build(&body);
-        foot_lock(None, &mut clip, &settings, &tracks, &thresholds, &mut report);
+        let detected = detect(None, &clip, &settings, &thresholds);
+        foot_lock(None, &mut clip, &settings, &tracks, &thresholds, &detected, &mut report);
         assert_eq!(report.foot_contacts, 1, "the empty track locks nothing");
 
         // And resetting every track goes back to detection, which finds nothing.
         tracks.reset();
         let mut report = CorrectionReport::default();
         let mut clip = build(&body);
-        foot_lock(None, &mut clip, &settings, &tracks, &thresholds, &mut report);
+        let detected = detect(None, &clip, &settings, &thresholds);
+        foot_lock(None, &mut clip, &settings, &tracks, &thresholds, &detected, &mut report);
         assert_eq!(report.foot_contacts, 0, "back to automatic detection");
     }
 
@@ -2581,7 +2446,7 @@ mod tests {
             betas: betas.clone(),
             foot_contacts: Vec::new(),
             floor: 0.0,
-            floor_from_mesh: true,
+            floor_from_contacts: true,
             offset: [0.0; 3],
             source_frames: (0..frames).collect(),
             anchors: 0,
@@ -2780,21 +2645,6 @@ mod tests {
         assert!((noise - 0.5).abs() < 1e-6, "noise {noise}");
     }
 
-    /// Only a target below the hip, beyond the leg's vertical span, pulls it down.
-    #[test]
-    #[test]
-    fn pelvis_drop_is_bounded_and_directional() {
-        let hip = [0.0, 0.9, 0.0];
-        // Straight down, 1.2 m below a 0.9 m leg: 0.3 m needed, capped at 0.25.
-        let far = pelvis_drop(hip, [0.0, -0.3, 0.0], 0.9);
-        assert!((far - 0.25).abs() < 1e-6, "capped drop {far}");
-        // Inside the span: nothing to do.
-        let near = pelvis_drop(hip, [0.0, 0.5, 0.0], 0.9);
-        assert_eq!(near, 0.0, "reachable target moved the pelvis");
-        // Above the hip: the lift path handles it, not the drop.
-        let above = pelvis_drop(hip, [0.0, 1.4, 0.0], 0.9);
-        assert_eq!(above, 0.0, "target above the hip");
-    }
     /// The analytic two-bone solve must put the wrist on its target and must not
     /// disturb the rest of the body.
     #[test]

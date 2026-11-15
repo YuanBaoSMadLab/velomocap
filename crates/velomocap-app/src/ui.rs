@@ -1822,11 +1822,17 @@ fn correction_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
                 }
             });
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(i18n::t("Pelvis Offset")).size(11.0));
+                // The reference calls this "Pelvis Height Offset (from Auto)": it
+                // may only give back the reach drop the root pass applied, so the
+                // useful range is the same ±0.25 m.
+                ui.label(egui::RichText::new(i18n::t("Pelvis Offset")).size(11.0))
+                    .on_hover_text(i18n::t(
+                        "Offset from the automatic pelvis height; positive gives back the reach drop, negative lowers the body",
+                    ));
                 ui.add(
                     egui::DragValue::new(&mut app.correction.pelvis_offset)
                         .speed(0.005)
-                        .range(-1.0..=1.0)
+                        .range(-0.25..=0.25)
                         .suffix(" m"),
                 );
             });
