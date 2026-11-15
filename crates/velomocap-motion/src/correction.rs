@@ -147,18 +147,21 @@ pub struct CorrectionReport {
     pub max_hand_error: f32,
     /// Largest vertical correction applied by the ground pass.
     pub vertical_shift: f32,
+    /// Largest pelvis lift needed to reach a contact (`reachable_pelvis_lift`).
+    pub pelvis_lift: f32,
 }
 
 impl CorrectionReport {
     pub fn line(&self) -> String {
         format!(
-            "correction: {} foot contacts, {} hand contacts, {} IK frames, max shift {:.3} m, hand residual {:.1} mm, ground {:+.3} m",
+            "correction: {} foot contacts, {} hand contacts, {} IK frames, max shift {:.3} m, hand residual {:.1} mm, ground {:+.3} m, pelvis lift {:.3} m",
             self.foot_contacts,
             self.hand_contacts,
             self.ik_frames,
             self.max_shift,
             self.max_hand_error * 1000.0,
-            self.vertical_shift
+            self.vertical_shift,
+            self.pelvis_lift
         )
     }
 }
@@ -329,6 +332,62 @@ fn contact_confidence(clip: &FlowClip, begin: usize, end: usize, confidence: f32
     (best / confidence).clamp(0.5, 1.0)
 }
 
+/// Kimodo's `_hermite`: `count` interior samples of the cubic that matches the
+/// endpoint values and velocities of a segment.
+fn hermite(a: f32, va: f32, b: f32, vb: f32, count: usize) -> Vec<f32> {
+    let duration = (count + 1) as f32;
+    (1..=count)
+        .map(|sample| {
+            let t = sample as f32 / duration;
+            (2.0 * t.powi(3) - 3.0 * t.powi(2) + 1.0) * a
+                + (t.powi(3) - 2.0 * t.powi(2) + t) * duration * va
+                + (-2.0 * t.powi(3) + 3.0 * t.powi(2)) * b
+                + (t.powi(3) - t.powi(2)) * duration * vb
+        })
+        .collect()
+}
+
+/// Kimodo's `smooth_auto_handoffs`: when two stances touch exactly (no swing
+/// frame between them) the anchor must not step at the boundary, so the
+/// correction is carried across with a Hermite blend over a window of about
+/// 0.2 s on each side. Walking clips are where this shows up.
+fn smooth_handoffs(
+    stances: &[(usize, usize)],
+    offsets_x: &mut [f64],
+    offsets_z: &mut [f64],
+    fps: f32,
+) {
+    let radius = ((fps * 0.20).round() as usize).max(3);
+    for pair in 0..stances.len().saturating_sub(1) {
+        let left = stances[pair];
+        let right = stances[pair + 1];
+        if left.1 != right.0 {
+            // A real swing gap separates them: nothing to blend.
+            continue;
+        }
+        let boundary = right.0;
+        let first = left.0.max(boundary.saturating_sub(radius));
+        let end = right.1.min(boundary + radius);
+        if end - first < 3 {
+            continue;
+        }
+        let a_x = offsets_x[first];
+        let b_x = offsets_x[end - 1];
+        let v_x_a = offsets_x[first + 1] - a_x;
+        let v_x_b = b_x - offsets_x[end - 2];
+        let a_z = offsets_z[first];
+        let b_z = offsets_z[end - 1];
+        let v_z_a = offsets_z[first + 1] - a_z;
+        let v_z_b = b_z - offsets_z[end - 2];
+        let blend_x = hermite(a_x as f32, v_x_a as f32, b_x as f32, v_x_b as f32, end - first - 2);
+        let blend_z = hermite(a_z as f32, v_z_a as f32, b_z as f32, v_z_b as f32, end - first - 2);
+        for (slot, index) in (first + 1..end - 1).enumerate() {
+            offsets_x[index] = blend_x[slot] as f64;
+            offsets_z[index] = blend_z[slot] as f64;
+        }
+    }
+}
+
 /// Kimodo's `couple_anchors`: two consecutive stances of the same foot that are
 /// separated by a very short release gap must not be pinned independently, or the
 /// foot teleports across the gap. Each stance may only be shifted as a whole
@@ -445,6 +504,7 @@ fn leg_ik(
         (2, 5, 8, 11), // right hip, knee, ankle, toe
     ];
     let cap = thresholds.max_correction.min(0.05) as f64;
+    let mut lifts = vec![0.0f32; count];
     for (hip, knee, ankle, toe) in legs {
         // Bone lengths from the rest pose: the reach limit for the falloff.
         let thigh = distance3(
@@ -498,6 +558,21 @@ fn leg_ik(
                     max_reach,
                 );
                 if weight <= 0.02 {
+                    // Kimodo's `reachable_pelvis_lift`: when the contact is out of
+                    // reach the pelvis is raised by the shortfall, never by more
+                    // than 12 cm, instead of leaving the leg straight and the foot
+                    // floating.
+                    let shortfall = distance3(
+                        target,
+                        [
+                            hip_pos[0] as f64,
+                            hip_pos[1] as f64,
+                            hip_pos[2] as f64,
+                        ],
+                    ) - max_reach * 0.999;
+                    if shortfall > 0.0 {
+                        lifts[index] = lifts[index].max(shortfall.min(0.12) as f32);
+                    }
                     continue;
                 }
                 let blended = [
@@ -526,6 +601,18 @@ fn leg_ik(
             }
         }
     }
+
+    // Apply the collected pelvis lifts and rebuild the skeletons that saw them.
+    let mut lifted = 0.0f32;
+    for index in 0..count {
+        if lifts[index] <= 0.0 {
+            continue;
+        }
+        clip.poses[index].translation[1] += lifts[index];
+        clip.skeletons[index] = body.forward_joints(&clip.poses[index]);
+        lifted = lifted.max(lifts[index]);
+    }
+    report.pelvis_lift = lifted;
 }
 
 fn joint3(rest: &[f32], index: usize) -> [f64; 3] {
@@ -803,25 +890,37 @@ fn foot_lock(
         }
 
         let adjustments = couple_anchor_offsets(&runs, &anchors, &support, fps);
+        let mut local_x = vec![0.0f64; count];
+        let mut local_z = vec![0.0f64; count];
+        let mut local_used = vec![false; count];
         for (stance, (begin, end)) in runs.iter().enumerate() {
             let adjustment = adjustments[stance];
             for index in *begin..*end {
                 // Horizontal only: the vertical placement is solved when the clip
                 // is dropped onto its floor.
-                let dx = (anchors[index][0] + adjustment[0] - support[index][0]) as f64
+                local_x[index] = (anchors[index][0] + adjustment[0] - support[index][0]) as f64
                     * holds[index] as f64;
-                let dz = (anchors[index][2] + adjustment[1] - support[index][2]) as f64
+                local_z[index] = (anchors[index][2] + adjustment[1] - support[index][2]) as f64
                     * holds[index] as f64;
-                // Two feet in contact at once average their demands.
-                if pinned[index] {
-                    target_x[index] = 0.5 * (target_x[index] + dx);
-                    target_z[index] = 0.5 * (target_z[index] + dz);
-                } else {
-                    target_x[index] = dx;
-                    target_z[index] = dz;
-                }
-                pinned[index] = true;
+                local_used[index] = true;
             }
+        }
+        // Stances that touch exactly get their correction carried across with a
+        // Hermite blend, so the anchor does not step at the boundary.
+        smooth_handoffs(&runs, &mut local_x, &mut local_z, fps);
+        for index in 0..count {
+            if !local_used[index] {
+                continue;
+            }
+            // Two feet in contact at once average their demands.
+            if pinned[index] {
+                target_x[index] = 0.5 * (target_x[index] + local_x[index]);
+                target_z[index] = 0.5 * (target_z[index] + local_z[index]);
+            } else {
+                target_x[index] = local_x[index];
+                target_z[index] = local_z[index];
+            }
+            pinned[index] = true;
         }
     }
 
@@ -1271,6 +1370,38 @@ mod tests {
             worst.1,
             worst.0
         );
+    }
+
+    /// `smooth_auto_handoffs`: when two stances touch, the correction curve must
+    /// not step at the boundary.
+    #[test]
+    fn handoffs_blend_across_a_touching_boundary() {
+        let frames = 24;
+        // Two stances that touch at frame 12.
+        let stances = vec![(0usize, 12usize), (12usize, 24usize)];
+        let mut x = vec![0.0f64; frames];
+        let mut z = vec![0.0f64; frames];
+        // A 10 cm step right at the boundary.
+        for frame in 12..24 {
+            x[frame] = 0.10;
+        }
+        let before = x[12] - x[11];
+        smooth_handoffs(&stances, &mut x, &mut z, 30.0);
+        let after = x[12] - x[11];
+        assert!(
+            after.abs() < before.abs(),
+            "step at the boundary grew: {before:.4} -> {after:.4}"
+        );
+    }
+
+    /// `_hermite` matches the endpoint values.
+    #[test]
+    fn hermite_matches_its_endpoints() {
+        let values = hermite(0.0, 0.1, 1.0, -0.1, 5);
+        assert_eq!(values.len(), 5);
+        assert!(values.iter().all(|v| v.is_finite()));
+        // Monotone-ish between the two endpoint values.
+        assert!(values.iter().all(|v| *v > -0.5 && *v < 1.5));
     }
 
     /// `couple_anchors`: two stances separated by a short gap must not keep
