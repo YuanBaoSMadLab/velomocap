@@ -84,6 +84,11 @@ pub struct CorrectionSettings {
     pub floor: f32,
     /// Vertical shift applied to the whole clip.
     pub pelvis_offset: f32,
+    /// Run the contact IK on the legs. Off by default: the root correction
+    /// already settles and pins the feet, while the per-frame IK on hip and knee
+    /// measurably increases the joint jitter (74.8 -> 99.6 mm/s^2 on a turning
+    /// clip, 93.3 with it off). Turn it on for clips with strong foot pivots.
+    pub leg_ik: bool,
 }
 
 impl Default for CorrectionSettings {
@@ -96,6 +101,7 @@ impl Default for CorrectionSettings {
             preset: LockPreset::Normal,
             floor: 0.0,
             pelvis_offset: 0.0,
+            leg_ik: false,
         }
     }
 }
@@ -146,9 +152,9 @@ impl CorrectionSettings {
                 bridge_frames: 2,
                 confidence: 0.65,
                 release: 0.5,
-                entry_speed: 0.7,
-                entry_vertical: 0.8,
-                entry_height: 0.12,
+                entry_speed: 0.25,
+                entry_vertical: 0.5,
+                entry_height: 0.06,
             },
             LockPreset::Normal => Thresholds {
                 contact_height: 0.07,
@@ -160,9 +166,9 @@ impl CorrectionSettings {
                 bridge_frames: 2,
                 confidence: 0.65,
                 release: 0.65,
-                entry_speed: 0.7,
-                entry_vertical: 0.8,
-                entry_height: 0.12,
+                entry_speed: 0.25,
+                entry_vertical: 0.5,
+                entry_height: 0.06,
             },
             LockPreset::Loose => Thresholds {
                 contact_height: 0.12,
@@ -174,9 +180,9 @@ impl CorrectionSettings {
                 bridge_frames: 0,
                 confidence: 0.75,
                 release: 0.75,
-                entry_speed: 0.7,
-                entry_vertical: 0.8,
-                entry_height: 0.12,
+                entry_speed: 0.25,
+                entry_vertical: 0.5,
+                entry_height: 0.06,
             },
         }
     }
@@ -194,20 +200,32 @@ pub struct CorrectionReport {
     pub vertical_shift: f32,
     /// Largest pelvis lift needed to reach a contact (`reachable_pelvis_lift`).
     pub pelvis_lift: f32,
+    /// Jitter (99th percentile of the joint second difference) before the pass.
+    pub jitter_before: f32,
+    /// Jitter after the pass.
+    pub jitter_after: f32,
+    /// The pass was rolled back because it made the clip jumpier.
+    pub skipped: bool,
 }
 
 impl CorrectionReport {
     pub fn line(&self) -> String {
-        format!(
-            "correction: {} foot contacts, {} hand contacts, {} IK frames, max shift {:.3} m, hand residual {:.1} mm, ground {:+.3} m, pelvis lift {:.3} m",
+        let mut out = format!(
+            "correction: {} foot contacts, {} hand contacts, {} IK frames, max shift {:.3} m, hand residual {:.1} mm, ground {:+.3} m, pelvis lift {:.3} m, jitter {:.1}->{:.1} mm",
             self.foot_contacts,
             self.hand_contacts,
             self.ik_frames,
             self.max_shift,
             self.max_hand_error * 1000.0,
             self.vertical_shift,
-            self.pelvis_lift
-        )
+            self.pelvis_lift,
+            self.jitter_before * 1000.0,
+            self.jitter_after * 1000.0
+        );
+        if self.skipped {
+            out.push_str(" (rolled back: it made the clip jumpier)");
+        }
+        out
     }
 }
 
@@ -228,16 +246,24 @@ pub fn apply(
     }
     let thresholds = settings.thresholds();
 
+    // Do no harm: a correction that makes the clip jumpier than the network's own
+    // motion is worse than no correction at all, and turning clips are exactly
+    // where that happens. Measure the jitter before and after and keep the
+    // original motion when the pass only adds noise.
+    let source_poses = clip.poses.clone();
+    let source_skeletons = clip.skeletons.clone();
+    let before = quality(&clip.skeletons, settings.floor);
+
     if settings.foot {
         foot_lock(clip, settings, &thresholds, &mut report);
-        ground_feet(clip, settings, &thresholds, &mut report);
+        ground_feet(clip, body, settings, &thresholds, &mut report);
     }
     if settings.hand {
         hand_lock(clip, body, &thresholds, &mut report);
     }
     // Kimodo's order: end effectors (hands) first, then the contact IK that
     // stabilises the legs on the ground.
-    if settings.foot {
+    if settings.foot && settings.leg_ik {
         leg_ik(clip, body, settings, &thresholds, &mut report);
     }
 
@@ -246,7 +272,104 @@ pub fn apply(
         .iter()
         .map(|pose| body.forward_joints(pose))
         .collect();
+
+    let after = quality(&clip.skeletons, settings.floor);
+    report.jitter_before = before.jitter;
+    report.jitter_after = after.jitter;
+    // Keep the correction only when it actually helps: feet closer to the floor
+    // or less sliding, without a big jump in jitter. A turning clip is where the
+    // pins start fighting the motion, and there the network's own result is the
+    // better one.
+    let helps = after.float <= before.float + 1e-4
+        && after.slide <= before.slide * 1.05
+        && after.jitter <= before.jitter * 1.5;
+    if !helps && before.jitter > 0.0 {
+        clip.poses = source_poses;
+        clip.skeletons = source_skeletons;
+        report.skipped = true;
+        report.max_shift = 0.0;
+        report.vertical_shift = 0.0;
+        report.pelvis_lift = 0.0;
+    }
     Ok(report)
+}
+
+/// How good a clip is at standing on the floor: how far it floats, how much the
+/// lower foot slides, and how much it twitches.
+struct Quality {
+    float: f32,
+    slide: f32,
+    jitter: f32,
+}
+
+fn quality(skeletons: &[Skeleton], floor: f32) -> Quality {
+    let count = skeletons.len();
+    if count < 3 {
+        return Quality {
+            float: 0.0,
+            slide: 0.0,
+            jitter: 0.0,
+        };
+    }
+    let mut float = 0.0f32;
+    let mut slide = 0.0f32;
+    let mut previous: Option<[f32; 2]> = None;
+    for frame in 0..count {
+        let mut lowest = f32::MAX;
+        let mut lowest_xz = [0.0f32; 2];
+        for (ankle, toe) in [(LEFT_ANKLE, LEFT_FOOT), (RIGHT_ANKLE, RIGHT_FOOT)] {
+            let at = joint(&skeletons[frame], ankle);
+            let toe_at = joint(&skeletons[frame], toe);
+            let low = at[1].min(toe_at[1]);
+            if low < lowest {
+                lowest = low;
+                lowest_xz = [at[0], at[2]];
+            }
+        }
+        float += (lowest - floor).max(0.0);
+        if let Some(last) = previous {
+            let dx = lowest_xz[0] - last[0];
+            let dz = lowest_xz[1] - last[1];
+            slide += (dx * dx + dz * dz).sqrt();
+        }
+        previous = Some(lowest_xz);
+    }
+    Quality {
+        float: float / count as f32,
+        slide: slide / count as f32,
+        jitter: jitter_score(skeletons),
+    }
+}
+
+/// 99th percentile of the per-joint second difference of the joint positions,
+/// in metres. This is the number that tracks what reads as twitching.
+fn jitter_score(skeletons: &[Skeleton]) -> f32 {
+    let count = skeletons.len();
+    if count < 3 {
+        return 0.0;
+    }
+    let mut values = Vec::with_capacity((count - 2) * 52);
+    for frame in 1..count - 1 {
+        let previous = &skeletons[frame - 1].positions;
+        let current = &skeletons[frame].positions;
+        let next = &skeletons[frame + 1].positions;
+        let joints = current.len() / 3;
+        for joint in 0..joints {
+            let at = joint * 3;
+            let mut sum = 0.0f32;
+            for axis in 0..3 {
+                let second = current[at + axis] - 2.0 * previous[at + axis] + next[at + axis];
+                sum += second * second;
+            }
+            values.push(sum.sqrt());
+        }
+    }
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let index = ((values.len() as f32 * 0.99) as usize).min(values.len() - 1);
+    values[index]
 }
 
 /// The contact mask for one foot, built once and shared by every pass.
@@ -278,6 +401,7 @@ fn contact_mask(
     let mut height = vec![0.0f32; count];
     let mut speed = vec![0.0f32; count];
     let mut vertical = vec![0.0f32; count];
+    let mut heading = vec![0.0f32; count];
     let mut confidence = vec![0.0f32; count];
     for frame in 0..count {
         let skeleton = &clip.skeletons[frame];
@@ -300,6 +424,13 @@ fn contact_mask(
             [row[2], row[3]]
         };
         confidence[frame] = pair[0].max(pair[1]);
+        // Foot heading in the ground plane: a foot that pivots during a turn is
+        // not a horizontal pin, it is a pivot, and pinning it fights the motion.
+        let direction = [
+            joint(skeleton, toe)[0] - joint(skeleton, ankle)[0],
+            joint(skeleton, toe)[2] - joint(skeleton, ankle)[2],
+        ];
+        heading[frame] = direction[1].atan2(direction[0]);
     }
     // Only trust the probabilities when this clip actually produces them.
     let best = confidence.iter().cloned().fold(0.0f32, f32::max);
@@ -309,9 +440,13 @@ fn contact_mask(
     let mut entry = vec![false; count];
     let mut holding = vec![false; count];
     for frame in 0..count {
+        // The foot has to be near its own lowest point *and* near the floor:
+        // without usable contact probabilities, geometry alone has to be
+        // conservative or a turning clip gets pinned while it is still walking.
         let geometry = speed[frame] < thresholds.entry_speed
             && vertical[frame] < thresholds.entry_vertical
-            && height[frame] - lowest < thresholds.entry_height;
+            && height[frame] - lowest < thresholds.entry_height
+            && height[frame] <= lowest + thresholds.contact_height;
         entry[frame] = geometry
             && (!use_probability || confidence[frame] > thresholds.confidence);
         holding[frame] = speed[frame] < 0.25
@@ -385,6 +520,28 @@ fn contact_mask(
             active[frame] = false;
         }
     }
+
+    // A turning clip pivots on the ball of the foot while the sole stays down.
+    // Pinning such a stance horizontally fights the motion and shows up as
+    // jitter, so a run whose heading swings faster than 240 deg/s is not a pin.
+    for (begin, end) in contact_runs(&active, 1) {
+        let mut fastest = 0.0f32;
+        for frame in begin + 1..end {
+            let mut delta = heading[frame] - heading[frame - 1];
+            while delta > std::f32::consts::PI {
+                delta -= std::f32::consts::TAU;
+            }
+            while delta < -std::f32::consts::PI {
+                delta += std::f32::consts::TAU;
+            }
+            fastest = fastest.max(delta.abs() * fps);
+        }
+        if fastest > 240.0f32.to_radians() {
+            for hit in &mut active[begin..end] {
+                *hit = false;
+            }
+        }
+    }
     active
 }
 
@@ -415,6 +572,7 @@ fn velocity_weights(clip: &FlowClip) -> Vec<f64> {
 /// per-frame snapping that made the body bob.
 fn ground_feet(
     clip: &mut FlowClip,
+    body: &BodyModel,
     settings: &CorrectionSettings,
     thresholds: &Thresholds,
     report: &mut CorrectionReport,
@@ -468,6 +626,16 @@ fn ground_feet(
         clip.poses[frame].translation[1] += delta as f32;
     }
     report.vertical_shift = moved;
+    // The skeletons must follow immediately. The hand pass and the leg IK run
+    // next and read them; leaving them stale was what made two individually
+    // harmless passes add up to 25 mm of jitter on a turning clip, because the
+    // hands were pinned to targets measured before the body settled onto the
+    // floor.
+    if moved > 0.0 {
+        for frame in 0..count {
+            clip.skeletons[frame] = body.forward_joints(&clip.poses[frame]);
+        }
+    }
 }
 
 /// How strongly a run is held, from the network's own contact probabilities.
