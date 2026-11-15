@@ -60,6 +60,10 @@ pub fn t(english: &'static str) -> &'static str {
         "Help" => "帮助",
         "Open video…" => "打开视频…",
         "Import video…" => "导入视频…",
+        "Import character…" => "导入角色…",
+        "Import a VRM / glTF humanoid and play the motion on it" => {
+            "导入 VRM / glTF 人物，用它播放这段动作"
+        }
         "Import video" => "导入视频",
         "Cancel" => "取消",
         "Detecting people…" => "正在检测人物…",

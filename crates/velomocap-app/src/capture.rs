@@ -241,6 +241,9 @@ pub struct FlowClipData {
     pub summary: String,
     /// Ready-to-write BVH payload; the body model is dropped after the bake.
     pub bvh: Arc<velomocap_motion::PreparedBvh>,
+    /// The clip's joint rotations per frame: what an imported character is
+    /// posed with (the mesh above is the built-in body).
+    pub skeletons: Arc<Vec<velomocap_body::Skeleton>>,
     /// The contact runs the detector found, per track (L foot, R foot, L hand,
     /// R hand), in clip frames. The timeline draws these under the hand-drawn
     /// locks so an automatic track shows what it is following instead of the
@@ -627,6 +630,7 @@ fn run_flow(
             frames: Arc::new(bodies),
             summary,
             bvh: Arc::new(bvh),
+            skeletons: Arc::new(clip.skeletons.clone()),
             contacts: correction.detected.clone(),
         });
         if sentinel() {

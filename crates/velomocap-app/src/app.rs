@@ -46,6 +46,8 @@ impl ExportFormat {
         pub frames: Arc<Vec<Vec<f32>>>,
         pub summary: String,
         pub bvh: Arc<velomocap_motion::PreparedBvh>,
+    /// The clip's joint rotations per frame, for posing an imported character.
+    pub skeletons: Arc<Vec<velomocap_body::Skeleton>>,
     /// Automatic contact runs per track, for the timeline's "automatic" rows.
     pub contacts: [Vec<[usize; 2]>; velomocap_motion::TRACK_COUNT],}
 impl FlowBody {
@@ -313,6 +315,13 @@ pub struct VeloMocap {
     /// made the naming look like a document property rather than a choice made
     /// when a file is written.
     pub show_export: bool,
+    /// An imported character (VRM / glTF) that replaces the built-in body in the
+    /// viewport, the reference's "Import Character".
+    pub character: Option<crate::character::Character>,
+    /// The clip's rest rotations, so a clip rotation becomes a delta.
+    pub character_rest: Option<Arc<Vec<[f32; 9]>>>,
+    /// What was imported, for the status line: bones matched, vertices.
+    pub character_note: String,
     pub export_format: ExportFormat,
     /// Suffix for the written files; empty means the clip's own name.
     pub export_name: String,
@@ -455,6 +464,9 @@ impl VeloMocap {
             show_models: false,
             show_guide: false,
             show_export: false,
+            character: None,
+            character_rest: None,
+            character_note: String::new(),
             export_format: ExportFormat::Bvh,
             export_name: String::new(),
             export_everyone: false,
@@ -533,8 +545,69 @@ impl VeloMocap {
             self.console.remove(0);
         }
     }
-    pub fn open_video_dialog(&mut self) {
+    /// Import a humanoid character (VRM / GLB): its own skeleton and skinned
+    /// mesh replace the built-in body in the viewport, driven by the clip.
+    pub fn import_character_dialog(&mut self) {
         let Some(path) = rfd::FileDialog::new()
+            .add_filter("Humanoid character", &["vrm", "glb"])
+            .set_title("Import character")
+            .pick_file()
+        else {
+            return;
+        };
+        self.import_character(path);
+    }
+
+    pub fn import_character(&mut self, path: PathBuf) {
+        match crate::character::Character::load(&path) {
+            Ok(character) => {
+                let bones = character.bones.len();
+                let matched = character.matched();
+                let vertices = character.vertex_count();
+                let unmatched: Vec<String> = character
+                    .unmatched()
+                    .into_iter()
+                    .map(|name| name.to_string())
+                    .collect();
+                self.character_rest = self.rest_rotations();
+                self.character_note = if unmatched.is_empty() {
+                    format!("{bones} bones · {vertices} vertices")
+                } else {
+                    format!(
+                        "{matched}/{bones} bones matched · not found: {}",
+                        unmatched.join(", ")
+                    )
+                };
+                self.log(format!(
+                    "character {}: {bones} bones, {matched} matched, {vertices} vertices",
+                    path.display()
+                ));
+                self.status = format!("Imported {} · {bones} bones", path.display());
+                self.character = Some(character);
+                // The character replaces the built-in body, so the viewport has
+                // to reframe on it.
+                self.orbit.framed = false;
+            }
+            Err(error) => self.error = Some(format!("{error:#}")),
+        }
+    }
+
+    /// The body model's rest orientation, which turns a clip rotation into the
+    /// delta an imported character is posed with.
+    fn rest_rotations(&self) -> Option<Arc<Vec<[f32; 9]>>> {
+        let body = velomocap_body::BodyModel::load(&self.smplh_model, 16).ok()?;
+        let pose = velomocap_body::Pose::neutral(body.num_joints, 16);
+        let skeleton = body.forward_joints(&pose);
+        let mut out = Vec::with_capacity(skeleton.rotations.len() / 9);
+        for joint in 0..skeleton.rotations.len() / 9 {
+            let mut rotation = [0.0f32; 9];
+            rotation.copy_from_slice(&skeleton.rotations[joint * 9..joint * 9 + 9]);
+            out.push(rotation);
+        }
+        Some(Arc::new(out))
+    }
+
+    pub fn open_video_dialog(&mut self) {        let Some(path) = rfd::FileDialog::new()
             .add_filter("Video", &["mp4", "mov", "mkv", "avi", "webm", "m4v"])
             .set_title("Import video")
             .pick_file()
@@ -1336,6 +1409,7 @@ impl VeloMocap {
                         frames: clip.frames,
                         summary: clip.summary,
                         bvh: clip.bvh,
+                        skeletons: clip.skeletons,
                         contacts: clip.contacts,
                     })
                     .collect();

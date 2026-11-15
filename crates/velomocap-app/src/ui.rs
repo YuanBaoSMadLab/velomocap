@@ -217,12 +217,25 @@ fn menu_bar(app: &mut VeloMocap, ctx: &egui::Context) {
                         app.cancel_capture();
                     }
                     ui.separator();
+                    // The reference's "Import Character": a VRM/glTF humanoid
+                    // replaces the built-in body and is driven by the clip.
+                    if ui
+                        .button(i18n::t("Import character…"))
+                        .on_hover_text(i18n::t(
+                            "Import a VRM / glTF humanoid and play the motion on it",
+                        ))
+                        .clicked()
+                    {
+                        ui.close();
+                        app.import_character_dialog();
+                    }
+                    ui.separator();
                     // Everything a written file needs — its format, the bone
                     // vocabulary, the rest correction and the name — lives in
                     // one export window. As a menu submenu the naming read like
                     // a property of the document rather than a choice made when
                     // a file is written.
-                    let can_export = !app.flow.is_empty() || !app.people.is_empty();
+                    let can_export = app.video.is_some();
                     if ui
                         .add_enabled(can_export, egui::Button::new(i18n::t("Export motion…")))
                         .on_hover_text(i18n::t(
@@ -730,11 +743,59 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                 let smplh_faces = app.smplh_faces.as_deref();
                 let empty: &[[u32; 3]] = &[];
                 let mhr_faces = mesh.map(|mesh| mesh.triangles.as_slice()).unwrap_or(empty);
+                // An imported character replaces the selected person's body: its
+                // own mesh, posed by the clip's joint rotations. Its root is put
+                // on the clip's pelvis, so it stands where the motion stands.
+                let character = app.character.as_ref();
+                let character_rest = app.character_rest.as_deref();
+                let posed_character: Option<Vec<f32>> = match (character, character_rest) {
+                    (Some(character), Some(rest)) => flow
+                        .get(selected)
+                        .filter(|clip| !clip.skeletons.is_empty())
+                        .map(|clip| {
+                            let index = app
+                                .playhead
+                                .saturating_sub(clip.first_frame)
+                                .min(clip.skeletons.len() - 1);
+                            let ours = &clip.skeletons[index];
+                            let rotations = rotations_of(ours);
+                            let bind = character
+                                .bones
+                                .iter()
+                                .find(|bone| bone.canonical == Some(0))
+                                .or_else(|| character.bones.first())
+                                .map(|bone| bone.bind)
+                                .unwrap_or([0.0; 3]);
+                            let translation = [
+                                ours.positions[0] - bind[0],
+                                ours.positions[1] - bind[1],
+                                ours.positions[2] - bind[2],
+                            ];
+                            character.pose(&rotations, rest, translation)
+                        }),
+                    _ => None,
+                };
+                let character_faces: &[[u32; 3]] = character
+                    .map(|character| character.faces.as_slice())
+                    .unwrap_or(empty);
                 let draws: Vec<viewport::PersonDraw<'_>> = people
                     .iter()
                     .enumerate()
                     .filter(|(_, person)| person.visible)
                     .filter_map(|(slot, person)| {
+                        // An imported character wins over the built-in body.
+                        if slot == selected {
+                            if let Some(verts) = posed_character.as_deref() {
+                                return Some(viewport::PersonDraw {
+                                    name: &person.name,
+                                    colour: person.colour,
+                                    verts,
+                                    keypoints: &[],
+                                    faces: character_faces,
+                                    selected: true,
+                                });
+                            }
+                        }
                         // Prefer the FlowHMR body: it is the temporally coherent
                         // motion the export uses, and the one the original
                         // previews. Fall back to the per-frame MHR mesh while no
@@ -1082,8 +1143,19 @@ fn clip_label(app: &mut VeloMocap, ui: &mut egui::Ui) {
         });
 }
 
-fn frame_ruler(app: &mut VeloMocap, ui: &mut egui::Ui) {
-    let frames = app.frame_count();
+/// A clip pose's per-joint world rotations, in the layout a character is posed
+/// with.
+fn rotations_of(skeleton: &velomocap_body::Skeleton) -> Vec<[f32; 9]> {
+    (0..skeleton.rotations.len() / 9)
+        .map(|joint| {
+            let mut rotation = [0.0f32; 9];
+            rotation.copy_from_slice(&skeleton.rotations[joint * 9..joint * 9 + 9]);
+            rotation
+        })
+        .collect()
+}
+
+fn frame_ruler(app: &mut VeloMocap, ui: &mut egui::Ui) {    let frames = app.frame_count();
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(i18n::t("Frame")).size(11.0));
         let mut value = app.playhead.min(frames.saturating_sub(1)) as f64;
@@ -2235,8 +2307,14 @@ fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
                 );
             }
             ui.add_space(6.0);
+            // The last file written, so a click always leaves a visible result.
+            if let Some(note) = &app.export_note {
+                ui.label(egui::RichText::new(note).size(10.0).color(OK));
+            }
             ui.horizontal(|ui| {
-                let can = !app.flow.is_empty() || !app.people.is_empty();
+                // A disabled button that explains nothing reads as a dead
+                // button; the export reports its own reason instead.
+                let can = app.video.is_some();
                 if ui
                     .add_enabled(can, egui::Button::new(i18n::t("Export")))
                     .clicked()

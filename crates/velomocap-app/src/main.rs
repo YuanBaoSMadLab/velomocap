@@ -12,6 +12,7 @@
 
 mod app;
 mod capture;
+mod character;
 mod i18n;
 mod models_ui;
 mod probe;
