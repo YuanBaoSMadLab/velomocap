@@ -39,7 +39,18 @@ impl ExportFormat {
     pub name: String,
     pub colour: egui::Color32,
     pub visible: bool,
-        pub frames: Vec<Option<Arc<PersonFrame>>>,}
+        pub frames: Vec<Option<Arc<PersonFrame>>>,
+    /// The character that replaces this person's built-in body, if one was
+    /// imported. Kept per person: the reference lets each person carry its own
+    /// avatar, and the path is saved beside the clip.
+    pub character: Option<AssignedCharacter>,}
+
+/// An imported character bound to one person.
+#[derive(Clone)]
+pub struct AssignedCharacter {
+    pub path: PathBuf,
+    pub character: Arc<crate::character::Character>,
+}
 #[derive(Clone)]pub struct FlowBody {
     pub name: String,
         pub first_frame: usize,
@@ -316,12 +327,13 @@ pub struct VeloMocap {
     /// when a file is written.
     pub show_export: bool,
     /// An imported character (VRM / glTF) that replaces the built-in body in the
-    /// viewport, the reference's "Import Character".
-    pub character: Option<crate::character::Character>,
-    /// The clip's rest rotations, so a clip rotation becomes a delta.
+    /// viewport, the reference's "Import Character". The rest rotations turn a
+    /// clip rotation into the delta a character is posed with.
     pub character_rest: Option<Arc<Vec<[f32; 9]>>>,
-    /// What was imported, for the status line: bones matched, vertices.
-    pub character_note: String,
+    /// The person whose character panel is open.
+    pub person_panel: Option<usize>,
+    /// The saved character map has been applied to the current people.
+    pub characters_loaded: bool,
     pub export_format: ExportFormat,
     /// Suffix for the written files; empty means the clip's own name.
     pub export_name: String,
@@ -464,9 +476,9 @@ impl VeloMocap {
             show_models: false,
             show_guide: false,
             show_export: false,
-            character: None,
             character_rest: None,
-            character_note: String::new(),
+            person_panel: None,
+            characters_loaded: false,
             export_format: ExportFormat::Bvh,
             export_name: String::new(),
             export_everyone: false,
@@ -545,9 +557,10 @@ impl VeloMocap {
             self.console.remove(0);
         }
     }
-    /// Import a humanoid character (VRM / GLB): its own skeleton and skinned
-    /// mesh replace the built-in body in the viewport, driven by the clip.
-    pub fn import_character_dialog(&mut self) {
+    /// Import a humanoid character (VRM / GLB) for one person: its own skeleton
+    /// and skinned mesh replace the built-in body in the viewport, driven by the
+    /// clip, and the choice is saved beside the clip.
+    pub fn import_character_dialog(&mut self, person: usize) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Humanoid character", &["vrm", "glb"])
             .set_title("Import character")
@@ -555,10 +568,13 @@ impl VeloMocap {
         else {
             return;
         };
-        self.import_character(path);
+        self.assign_character(person, path);
     }
 
-    pub fn import_character(&mut self, path: PathBuf) {
+    pub fn assign_character(&mut self, person: usize, path: PathBuf) {
+        if person >= self.people.len() {
+            return;
+        }
         match crate::character::Character::load(&path) {
             Ok(character) => {
                 let bones = character.bones.len();
@@ -569,26 +585,129 @@ impl VeloMocap {
                     .into_iter()
                     .map(|name| name.to_string())
                     .collect();
-                self.character_rest = self.rest_rotations();
-                self.character_note = if unmatched.is_empty() {
-                    format!("{bones} bones · {vertices} vertices")
-                } else {
-                    format!(
-                        "{matched}/{bones} bones matched · not found: {}",
-                        unmatched.join(", ")
-                    )
-                };
+                if self.character_rest.is_none() {
+                    self.character_rest = self.rest_rotations();
+                }
                 self.log(format!(
-                    "character {}: {bones} bones, {matched} matched, {vertices} vertices",
-                    path.display()
+                    "{}: {} · {bones} bones ({matched} matched), {vertices} vertices{}",
+                    self.people[person].name,
+                    path.display(),
+                    if unmatched.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · not matched: {}", unmatched.join(", "))
+                    }
                 ));
-                self.status = format!("Imported {} · {bones} bones", path.display());
-                self.character = Some(character);
+                self.status = format!(
+                    "{} · {} bones · {} vertices",
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    bones,
+                    vertices
+                );
+                self.people[person].character = Some(AssignedCharacter {
+                    path,
+                    character: Arc::new(character),
+                });
+                self.save_characters();
                 // The character replaces the built-in body, so the viewport has
                 // to reframe on it.
                 self.orbit.framed = false;
             }
             Err(error) => self.error = Some(format!("{error:#}")),
+        }
+    }
+
+    pub fn clear_character(&mut self, person: usize) {
+        if let Some(view) = self.people.get_mut(person) {
+            view.character = None;
+        }
+        self.save_characters();
+        self.orbit.framed = false;
+    }
+
+    fn characters_path(&self) -> Option<PathBuf> {
+        self.video
+            .as_ref()
+            .map(|video| video.with_extension("characters.json"))
+    }
+
+    /// Save the per-person character choice beside the clip, so re-opening the
+    /// video (or re-running the motion) brings the avatars back.
+    pub fn save_characters(&mut self) {
+        let Some(path) = self.characters_path() else {
+            return;
+        };
+        let people: Vec<serde_json::Value> = self
+            .people
+            .iter()
+            .filter_map(|person| {
+                let assigned = person.character.as_ref()?;
+                Some(serde_json::json!({
+                    "name": person.name,
+                    "file": assigned.path.display().to_string(),
+                }))
+            })
+            .collect();
+        let document = serde_json::json!({ "version": 1, "people": people });
+        match serde_json::to_string_pretty(&document)
+            .map_err(|error| error.to_string())
+            .and_then(|text| std::fs::write(&path, text).map_err(|error| error.to_string()))
+        {
+            Ok(()) => {}
+            Err(error) => self.log(format!("characters: {error}")),
+        }
+    }
+
+    /// Apply the saved map once the people exist. A character that disappeared
+    /// from disk is reported and skipped rather than failing the run.
+    pub fn load_characters(&mut self) {
+        if self.characters_loaded || self.people.is_empty() {
+            return;
+        }
+        self.characters_loaded = true;
+        let Some(path) = self.characters_path() else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Ok(document) = serde_json::from_str::<serde_json::Value>(&text) else {
+            self.log(format!("characters: {} is not valid JSON", path.display()));
+            return;
+        };
+        let entries = document
+            .get("people")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for entry in entries {
+            let name = entry.get("name").and_then(|value| value.as_str());
+            let file = entry.get("file").and_then(|value| value.as_str());
+            let (Some(name), Some(file)) = (name, file) else {
+                continue;
+            };
+            let Some(index) = self.people.iter().position(|person| person.name == name) else {
+                continue;
+            };
+            let file = PathBuf::from(file);
+            if !file.is_file() {
+                self.log(format!("characters: {name} uses {}, which is gone", file.display()));
+                continue;
+            }
+            match crate::character::Character::load(&file) {
+                Ok(character) => {
+                    if self.character_rest.is_none() {
+                        self.character_rest = self.rest_rotations();
+                    }
+                    self.people[index].character = Some(AssignedCharacter {
+                        path: file,
+                        character: Arc::new(character),
+                    });
+                }
+                Err(error) => self.log(format!("characters: {error:#}")),
+            }
         }
     }
 
@@ -853,6 +972,8 @@ impl VeloMocap {
         self.error = None;
         self.export_note = None;
         self.people.clear();
+        self.characters_loaded = false;
+        self.person_panel = None;
         self.mesh = None;
         self.selected = 0;
         self.framed_after_capture = false;
@@ -1555,6 +1676,7 @@ impl VeloMocap {
                         colour: PERSON_COLOURS[index % PERSON_COLOURS.len()],
                         visible: true,
                         frames: track.frames.clone(),
+                        character: None,
                     });
                 }
             }
@@ -1562,6 +1684,9 @@ impl VeloMocap {
         if self.selected >= self.people.len() {
             self.selected = 0;
         }
+        // The avatars assigned to this clip come back as soon as the people
+        // exist, before the motion stage has finished.
+        self.load_characters();
     }
     /// Show the newest decoded frame in the Movie Clip panel.
     ///

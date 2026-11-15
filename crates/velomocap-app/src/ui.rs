@@ -121,6 +121,7 @@ pub fn draw(app: &mut VeloMocap, ctx: &egui::Context) {
     about_window(app, ctx);
     guide_window(app, ctx);
     export_window(app, ctx);
+    person_window(app, ctx);
     clear_scene_prompt(app, ctx);
 }
 
@@ -227,7 +228,7 @@ fn menu_bar(app: &mut VeloMocap, ctx: &egui::Context) {
                         .clicked()
                     {
                         ui.close();
-                        app.import_character_dialog();
+                        app.import_character_dialog(app.selected);
                     }
                     ui.separator();
                     // Everything a written file needs — its format, the bone
@@ -743,56 +744,54 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                 let smplh_faces = app.smplh_faces.as_deref();
                 let empty: &[[u32; 3]] = &[];
                 let mhr_faces = mesh.map(|mesh| mesh.triangles.as_slice()).unwrap_or(empty);
-                // An imported character replaces the selected person's body: its
-                // own mesh, posed by the clip's joint rotations. Its root is put
-                // on the clip's pelvis, so it stands where the motion stands.
-                let character = app.character.as_ref();
+                // Imported characters replace their person's body: each one is
+                // posed by the clip's joint rotations, with its root put on the
+                // clip's pelvis so it stands where the motion stands.
                 let character_rest = app.character_rest.as_deref();
-                let posed_character: Option<Vec<f32>> = match (character, character_rest) {
-                    (Some(character), Some(rest)) => flow
-                        .get(selected)
-                        .filter(|clip| !clip.skeletons.is_empty())
-                        .map(|clip| {
-                            let index = app
-                                .playhead
-                                .saturating_sub(clip.first_frame)
-                                .min(clip.skeletons.len() - 1);
-                            let ours = &clip.skeletons[index];
-                            let rotations = rotations_of(ours);
-                            let bind = character
-                                .bones
-                                .iter()
-                                .find(|bone| bone.canonical == Some(0))
-                                .or_else(|| character.bones.first())
-                                .map(|bone| bone.bind)
-                                .unwrap_or([0.0; 3]);
-                            let translation = [
-                                ours.positions[0] - bind[0],
-                                ours.positions[1] - bind[1],
-                                ours.positions[2] - bind[2],
-                            ];
-                            character.pose(&rotations, rest, translation)
-                        }),
-                    _ => None,
-                };
-                let character_faces: &[[u32; 3]] = character
-                    .map(|character| character.faces.as_slice())
-                    .unwrap_or(empty);
+                let posed: Vec<Option<Vec<f32>>> = people
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, person)| {
+                        let assigned = person.character.as_ref()?;
+                        let rest = character_rest?;
+                        let clip = flow.get(slot).filter(|clip| !clip.skeletons.is_empty())?;
+                        let index = app
+                            .playhead
+                            .saturating_sub(clip.first_frame)
+                            .min(clip.skeletons.len() - 1);
+                        let ours = &clip.skeletons[index];
+                        let rotations = rotations_of(ours);
+                        let bind = assigned
+                            .character
+                            .bones
+                            .iter()
+                            .find(|bone| bone.canonical == Some(0))
+                            .or_else(|| assigned.character.bones.first())
+                            .map(|bone| bone.bind)
+                            .unwrap_or([0.0; 3]);
+                        let translation = [
+                            ours.positions[0] - bind[0],
+                            ours.positions[1] - bind[1],
+                            ours.positions[2] - bind[2],
+                        ];
+                        Some(assigned.character.pose(&rotations, rest, translation))
+                    })
+                    .collect();
                 let draws: Vec<viewport::PersonDraw<'_>> = people
                     .iter()
                     .enumerate()
                     .filter(|(_, person)| person.visible)
                     .filter_map(|(slot, person)| {
                         // An imported character wins over the built-in body.
-                        if slot == selected {
-                            if let Some(verts) = posed_character.as_deref() {
+                        if let Some(Some(verts)) = posed.get(slot) {
+                            if let Some(assigned) = person.character.as_ref() {
                                 return Some(viewport::PersonDraw {
                                     name: &person.name,
                                     colour: person.colour,
                                     verts,
                                     keypoints: &[],
-                                    faces: character_faces,
-                                    selected: true,
+                                    faces: &assigned.character.faces,
+                                    selected: slot == selected,
                                 });
                             }
                         }
@@ -1696,6 +1695,7 @@ fn sidebar(app: &mut VeloMocap, ctx: &egui::Context) {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         model_group(app, ui);
+                        people_group(app, ui);
                         solver_group(app, ui);
                         correction_group(app, ui);
                         resources_group(app, ui);
@@ -1783,6 +1783,104 @@ fn model_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
             );
         }
     });
+}
+
+/// One row per person, like the reference's people list: clicking a row opens
+/// that person's panel, where the built-in body can be replaced by an imported
+/// character (and the choice is saved beside the clip).
+fn people_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
+    if app.people.is_empty() {
+        return;
+    }
+    group(ui, i18n::t("People"), |ui| {
+        for index in 0..app.people.len() {
+            let name = app.people[index].name.clone();
+            let colour = app.people[index].colour;
+            let assigned = app.people[index]
+                .character
+                .as_ref()
+                .and_then(|assigned| assigned.path.file_stem())
+                .map(|stem| stem.to_string_lossy().into_owned());
+            let label = match &assigned {
+                Some(stem) => format!("{name}  ·  {stem}"),
+                None => name.clone(),
+            };
+            let selected = app.selected == index;
+            let response = ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new(label)
+                            .size(11.0)
+                            .color(if selected { TEXT } else { colour }),
+                    )
+                    .frame(selected)
+                    .min_size(egui::vec2(ui.available_width(), 18.0)),
+                )
+                .on_hover_text(i18n::t("Click to open this person's model settings"));
+            if response.clicked() {
+                app.selected = index;
+                app.person_panel = Some(index);
+                app.orbit.framed = false;
+            }
+        }
+    });
+}
+
+/// The panel a person row opens: which model is on this person, and how to
+/// replace it.
+fn person_window(app: &mut VeloMocap, ctx: &egui::Context) {
+    let Some(index) = app.person_panel else {
+        return;
+    };
+    if index >= app.people.len() {
+        app.person_panel = None;
+        return;
+    }
+    let name = app.people[index].name.clone();
+    let current = app.people[index]
+        .character
+        .as_ref()
+        .map(|assigned| assigned.path.display().to_string());
+    let mut open = true;
+    egui::Window::new(i18n::zh_en(
+        &format!("人物：{name}"),
+        &format!("Person: {name}"),
+    ))
+    .open(&mut open)
+    .default_width(420.0)
+    .resizable(false)
+    .show(ctx, |ui| {
+        ui.label(
+            egui::RichText::new(match &current {
+                Some(path) => path.clone(),
+                None => i18n::t("Built-in body").to_string(),
+            })
+            .size(11.0)
+            .color(MUTED),
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(egui::Button::new(i18n::t("Replace model…")))
+                .on_hover_text(i18n::t("Import a VRM / glTF humanoid for this person"))
+                .clicked()
+            {
+                app.import_character_dialog(index);
+            }
+            if ui
+                .add_enabled(
+                    current.is_some(),
+                    egui::Button::new(i18n::t("Use built-in body")),
+                )
+                .clicked()
+            {
+                app.clear_character(index);
+            }
+        });
+    });
+    if !open {
+        app.person_panel = None;
+    }
 }
 
 fn solver_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
