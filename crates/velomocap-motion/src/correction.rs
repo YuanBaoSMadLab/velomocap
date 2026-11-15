@@ -885,6 +885,28 @@ fn leg_ik(
             // Same rolling anchor the root pass uses, so the leg IK and the root
             // agree on where the contact patch should be.
             let anchors = rolling_anchor(sole, clip, begin, end, foot_index, ankle, toe, settings.floor);
+            // The reference smooths the reach gain along time
+            // (gaussian_filter1d(1/(1+(gap/.03)^4), max(.5, fps*.08))) so the
+            // IK weight cannot flicker between frames.
+            let raw_weights: Vec<f32> = (begin..end)
+                .enumerate()
+                .map(|(offset, index)| {
+                    let current = joint(&clip.skeletons[index], ankle);
+                    let sole_at = support_point(sole, clip, index, foot_index, ankle, toe);
+                    let hip_pos = joint(&clip.skeletons[index], hip);
+                    let target = [
+                        current[0] as f64 + (anchors[offset][0] - sole_at[0]) as f64,
+                        current[1] as f64,
+                        current[2] as f64 + (anchors[offset][2] - sole_at[2]) as f64,
+                    ];
+                    let hip_f = [hip_pos[0] as f64, hip_pos[1] as f64, hip_pos[2] as f64];
+                    if distance3(target, hip_f) < min_reach * 1.0005 {
+                        return 0.0;
+                    }
+                    reach_falloff(target, hip_f, max_reach) as f32
+                })
+                .collect();
+            let weights = smooth_weights(&raw_weights, fps);
             for (offset, index) in (begin..end).enumerate() {
                 let current = joint(&clip.skeletons[index], ankle);
                 let sole_at = support_point(sole, clip, index, foot_index, ankle, toe);
@@ -906,11 +928,7 @@ fn leg_ik(
                 if distance3(target, hip_f) < min_reach * 1.0005 {
                     continue;
                 }
-                let weight = reach_falloff(
-                    target,
-                    hip_f,
-                    max_reach,
-                );
+                let weight = weights[offset];
                 if weight <= 0.02 {
                     // Kimodo's `reachable_pelvis_lift`: when the contact is out of
                     // reach the pelvis is raised by the shortfall, never by more
@@ -947,9 +965,9 @@ fn leg_ik(
                 // is corrected next to a frame that is not is exactly what reads
                 // as a twitch, so the correction always ramps with distance.
                 let mut want = [
-                    (target[0] - current[0] as f64) * weight,
+                    (target[0] - current[0] as f64) * weight as f64,
                     0.0,
-                    (target[2] - current[2] as f64) * weight,
+                    (target[2] - current[2] as f64) * weight as f64,
                 ];
                 let length = (want[0] * want[0] + want[2] * want[2]).sqrt();
                 if length > cap && length > 0.0 {
@@ -986,7 +1004,7 @@ fn leg_ik(
                             &rest,
                             &source,
                             &[hip, knee],
-                            weight,
+                            weight as f64,
                         );
                         clip.skeletons[index] = body.forward_joints(&clip.poses[index]);
                         report.ik_frames += 1;
@@ -1024,6 +1042,35 @@ fn pelvis_drop(hip: [f64; 3], target: [f64; 3], max_reach: f64) -> f64 {
     }
     let limit = (max_reach * max_reach - horizontal * horizontal).max(0.0).sqrt();
     (vertical - limit).clamp(0.0, 0.25)
+}
+
+/// Gaussian smoothing of a per-frame IK weight along a stance, sigma =
+/// max(0.5, fps * 0.08) frames, the same kernel the reference uses for its
+/// reach gain. This is what stops a marginal reach from switching the IK on and
+/// off between two frames.
+fn smooth_weights(weights: &[f32], fps: f32) -> Vec<f32> {
+    if weights.len() < 3 {
+        return weights.to_vec();
+    }
+    let sigma = (fps.max(1.0) * 0.08).max(0.5);
+    let radius = (sigma * 3.0).ceil() as isize;
+    let kernel: Vec<f32> = (-radius..=radius)
+        .map(|offset| {
+            let o = offset as f32;
+            (-(o * o) / (2.0 * sigma * sigma)).exp()
+        })
+        .collect();
+    let total: f32 = kernel.iter().sum();
+    (0..weights.len())
+        .map(|frame| {
+            let mut sum = 0.0f32;
+            for (slot, offset) in (-radius..=radius).enumerate() {
+                let at = (frame as isize + offset).clamp(0, weights.len() as isize - 1) as usize;
+                sum += weights[at] * kernel[slot];
+            }
+            sum / total
+        })
+        .collect()
 }
 
 fn joint3(rest: &[f32], index: usize) -> [f64; 3] {
