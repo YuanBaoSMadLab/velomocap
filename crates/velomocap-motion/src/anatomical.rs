@@ -234,6 +234,104 @@ pub fn solve_leg(
     })
 }
 
+/// The reference's `source_reach_gap`: how far a hand target sits outside what the
+/// arm can actually reach, given the elbow axis bounded by `elbow_deg` and the
+/// collar spin bounded by `collar_deg`. Geometry only - it never looks at whether
+/// an optimisation succeeded. Zero means reachable; the caller fades its
+/// correction out as the gap grows (`1 / (1 + (gap / 0.03)^4)` in the reference).
+pub fn source_reach_gap(
+    rest: &[f32],
+    world: &[[f64; 9]],
+    positions: &[[f64; 3]],
+    hand: usize,
+    target: [f64; 3],
+    sample: [f64; 3],
+    collar_deg: f64,
+    elbow_deg: f64,
+) -> f64 {
+    let (shoulder, elbow, wrist, collar) = if hand == 0 {
+        (16usize, 18usize, 20usize, 13usize)
+    } else {
+        (17, 19, 21, 14)
+    };
+    let sign = if hand == 0 { 1.0 } else { -1.0 };
+    let u = sub(joint3(rest, elbow), joint3(rest, shoulder));
+    let v0 = sub(joint3(rest, wrist), joint3(rest, elbow));
+    let calibration = math::align(&[sign, 0.0, 0.0], &u);
+    let axis = rotate(&calibration, [0.0, -sign, 0.0]);
+    let local_elbow = math::tmul3(&world[shoulder], &world[elbow]);
+    let v = rotate(&local_elbow, v0);
+    let along = dot(v, axis);
+    let aa = dot(v, u) - along * dot(u, axis);
+    let bb = dot(cross(axis, v), u);
+    let constant = dot(u, u) + dot(v0, v0) + 2.0 * along * dot(u, axis);
+    let phase = bb.atan2(aa);
+    let bound = elbow_deg.to_radians();
+    let mut low = f64::INFINITY;
+    let mut high: f64 = 0.0;
+    for theta in [
+        -bound,
+        bound,
+        phase.clamp(-bound, bound),
+        wrap(phase).clamp(-bound, bound),
+        wrap(phase + std::f64::consts::PI).clamp(-bound, bound),
+    ] {
+        let value = (constant + 2.0 * (aa * theta.cos() + bb * theta.sin()))
+            .max(0.0)
+            .sqrt();
+        low = low.min(value);
+        high = high.max(value);
+    }
+
+    // Collar spin bounds: how far the shoulder itself can carry the target.
+    let offset = sub(joint3(rest, shoulder), joint3(rest, collar));
+    let offset = rotate(&world[collar], offset);
+    let spin_raw = cross(offset, [0.0, -1.0, 0.0]);
+    let spin_length = norm(spin_raw).max(1e-12);
+    let spin = [spin_raw[0] / spin_length, spin_raw[1] / spin_length, spin_raw[2] / spin_length];
+    let goal = sub(positions[wrist], positions[collar]);
+    let goal = [
+        goal[0] + target[0] - sample[0],
+        goal[1] + target[1] - sample[1],
+        goal[2] + target[2] - sample[2],
+    ];
+    let parallel = [
+        spin[0] * dot(spin, offset),
+        spin[1] * dot(spin, offset),
+        spin[2] * dot(spin, offset),
+    ];
+    let perp = sub(offset, parallel);
+    let ca = dot(goal, perp);
+    let cb = dot(goal, cross(spin, offset));
+    let phase = cb.atan2(ca);
+    let bound = collar_deg.to_radians();
+    let base = dot(goal, goal) + dot(offset, offset) - 2.0 * dot(goal, parallel);
+    let mut dmin = f64::INFINITY;
+    let mut dmax: f64 = 0.0;
+    for theta in [
+        -bound,
+        bound,
+        wrap(phase).clamp(-bound, bound),
+        wrap(phase + std::f64::consts::PI).clamp(-bound, bound),
+    ] {
+        let value = (base - 2.0 * (ca * theta.cos() + cb * theta.sin())).max(0.0).sqrt();
+        dmin = dmin.min(value);
+        dmax = dmax.max(value);
+    }
+    (dmin - high).max(low - dmax).max(0.0)
+}
+
+/// Wrap an angle into `[-pi, pi]`.
+fn wrap(mut angle: f64) -> f64 {
+    while angle > std::f64::consts::PI {
+        angle -= 2.0 * std::f64::consts::PI;
+    }
+    while angle < -std::f64::consts::PI {
+        angle += 2.0 * std::f64::consts::PI;
+    }
+    angle
+}
+
 /// Rotation matrix to an axis-angle vector.
 fn matrix_to_axis_angle(m: &[f64; 9]) -> [f32; 3] {
     let trace = m[0] + m[4] + m[8];
@@ -325,6 +423,23 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn reach_gap_grows_with_distance() {
+        let Some((body, rest)) = loaded() else {
+            return;
+        };
+        let mut pose = Pose::neutral(body.num_joints, 16);
+        pose.betas[0] = 0.3;
+        pose.translation = [0.0, 0.9, 0.0];
+        let (world, positions) = forward(&body, &pose, &rest);
+        let wrist = positions[20];
+        let near = source_reach_gap(&rest, &world, &positions, 0, wrist, wrist, 15.0, 60.0);
+        assert!(near < 1e-6, "current wrist should be reachable, gap {near}");
+        let far = [wrist[0] + 0.8, wrist[1], wrist[2] + 0.5];
+        let gap = source_reach_gap(&rest, &world, &positions, 0, far, wrist, 15.0, 60.0);
+        assert!(gap > 0.1, "far target should have a gap, got {gap}");
+    }
+
     fn solve_leg_reaches_a_target_without_leaving_the_knee_axis() {
         let Some((body, rest)) = loaded() else {
             return;
