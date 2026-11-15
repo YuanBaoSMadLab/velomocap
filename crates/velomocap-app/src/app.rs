@@ -8,6 +8,32 @@ use crate::capture::{self, CaptureJob, CaptureStage};
 use crate::i18n;
 use crate::ui;
 use crate::viewport::{Layers, Orbit, ViewportCache, PERSON_COLOURS};
+/// Which file(s) the export window writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportFormat {
+    Bvh,
+    Fbx,
+    Both,
+}
+
+impl ExportFormat {
+    pub fn label(self) -> &'static str {
+        match self {
+            ExportFormat::Bvh => "BVH",
+            ExportFormat::Fbx => "FBX",
+            ExportFormat::Both => i18n::t("BVH + FBX"),
+        }
+    }
+
+    pub fn bvh(self) -> bool {
+        matches!(self, ExportFormat::Bvh | ExportFormat::Both)
+    }
+
+    pub fn fbx(self) -> bool {
+        matches!(self, ExportFormat::Fbx | ExportFormat::Both)
+    }
+}
+
 #[derive(Clone)]pub struct PersonView {
     pub id: usize,
     pub name: String,
@@ -19,7 +45,9 @@ use crate::viewport::{Layers, Orbit, ViewportCache, PERSON_COLOURS};
         pub first_frame: usize,
         pub frames: Arc<Vec<Vec<f32>>>,
         pub summary: String,
-        pub bvh: Arc<velomocap_motion::PreparedBvh>,}
+        pub bvh: Arc<velomocap_motion::PreparedBvh>,
+    /// Automatic contact runs per track, for the timeline's "automatic" rows.
+    pub contacts: [Vec<[usize; 2]>; velomocap_motion::TRACK_COUNT],}
 impl FlowBody {
         pub fn frame(&self, playhead: usize) -> Option<&[f32]> {
         let index = playhead.checked_sub(self.first_frame)?;
@@ -175,8 +203,6 @@ pub struct LockDrag {
     /// The lock being edited, if any.
     pub index: Option<usize>,
     pub before: Option<Vec<velomocap_motion::Interval>>,
-    /// Whether the pointer left the press pixel, so a stray click stays a click.
-    pub moved: bool,
 }
 pub struct VeloMocap {
     pub video: Option<PathBuf>,
@@ -273,11 +299,25 @@ pub struct VeloMocap {
     locks_pending: bool,
     /// The locks changed since the clip was generated: the next run applies them.
     pub locks_dirty: bool,
+    /// When the playhead last moved on its own, so a seek that never produced a
+    /// picture can be retried instead of leaving the pane on the old frame.
+    seek_at: Instant,
+    seek_tries: u8,
     pub console: Vec<String>,
     pub show_console: bool,
     pub show_help: bool,
     pub show_models: bool,
     pub show_guide: bool,
+    /// The export window: format, skeleton naming, rest correction, file name.
+    /// These used to be a rig submenu plus two items in the File menu, which
+    /// made the naming look like a document property rather than a choice made
+    /// when a file is written.
+    pub show_export: bool,
+    pub export_format: ExportFormat,
+    /// Suffix for the written files; empty means the clip's own name.
+    pub export_name: String,
+    /// One file per person instead of the selected one.
+    pub export_everyone: bool,
     pub tools_ok: bool,
     pub ort_path: Option<PathBuf>,
     pub cuda_ok: bool,
@@ -346,7 +386,7 @@ impl VeloMocap {
             camera_weights,
             use_flow: true,
             correction: velomocap_motion::correction::CorrectionSettings::default(),
-            estimate_camera: true,
+            estimate_camera: false,
             refine_camera: true,
             export_on_finish: export,
             export_fbx_on_finish: export_fbx,
@@ -407,11 +447,17 @@ impl VeloMocap {
             lock_drag: None,
             locks_pending: true,
             locks_dirty: false,
+            seek_at: Instant::now(),
+            seek_tries: 0,
             console: Vec::new(),
             show_console: false,
             show_help: false,
             show_models: false,
             show_guide: false,
+            show_export: false,
+            export_format: ExportFormat::Bvh,
+            export_name: String::new(),
+            export_everyone: false,
             model_status: Vec::new(),
             model_root: None,
             model_core_ready: false,
@@ -970,11 +1016,56 @@ impl VeloMocap {
         }
         Ok(prepared)
     }
-                    pub fn export_fbx(&mut self) {
-        let Some(video) = self.video.clone() else {
+    /// Where an export goes: beside the clip, named after it unless the export
+    /// window gave a name. "Everyone" adds `-p1`, `-p2`, … so the files do not
+    /// overwrite each other (they all used to be `<clip>.bvh`).
+    pub fn export_path(&self, ext: &str, index: usize) -> Option<PathBuf> {
+        let video = self.video.as_ref()?;
+        let name = self.export_name.trim();
+        let stem = if name.is_empty() {
+            video.file_stem()?.to_string_lossy().into_owned()
+        } else {
+            name.to_string()
+        };
+        let suffix = if self.export_everyone {
+            format!("-p{}", index + 1)
+        } else {
+            String::new()
+        };
+        Some(video.with_file_name(format!("{stem}{suffix}.{ext}")))
+    }
+
+    /// Write what the export window selected, then close it.
+    pub fn export_now(&mut self) {
+        let count = if self.flow.is_empty() {
+            self.people.len()
+        } else {
+            self.flow.len()
+        };
+        let previous = self.selected;
+        let indices: Vec<usize> = if self.export_everyone && count > 1 {
+            (0..count).collect()
+        } else {
+            vec![previous.min(count.saturating_sub(1))]
+        };
+        for index in indices {
+            self.selected = index;
+            if self.export_format.bvh() {
+                self.export_bvh();
+            }
+            if self.export_format.fbx() {
+                self.export_fbx();
+            }
+        }
+        self.selected = previous;
+        self.show_export = false;
+    }
+
+    pub fn export_fbx(&mut self) {
+        if self.video.is_none() {
             self.error = Some("Open a video first.".into());
             return;
-        };
+        }
         let Some(clip) = self
             .flow
             .get(self.selected)
@@ -984,7 +1075,10 @@ impl VeloMocap {
             self.error = Some("Generate motion (FlowHMR) before exporting FBX.".into());
             return;
         };
-        let path = video.with_extension("fbx");
+        let Some(path) = self.export_path("fbx", self.selected) else {
+            self.error = Some("Open a video first.".into());
+            return;
+        };
         // MMD's standard bones are Japanese, and the FBX writer keeps bone names
         // ASCII (its importers are not reliable about anything else). Say which
         // export does work instead of failing inside the writer.
@@ -1024,17 +1118,20 @@ impl VeloMocap {
         }
     }
         pub fn export_bvh(&mut self) {
-        let Some(video) = self.video.clone() else {
+        if self.video.is_none() {
             self.error = Some("Open a video first.".into());
             return;
-        };
+        }
         if let Some(clip) = self
             .flow
             .get(self.selected)
             .or_else(|| self.flow.first())
             .cloned()
         {
-            let path = video.with_extension("bvh");
+            let Some(path) = self.export_path("bvh", self.selected) else {
+                self.error = Some("Open a video first.".into());
+                return;
+            };
             let prepared = match self.export_payload(&clip.bvh, self.export_rest_correct) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -1087,7 +1184,13 @@ impl VeloMocap {
             last_frame: person.frames.len().saturating_sub(1),
             hits: person.hits(),
         };
-        let path = video.with_extension("bvh");
+        let path = match self.export_path("bvh", self.selected) {
+            Some(path) => path,
+            None => {
+                self.error = Some("Open a video first.".into());
+                return;
+            }
+        };
         // The MHR skeleton has no canonical bone names (its joints are
         // `mhr000…`), so the skeleton-naming choice cannot apply to it: the
         // per-frame MHR export is only reachable when there is no FlowHMR clip,
@@ -1227,6 +1330,7 @@ impl VeloMocap {
                         frames: clip.frames,
                         summary: clip.summary,
                         bvh: clip.bvh,
+                        contacts: clip.contacts,
                     })
                     .collect();
                                                                 self.orbit.framed = false;
@@ -1446,6 +1550,19 @@ impl VeloMocap {
         } else {
             self.playhead
         };
+        // A seek that produced no picture (ffmpeg declined the `-ss`, or the
+        // request was coalesced away) left the pane showing the old frame while
+        // the playhead had already moved, so the new frame looked ignored. Ask
+        // again a few times instead of staying stuck on the old picture.
+        if !self.playing && self.preview_frame != self.playhead {
+            if self.seek_at.elapsed() > Duration::from_millis(300) && self.seek_tries < 4 {
+                self.seek_tries += 1;
+                self.seek_at = Instant::now();
+                self.stream.invalidate();
+            }
+        } else {
+            self.seek_tries = 0;
+        }
         self.stream.request(
             &video,
             frame,
@@ -1460,6 +1577,12 @@ impl VeloMocap {
     /// Move the playhead and restart the stream there (timeline clicks, slider).
     pub fn seek_to(&mut self, frame: usize) {
         self.playhead = frame;
+        // Always decode the new position, even when it is the frame that is
+        // already on screen: a paused seek is the only thing that updates the
+        // picture, so deduplicating it leaves the pane showing an old frame.
+        self.seek_at = Instant::now();
+        self.seek_tries = 0;
+        self.stream.invalidate();
         // Re-anchor the transport at the new frame, otherwise the next tick
         // would pull the playhead straight back to where the old anchor
         // predicts.

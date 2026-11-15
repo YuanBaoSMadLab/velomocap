@@ -68,6 +68,22 @@ pub fn t(english: &'static str) -> &'static str {
         "Detect every person, then run SAM 3D Body on each" => "先检测出每个人，再逐人运行 SAM 3D Body",
         "Cancel reconstruction" => "取消重建",
         "Export BVH…" => "导出 BVH…",
+        "Export motion…" => "导出动作…",
+        "Export motion" => "导出动作",
+        "Export" => "导出",
+        "Format" => "格式",
+        "File name" => "文件名",
+        "Format, skeleton naming, rest correction and file name" => {
+            "格式、骨架命名、rest 校正与文件名"
+        }
+        "Write the selected person's motion next to the video" => "把选中人物的动作写在视频旁边",
+        "Open a video first" => "请先打开一个视频",
+        "An FBX carries its own bind pose, so the correction applies to BVH exports" => {
+            "FBX 自带绑定姿态，rest 校正只对 BVH 生效"
+        }
+        "This rig's bone names are not ASCII: the FBX writer cannot hold them, write BVH instead" => {
+            "该骨架的骨名不是 ASCII，FBX 写器无法保存，请导出 BVH"
+        }
         "Skeleton naming" => "骨架命名",
         "Write the bones with this rig's names" => "用该骨架的命名写出骨骼",
         "Rest correction" => "rest 姿态校正",
@@ -84,6 +100,7 @@ pub fn t(english: &'static str) -> &'static str {
         "Lock" => "锁定",
         "automatic" => "自动",
         "Add lock here" => "在此添加锁定",
+        "Copy the automatic runs" => "把自动区间复制到本轨",
         "Delete lock" => "删除锁定",
         "Undo" => "撤销",
         "Redo" => "重做",

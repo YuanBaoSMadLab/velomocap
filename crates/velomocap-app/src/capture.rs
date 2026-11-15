@@ -241,6 +241,11 @@ pub struct FlowClipData {
     pub summary: String,
     /// Ready-to-write BVH payload; the body model is dropped after the bake.
     pub bvh: Arc<velomocap_motion::PreparedBvh>,
+    /// The contact runs the detector found, per track (L foot, R foot, L hand,
+    /// R hand), in clip frames. The timeline draws these under the hand-drawn
+    /// locks so an automatic track shows what it is following instead of the
+    /// word "automatic".
+    pub contacts: [Vec<[usize; 2]>; velomocap_motion::TRACK_COUNT],
 }
 
 /// Where the motion models live, and how much of the clip to animate.
@@ -622,6 +627,7 @@ fn run_flow(
             frames: Arc::new(bodies),
             summary,
             bvh: Arc::new(bvh),
+            contacts: correction.detected.clone(),
         });
         if sentinel() {
             break;

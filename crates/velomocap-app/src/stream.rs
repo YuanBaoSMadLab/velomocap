@@ -30,6 +30,8 @@ enum Command {
         path: PathBuf,
         frame: usize,
         scale: usize,
+        /// The resampled grid the clip is played on; the seek must land on it.
+        fps: f64,
     },
     /// Stream from `frame` in order, pacing at `fps * speed`.
     Play {
@@ -141,6 +143,7 @@ impl VideoStream {
                 path: path.to_path_buf(),
                 frame,
                 scale,
+                fps,
             }
         };
         let _ = self.commands.send(command);
@@ -208,10 +211,15 @@ fn run(
                 path,
                 frame,
                 scale,
+                fps,
             } => {
-                if let Some(decoded) =
-                    velomocap_video::decode_frame_at(&tools, &path, frame, Some(scale))
-                {
+                if let Some(decoded) = velomocap_video::decode_frame_at_grid(
+                    &tools,
+                    &path,
+                    frame,
+                    Some(scale),
+                    Some(fps),
+                ) {
                     publish(&shared, &version, generation, serial, decoded);
                 }
             }

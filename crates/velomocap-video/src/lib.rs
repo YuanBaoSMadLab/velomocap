@@ -757,6 +757,25 @@ pub fn decode_frame_at(
     index: usize,
     scale_to_width: Option<usize>,
 ) -> Option<Frame> {
+    decode_frame_at_grid(tools, path, index, scale_to_width, None)
+}
+
+/// Decode one frame on a resampled time grid.
+///
+/// The motion path resamples every clip to 30 fps (`Decoder::open_flow`) and the
+/// playback stream paces itself on that same grid, but a seek used the
+/// container's own frame rate. On a 24/25/60 fps clip that picture belonged to a
+/// different moment than the frame the timeline had selected, so "setting the
+/// frame" looked like it did nothing. `grid_fps` puts the seek on the stream's
+/// grid: the offset is `index / grid_fps` and ffmpeg emits the frame at that
+/// moment of the resampled timeline.
+pub fn decode_frame_at_grid(
+    tools: &Tools,
+    path: impl AsRef<Path>,
+    index: usize,
+    scale_to_width: Option<usize>,
+    grid_fps: Option<f64>,
+) -> Option<Frame> {
     let info = probe(tools, path.as_ref()).ok()?;
     let (width, height) = match scale_to_width {
         Some(target) if target > 0 && target < info.width => {
@@ -765,8 +784,13 @@ pub fn decode_frame_at(
         }
         _ => (info.width & !1, info.height & !1),
     };
-    let fps = if info.fps > 0.0 { info.fps } else { 30.0 };
+    let grid = grid_fps.filter(|fps| fps.is_finite() && *fps > 0.0);
+    let fps = grid.unwrap_or(if info.fps > 0.0 { info.fps } else { 30.0 });
     let seconds = index as f64 / fps;
+    let filter = match grid {
+        Some(grid) => format!("fps={grid},scale={width}:{height}:flags=area"),
+        None => format!("scale={width}:{height}:flags=area"),
+    };
 
     let mut command = Command::new(&tools.ffmpeg);
     command
@@ -777,7 +801,7 @@ pub fn decode_frame_at(
         .arg(path.as_ref())
         .args([
             "-vf",
-            &format!("scale={width}:{height}:flags=area"),
+            &filter,
             "-frames:v",
             "1",
             "-f",
@@ -899,6 +923,39 @@ mod tests {
         // Without rotation both are identities.
         let plain = VggtGeometry::plan_with(1080, 1920, 512, 16, true);
         assert_eq!(plain.unrotate_translation([1.0, 2.0, 3.0]), [1.0, 2.0, 3.0]);
+    }
+
+    /// A seek has to land on the grid the clip is played on.
+    ///
+    /// The motion path resamples every clip to 30 fps and the playback stream
+    /// paces itself on that grid, so a seek that used the container's own rate
+    /// asked for a different moment of the clip. `test-24fps.mp4` is 72 frames at
+    /// 24 fps (3.0 s): as a 30 fps grid it has 90 frames, so frame 72 exists on
+    /// the grid and does not exist on the native timeline. That is the picture
+    /// the timeline showed but the seek never delivered.
+    #[test]
+    fn a_seek_lands_on_the_playback_grid() {
+        let Ok(tools) = Tools::discover() else {
+            eprintln!("skipping: no ffmpeg");
+            return;
+        };
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/media/test-24fps.mp4");
+        if !path.is_file() {
+            eprintln!("skipping: no 24 fps sample");
+            return;
+        }
+        let info = probe(&tools, &path).expect("probe");
+        assert!((info.fps - 24.0).abs() < 0.01, "sample is {:.3} fps", info.fps);
+        // Native grid: 72 frames over 3.0 s, so index 72 is past the end.
+        assert!(
+            decode_frame_at(&tools, &path, 72, Some(96)).is_none(),
+            "the native timeline unexpectedly has frame 72"
+        );
+        // 30 fps grid: 90 frames over the same 3.0 s, so 72 is inside.
+        assert!(
+            decode_frame_at_grid(&tools, &path, 72, Some(96), Some(30.0)).is_some(),
+            "the 30 fps grid has no frame 72"
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@
 
 use eframe::egui;
 
-use crate::app::{LockDrag, LockGrab, VeloMocap};
+use crate::app::{ExportFormat, LockDrag, LockGrab, VeloMocap};
 use crate::i18n;
 use crate::capture::CaptureStage;
 use crate::viewport::{self, Scene, ViewMode};
@@ -120,6 +120,7 @@ pub fn draw(app: &mut VeloMocap, ctx: &egui::Context) {
     console_window(app, ctx);
     about_window(app, ctx);
     guide_window(app, ctx);
+    export_window(app, ctx);
     clear_scene_prompt(app, ctx);
 }
 
@@ -216,58 +217,21 @@ fn menu_bar(app: &mut VeloMocap, ctx: &egui::Context) {
                         app.cancel_capture();
                     }
                     ui.separator();
-                    // Which bone vocabulary the export is written in, and
-                    // whether its rotations are re-expressed in the canonical
-                    // rest frames. Picking a vendor also turns the correction on
-                    // for rigs that bind in the canonical T-pose, and off for the
-                    // ones that do not (Unreal's mannequin is an A-pose).
-                    ui.menu_button(i18n::t("Skeleton naming"), |ui| {
-                        for rig in velomocap_motion::retarget::Rig::ALL {
-                            if ui
-                                .selectable_label(app.export_rig == rig, i18n::t(rig.label()))
-                                .clicked()
-                            {
-                                app.export_rig = rig;
-                                app.export_rest_correct =
-                                    rig != velomocap_motion::retarget::Rig::Biped
-                                        && rig.binds_in_t_pose();
-                                ui.close();
-                            }
-                        }
-                    })
-                    .response
-                    .on_hover_text(i18n::t("Write the bones with this rig's names"));
-                    ui.checkbox(&mut app.export_rest_correct, i18n::t("Rest correction"))
-                        .on_hover_text(i18n::t(
-                            "Turn the clip into the canonical T-pose bind, so a Mixamo-class rig plays it exactly",
-                        ));
-                    ui.separator();
-                    // The FlowHMR clip is what the viewport shows, so the menu
-                    // exports that when it exists and the per-frame MHR bodies
-                    // otherwise.
+                    // Everything a written file needs — its format, the bone
+                    // vocabulary, the rest correction and the name — lives in
+                    // one export window. As a menu submenu the naming read like
+                    // a property of the document rather than a choice made when
+                    // a file is written.
                     let can_export = !app.flow.is_empty() || !app.people.is_empty();
                     if ui
-                        .add_enabled(can_export, egui::Button::new(i18n::t("Export BVH…")))
+                        .add_enabled(can_export, egui::Button::new(i18n::t("Export motion…")))
                         .on_hover_text(i18n::t(
-                            "Write the selected person's motion next to the video",
+                            "Format, skeleton naming, rest correction and file name",
                         ))
                         .clicked()
                     {
                         ui.close();
-                        app.export_bvh();
-                    }
-                    if ui
-                        .add_enabled(
-                            !app.flow.is_empty(),
-                            egui::Button::new(i18n::t("Export FBX…")),
-                        )
-                        .on_hover_text(i18n::t(
-                            "Write the selected person's motion as binary FBX 7.4",
-                        ))
-                        .clicked()
-                    {
-                        ui.close();
-                        app.export_fbx();
+                        app.show_export = true;
                     }
                     ui.separator();
                     if ui.button(i18n::t("Quit")).clicked() {
@@ -1339,14 +1303,22 @@ fn lock_rows(app: &mut VeloMocap, ui: &mut egui::Ui, frames: usize) {
                     let frame = frame_of(rect, position.x);
                     let before = app.locks.track(track).map(<[_]>::to_vec);
                     let mut grab = (LockGrab::New, None);
+                    // A one-frame lock is only a few pixels wide on a long clip,
+                    // and the six-pixel edge tolerance then covers the whole
+                    // bar: every press landed on an edge and the bar slid or
+                    // shrank instead of being dragged where it was pointed at.
+                    // Edges are only grabbable when there is room for a body.
+                    let per_frame = rect.width() / (frames.max(2) - 1) as f32;
+                    let tolerance = LOCK_EDGE.min(per_frame * 0.35);
                     if let Some(intervals) = app.locks.track(track) {
                         for (index, [start, end]) in intervals.iter().enumerate() {
                             let (left, right) = (x_of(rect, *start), x_of(rect, *end));
-                            if (position.x - left).abs() <= LOCK_EDGE {
+                            let roomy = (*end - *start) as f32 * per_frame >= 12.0;
+                            if roomy && (position.x - left).abs() <= tolerance {
                                 grab = (LockGrab::Start, Some(index));
                                 break;
                             }
-                            if (position.x - right).abs() <= LOCK_EDGE {
+                            if roomy && (position.x - right).abs() <= tolerance {
                                 grab = (LockGrab::End, Some(index));
                                 break;
                             }
@@ -1376,13 +1348,13 @@ fn lock_rows(app: &mut VeloMocap, ui: &mut egui::Ui, frames: usize) {
                         anchor: frame,
                         index,
                         before,
-                        moved: false,
                     });
                 }
             }
 
             // Drag: recompute the grabbed lock; the release turns it into one
-            // undo step (a press that never moved stays a plain scrub).
+            // undo step (a press that never moved leaves the one-frame lock it
+            // just placed).
             if app.lock_drag.as_ref().is_some_and(|drag| drag.track == track) {
                 let pointer = ui.ctx().pointer_latest_pos();
                 if let Some(position) = pointer {
@@ -1412,7 +1384,6 @@ fn lock_rows(app: &mut VeloMocap, ui: &mut egui::Ui, frames: usize) {
                                     app.selected_lock = Some((track, now));
                                     drag.index = Some(now);
                                 }
-                                drag.moved = drag.moved || frame != drag.anchor;
                             }
                         }
                     }
@@ -1421,22 +1392,42 @@ fn lock_rows(app: &mut VeloMocap, ui: &mut egui::Ui, frames: usize) {
                 let released = response.drag_stopped() || !response.is_pointer_button_down_on();
                 if released {
                     let drag = app.lock_drag.take().expect("checked above");
-                    if drag.grab == LockGrab::New && !drag.moved {
-                        match drag.before {
-                            Some(list) => app.locks.set_track(track, list),
-                            None => app.locks.reset_track(track),
-                        }
-                        app.selected_lock = None;
-                    } else {
-                        app.locks.normalise(frames);
-                        app.push_lock_edit(track, drag.before);
-                    }
+                    // A press without a drag is a *fixed frame*: it used to be
+                    // created here and then thrown away again on release, so a
+                    // click looked like it did nothing and the frame could only
+                    // be placed by dragging a one-frame bar exactly.
+                    app.locks.normalise(frames);
+                    app.push_lock_edit(track, drag.before);
                 }
             }
 
             // Draw the track.
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(0x1c, 0x1c, 0x1c));
+            // The detector's own runs, dimmed: an automatic track then shows
+            // *what* it follows instead of only the word "automatic", and a
+            // hand-drawn track shows what the drawing is replacing. Without
+            // this there is nothing to estimate a lock against.
+            let auto: Vec<[usize; 2]> = app
+                .flow
+                .get(app.selected)
+                .map(|clip| clip.contacts[track].clone())
+                .unwrap_or_default();
+            for [start, end] in &auto {
+                let left = x_of(rect, *start);
+                let right = x_of(rect, (*end).min(frames.saturating_sub(1)).max(*start));
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(left, rect.top() + 4.5),
+                        egui::pos2(
+                            (right.max(left + 1.0)).min(rect.right()),
+                            rect.bottom() - 4.5,
+                        ),
+                    ),
+                    1.0,
+                    colour.gamma_multiply(0.30),
+                );
+            }
             match app.locks.track(track) {
                 Some(intervals) => {
                     for (index, [start, end]) in intervals.iter().enumerate() {
@@ -1481,13 +1472,15 @@ fn lock_rows(app: &mut VeloMocap, ui: &mut egui::Ui, frames: usize) {
                     }
                 }
                 None => {
-                    painter.text(
-                        rect.left_center() + egui::vec2(6.0, 0.0),
-                        egui::Align2::LEFT_CENTER,
-                        i18n::t("automatic"),
-                        egui::FontId::proportional(9.5),
-                        MUTED,
-                    );
+                    if auto.is_empty() {
+                        painter.text(
+                            rect.left_center() + egui::vec2(6.0, 0.0),
+                            egui::Align2::LEFT_CENTER,
+                            i18n::t("automatic"),
+                            egui::FontId::proportional(9.5),
+                            MUTED,
+                        );
+                    }
                 }
             }
             let x = rect.left()
@@ -1501,6 +1494,20 @@ fn lock_rows(app: &mut VeloMocap, ui: &mut egui::Ui, frames: usize) {
             // The reference's context menu, item for item.
             response.clone().context_menu(|ui| {
                 ui.label(i18n::t(velomocap_motion::TRACK_LABELS[track]));
+                // Start from what the detector found instead of drawing the
+                // whole track by hand: the runs are what the user is trying to
+                // match, so they are the natural starting point.
+                if !auto.is_empty()
+                    && ui
+                        .add(egui::Button::new(i18n::t("Copy the automatic runs")))
+                        .clicked()
+                {
+                    let before = app.locks.track(track).map(<[_]>::to_vec);
+                    app.locks.set_track(track, auto.clone());
+                    app.locks.normalise(frames);
+                    app.push_lock_edit(track, before);
+                    ui.close();
+                }
                 if ui.button(i18n::t("Add lock here")).clicked() {
                     let frame = ui
                         .ctx()
@@ -2105,8 +2112,148 @@ fn about_window(app: &mut VeloMocap, ctx: &egui::Context) {
     app.show_help = open;
 }
 
-fn guide_window(app: &mut VeloMocap, ctx: &egui::Context) {
-    if !app.show_guide {
+/// The export window: format, skeleton naming, rest correction, file name.
+///
+/// The naming and the rest-correction toggle used to be in the File menu, which
+/// made them look like properties of the open document. They are choices about
+/// the file being written, so they live with the write: one window that shows
+/// exactly which files a click will produce.
+fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
+    if !app.show_export {
+        return;
+    }
+    let mut open = app.show_export;
+    egui::Window::new(i18n::t("Export motion"))
+        .open(&mut open)
+        .default_width(440.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(i18n::t("Format")).size(11.0).color(MUTED));
+                for format in [ExportFormat::Bvh, ExportFormat::Fbx, ExportFormat::Both] {
+                    ui.selectable_value(&mut app.export_format, format, format.label());
+                }
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(i18n::t("Skeleton naming")).size(11.0).color(MUTED));
+                egui::ComboBox::from_id_salt("export-rig")
+                    .selected_text(i18n::t(app.export_rig.label()))
+                    .width(206.0)
+                    .show_ui(ui, |ui| {
+                        for rig in velomocap_motion::retarget::Rig::ALL {
+                            if ui
+                                .selectable_label(app.export_rig == rig, i18n::t(rig.label()))
+                                .clicked()
+                            {
+                                app.export_rig = rig;
+                                // Rigs that bind in the canonical T-pose want
+                                // the correction; the ones that do not (Unreal's
+                                // mannequin is an A-pose) do not.
+                                app.export_rest_correct =
+                                    rig != velomocap_motion::retarget::Rig::Biped
+                                        && rig.binds_in_t_pose();
+                            }
+                        }
+                    });
+            })
+            .response
+            .on_hover_text(i18n::t("Write the bones with this rig's names"));
+            ui.add_enabled(
+                app.export_format.bvh(),
+                egui::Checkbox::new(
+                    &mut app.export_rest_correct,
+                    egui::RichText::new(i18n::t("Rest correction")).size(11.0),
+                ),
+            )
+            .on_disabled_hover_text(i18n::t(
+                "An FBX carries its own bind pose, so the correction applies to BVH exports",
+            ))
+            .on_hover_text(i18n::t(
+                "Turn the clip into the canonical T-pose bind, so a Mixamo-class rig plays it exactly",
+            ));
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(i18n::t("File name")).size(11.0).color(MUTED));
+                let hint = app
+                    .video
+                    .as_ref()
+                    .and_then(|video| video.file_stem())
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.export_name)
+                        .hint_text(hint)
+                        .desired_width(240.0),
+                );
+            });
+            let count = if app.flow.is_empty() {
+                app.people.len()
+            } else {
+                app.flow.len()
+            };
+            if count > 1 {
+                ui.checkbox(
+                    &mut app.export_everyone,
+                    egui::RichText::new(i18n::zh_en(
+                        &format!("全部 {count} 人各写一份"),
+                        &format!("One file per person ({count})"),
+                    ))
+                    .size(11.0),
+                );
+            }
+            ui.add_space(4.0);
+            // Show the exact paths, so a multi-person export cannot silently
+            // overwrite the previous person's file.
+            let indices: Vec<usize> = if app.export_everyone && count > 1 {
+                (0..count).collect()
+            } else {
+                vec![app.selected.min(count.saturating_sub(1))]
+            };
+            for index in indices {
+                for (enabled, ext) in [
+                    (app.export_format.bvh(), "bvh"),
+                    (app.export_format.fbx(), "fbx"),
+                ] {
+                    if !enabled {
+                        continue;
+                    }
+                    let path = app
+                        .export_path(ext, index)
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| i18n::t("Open a video first").to_string());
+                    ui.label(egui::RichText::new(path).size(10.0).color(MUTED));
+                }
+            }
+            if app.export_format.fbx() && !app.export_rig.ascii_names() {
+                ui.label(
+                    egui::RichText::new(i18n::t(
+                        "This rig's bone names are not ASCII: the FBX writer cannot hold them, write BVH instead",
+                    ))
+                    .size(10.0)
+                    .color(ERR),
+                );
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let can = !app.flow.is_empty() || !app.people.is_empty();
+                if ui
+                    .add_enabled(can, egui::Button::new(i18n::t("Export")))
+                    .clicked()
+                {
+                    app.export_now();
+                }
+                if ui.button(i18n::t("Cancel")).clicked() {
+                    app.show_export = false;
+                }
+            });
+        });
+    // `export_now` closes the window itself, so keep it closed even though the
+    // local `open` is still true.
+    app.show_export = open && app.show_export;
+}
+
+fn guide_window(app: &mut VeloMocap, ctx: &egui::Context) {    if !app.show_guide {
         return;
     }
     let mut open = app.show_guide;
