@@ -31,6 +31,11 @@ const RIGHT_ELBOW: usize = 19;
 const LEFT_WRIST: usize = 20;
 const RIGHT_WRIST: usize = 21;
 
+/// Kimodo's default trajectory weights (`Utility.cpp`).
+const POS_WEIGHT: f64 = 0.001;
+const VEL_WEIGHT: f64 = 1.0;
+const ACC_WEIGHT: f64 = 10.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CorrectionMode {
     /// Every foot is pinned to one ground height.
@@ -117,17 +122,20 @@ pub struct CorrectionReport {
     pub ik_frames: usize,
     /// Worst distance between a solved wrist and its pinned target.
     pub max_hand_error: f32,
+    /// Largest vertical correction applied by the ground pass.
+    pub vertical_shift: f32,
 }
 
 impl CorrectionReport {
     pub fn line(&self) -> String {
         format!(
-            "correction: {} foot contacts, {} hand contacts, {} IK frames, max shift {:.3} m, hand residual {:.1} mm",
+            "correction: {} foot contacts, {} hand contacts, {} IK frames, max shift {:.3} m, hand residual {:.1} mm, ground {:+.3} m",
             self.foot_contacts,
             self.hand_contacts,
             self.ik_frames,
             self.max_shift,
-            self.max_hand_error * 1000.0
+            self.max_hand_error * 1000.0,
+            self.vertical_shift
         )
     }
 }
@@ -151,6 +159,7 @@ pub fn apply(
 
     if settings.foot {
         foot_lock(clip, settings, &thresholds, &mut report);
+        ground_feet(clip, settings, &thresholds, &mut report);
     }
     if settings.hand {
         hand_lock(clip, body, &thresholds, &mut report);
@@ -164,8 +173,89 @@ pub fn apply(
     Ok(report)
 }
 
-fn joint(skeleton: &Skeleton, index: usize) -> [f32; 3] {
-    [
+/// Kimodo's velocity weights: slow motion is preserved more strongly, so a
+/// character that is standing still does not drift while the solver evens out
+/// the contacts.
+fn velocity_weights(clip: &FlowClip) -> Vec<f64> {
+    let count = clip.skeletons.len();
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut weights = vec![1.0f64; count];
+    for frame in 1..count {
+        let x = (clip.skeletons[frame].positions[0] - clip.skeletons[frame - 1].positions[0]) as f64;
+        let z = (clip.skeletons[frame].positions[2] - clip.skeletons[frame - 1].positions[2]) as f64;
+        let speed = (x * x + z * z).sqrt() / 0.05;
+        weights[frame] = 1.0 / speed.max(1e-3);
+    }
+    if count > 1 {
+        weights[0] = weights[1];
+    }
+    weights
+}
+
+/// Vertical correction, ported from Kimodo's `CorrectHipsY`: the frames where a
+/// sole is on the ground are pins, the rest is free, and the position, velocity
+/// and acceleration weights keep the height a smooth curve instead of the
+/// per-frame snapping that made the body bob.
+fn ground_feet(
+    clip: &mut FlowClip,
+    settings: &CorrectionSettings,
+    thresholds: &Thresholds,
+    report: &mut CorrectionReport,
+) {
+    let count = clip.skeletons.len();
+    if count < 3 {
+        return;
+    }
+    let feet = [(LEFT_ANKLE, LEFT_FOOT), (RIGHT_ANKLE, RIGHT_FOOT)];
+    let tolerance = thresholds.contact_height;
+    let mut margins = vec![-1.0f64; count];
+    let mut observation = vec![0.0f64; count];
+    let mut pinned = 0usize;
+    for frame in 0..count {
+        let mut stack = [0.0f32; 2];
+        let mut lowest = f32::MAX;
+        for (slot, (ankle, toe)) in feet.iter().enumerate() {
+            let at = joint(&clip.skeletons[frame], *ankle)[1].min(joint(&clip.skeletons[frame], *toe)[1]);
+            stack[slot] = at;
+            lowest = lowest.min(at);
+        }
+        // Only the lowest sole decides: a stepping foot is not a pin.
+        let gap = lowest - settings.floor;
+        observation[frame] = (clip.poses[frame].translation[1] - gap) as f64;
+        if gap <= tolerance {
+            margins[frame] = 0.0;
+            pinned += 1;
+        }
+    }
+    if pinned < 2 {
+        return;
+    }
+
+    // Kimodo's weights for the vertical pass: position x10, velocity x1,
+    // acceleration x0.1.
+    let reference: Vec<f64> = clip.poses.iter().map(|pose| pose.translation[1] as f64).collect();
+    let corrector = crate::trajectory::TrajectoryCorrector::new(
+        &margins,
+        POS_WEIGHT * 10.0,
+        VEL_WEIGHT,
+        ACC_WEIGHT * 0.1,
+        &[],
+        60,
+    );
+    let corrected = corrector.interpolate(&observation, &reference);
+    let cap = thresholds.max_correction as f64;
+    let mut moved = 0.0f32;
+    for frame in 0..count {
+        let delta = (corrected[frame] - reference[frame]).clamp(-cap, cap);
+        moved = moved.max(delta.abs() as f32);
+        clip.poses[frame].translation[1] += delta as f32;
+    }
+    report.vertical_shift = moved;
+}
+
+fn joint(skeleton: &Skeleton, index: usize) -> [f32; 3] {    [
         skeleton.positions[index * 3],
         skeleton.positions[index * 3 + 1],
         skeleton.positions[index * 3 + 2],
@@ -296,13 +386,16 @@ fn foot_lock(
         return;
     }
     let reference = vec![0.0f64; count];
+    // Kimodo's velocity weights: standing still is weighted up so the root does
+    // not drift while the solver evens out the contacts.
+    let weights = velocity_weights(clip);
     let corrector = crate::trajectory::TrajectoryCorrector::new(
         &margins,
-        1.0,
-        12.0,
-        40.0,
-        &[],
-        40,
+        POS_WEIGHT,
+        VEL_WEIGHT,
+        ACC_WEIGHT,
+        &weights,
+        60,
     );
     let shift_x = corrector.interpolate(&target_x, &reference);
     let shift_z = corrector.interpolate(&target_z, &reference);
@@ -601,52 +694,6 @@ fn rotate_joint_world(
     pose.body[at + 1] = angles[1];
     pose.body[at + 2] = angles[2];
     true
-}
-
-/// Apply `delta` (a world-space rotation) to one joint and rewrite that joint's
-/// axis-angle in the pose.
-fn rotate_joint(
-    body: &BodyModel,
-    pose: &mut Pose,
-    skeleton: &Skeleton,
-    joint_index: usize,
-    delta: &[f64; 9],
-) -> bool {
-    let current = world_rotation(skeleton, joint_index);
-    let next = math::mul3(delta, &current);
-    if joint_index == 0 {
-        let angles = axis_angle(&next);
-        pose.root = angles;
-        return true;
-    }
-    let parent = match body.parents.get(joint_index) {
-        Some(value) if *value >= 0 => *value as usize,
-        _ => {
-            let angles = axis_angle(&next);
-            pose.root = angles;
-            return true;
-        }
-    };
-    let parent_world = world_rotation(skeleton, parent);
-    let local = math::tmul3(&parent_world, &next);
-    let angles = axis_angle(&local);
-    let at = (joint_index - 1) * 3;
-    if at + 3 > pose.body.len() {
-        return false;
-    }
-    pose.body[at] = angles[0];
-    pose.body[at + 1] = angles[1];
-    pose.body[at + 2] = angles[2];
-    true
-}
-
-fn world_rotation(skeleton: &Skeleton, index: usize) -> [f64; 9] {
-    let at = index * 9;
-    let mut out = [0.0f64; 9];
-    for k in 0..9 {
-        out[k] = skeleton.rotations[at + k] as f64;
-    }
-    out
 }
 
 fn axis_angle(m: &[f64; 9]) -> [f32; 3] {
