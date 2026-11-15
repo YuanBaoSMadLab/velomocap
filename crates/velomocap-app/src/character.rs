@@ -1587,6 +1587,33 @@ mod tests {
         assert!(character.vertex_count() > 0);
     }
 
+    /// The same real file, posed with a clip that has not moved: every joint's
+    /// delta is the identity, so the skinning has to put every vertex back
+    /// exactly where the bind pose had it. Anything the hierarchy, the pivots or
+    /// the swing gets wrong shows up as the mesh sliding.
+    #[test]
+    fn a_real_character_poses_without_drifting() {
+        let Some(path) = std::env::var_os("VELOMOCAP_CHARACTER") else {
+            return;
+        };
+        let character = Character::load(std::path::Path::new(&path)).expect("load");
+        let mut names = vec![String::new(); 52];
+        for (bone, name) in names.iter_mut().enumerate() {
+            *name = velomocap_motion::retarget::BONES.get(bone).unwrap_or(&"").to_string();
+        }
+        let world = vec![neutral(); 52];
+        let rest = vec![neutral(); 52];
+        let posed = character.pose(&world, &rest, &vec![[0.0f32; 3]; 52], &names, [0.0; 3]);
+        let mut worst = 0.0f32;
+        for (rest, posed) in character.rest.chunks_exact(3).zip(posed.chunks_exact(3)) {
+            for axis in 0..3 {
+                worst = worst.max((rest[axis] - posed[axis]).abs());
+            }
+        }
+        eprintln!("{}: bind pose drifts {:.6} m", character.name, worst);
+        assert!(worst < 0.005, "{worst} m");
+    }
+
     /// The FBX path: a skin with two clusters, a quad, and the connections that
     /// tie a cluster to its bone. Everything below is what a Mixamo export has,
     /// minus the hundreds of nodes around it.
