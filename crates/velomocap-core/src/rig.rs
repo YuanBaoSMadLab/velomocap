@@ -56,9 +56,15 @@ impl Binding {
             return Err(Error::new("Non-finite export skeleton data"));
         }
         for name in &self.names {
+            // A BVH joint name is a single token: whitespace and the braces that
+            // delimit the hierarchy are the only characters that break the file.
+            // `:` has to survive because it is what Mixamo's FBX namespace
+            // writes (`mixamorig:Hips`), and the rest of the range has to survive
+            // because MMD's standard bones are Japanese (`センター`, `左ひじ`).
             if name.is_empty()
-                || !name.is_ascii()
-                || name.chars().any(|c| c.is_whitespace() || c == '{' || c == '}' || c == ':')
+                || name
+                    .chars()
+                    .any(|c| c.is_whitespace() || c == '{' || c == '}' || c.is_control())
             {
                 return Err(Error::new(format!("Invalid export bone name: {name:?}")));
             }
@@ -147,9 +153,26 @@ mod tests {
         }
     }
 
+    /// A joint name only has to survive the file: Mixamo's namespace uses `:`
+    /// and MMD's standard bones are Japanese, while whitespace and braces would
+    /// break the hierarchy tokens.
     #[test]
-    fn identity_basis_is_a_no_op() {
-        let binding = identity_binding();
+    fn bone_names_that_a_rig_actually_uses_are_accepted() {
+        let mut binding = identity_binding();
+        for name in ["mixamorig:Hips", "センター", "左ひじ", "J_Bip_L_UpperArm", "index_02_l"] {
+            binding.names[0] = name.to_string();
+            binding
+                .validate()
+                .unwrap_or_else(|error| panic!("{name} was rejected: {error}"));
+        }
+        for name in ["", "left arm", "left{arm", "left}arm", "left\tarm"] {
+            binding.names[0] = name.to_string();
+            assert!(binding.validate().is_err(), "{name:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn identity_basis_is_a_no_op() {        let binding = identity_binding();
         let local: Vec<f64> = (0..3 * 9).map(|i| (i as f64) * 0.01).collect();
         let out = local_frames(&local, &binding, 1);
         for (a, b) in out.iter().zip(local.iter()) {

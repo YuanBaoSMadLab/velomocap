@@ -1002,7 +1002,10 @@ fn strip_namespace(raw: &str) -> &str {
 /// `^mixamorig\d*[_:]?`
 fn strip_mixamo<'a>(raw: &'a str) -> &'a str {
     let prefix = "mixamorig";
-    if raw.len() < prefix.len() || !raw[..prefix.len()].eq_ignore_ascii_case(prefix) {
+    if raw.len() < prefix.len() || !raw.is_char_boundary(prefix.len()) {
+        return raw;
+    }
+    if !raw[..prefix.len()].eq_ignore_ascii_case(prefix) {
         return raw;
     }
     let mut rest = &raw[prefix.len()..];
@@ -1043,8 +1046,12 @@ fn strip_prefix_plain<'a>(raw: &'a str, prefix: &str) -> &'a str {
 }
 
 /// Case-insensitive `prefix`, without allocating.
+///
+/// The length check is in bytes and the slice is guarded by `is_char_boundary`:
+/// an ASCII prefix can only match at a character boundary, and MMD's names are
+/// Japanese, where a plain `split_at(prefix.len())` would panic mid-character.
 fn strip_ci_start<'a>(raw: &'a str, prefix: &str) -> Option<&'a str> {
-    if raw.len() < prefix.len() {
+    if raw.len() < prefix.len() || !raw.is_char_boundary(prefix.len()) {
         return None;
     }
     let (head, rest) = raw.split_at(prefix.len());
@@ -1195,9 +1202,6 @@ pub const BIPED: [&str; BONE_COUNT] = [
 ///
 /// Vendors the package handles but this list leaves out, and why:
 ///
-/// * **MMD/PMX** — its biped has two spine bones where the canonical skeleton
-///   has three, and the package maps `上半身2` to `Spine1` only, so `Spine2`
-///   would need a name invented here.
 /// * **MakeHuman** — its default skeleton numbers every bone (`spine01`,
 ///   `upperarm01.L`), which the alias table resolves only in part.
 /// * **Rigify** — `spine.001` and friends have no alias either; Blender
@@ -1217,16 +1221,24 @@ pub enum Rig {
     Unreal,
     /// DAZ Genesis (`hip`, `lShldr`, `lThigh`, `lIndex1`).
     Daz,
+    /// MMD / PMX standard bones (`センター`, `上半身`, `左腕`, `左ひじ`,
+    /// `左親指0`). The standard rig has two spine bones where the canonical
+    /// skeleton has three, so the third is written as `上半身3` — the
+    /// continuation MMD models use when they carry one — and `EXTRA` resolves
+    /// it back. Its bind pose is per model, so the rest correction is off by
+    /// default like Unreal's.
+    Mmd,
 }
 
 impl Rig {
-    pub const ALL: [Rig; 6] = [
+    pub const ALL: [Rig; 7] = [
         Rig::Biped,
         Rig::Mixamo,
         Rig::MixamoPrefixed,
         Rig::Vrm,
         Rig::Unreal,
         Rig::Daz,
+        Rig::Mmd,
     ];
 
     /// Interface label.
@@ -1238,6 +1250,7 @@ impl Rig {
             Rig::Vrm => "VRM",
             Rig::Unreal => "Unreal",
             Rig::Daz => "DAZ Genesis",
+            Rig::Mmd => "MMD / PMX",
         }
     }
 
@@ -1250,6 +1263,7 @@ impl Rig {
             Rig::Vrm => "vrm",
             Rig::Unreal => "unreal",
             Rig::Daz => "daz",
+            Rig::Mmd => "mmd",
         }
     }
 
@@ -1263,10 +1277,20 @@ impl Rig {
     /// rest-pose correction is the right default for it.
     ///
     /// The canonical rest is Mixamo's, so Mixamo, VRM and DAZ (all T-pose
-    /// binds) line up with it; the Unreal mannequin binds in an A-pose, so the
-    /// correction would rotate every arm by 45° and has to stay off.
+    /// binds) line up with it. The Unreal mannequin binds in an A-pose, so the
+    /// correction would rotate every arm by 45°, and an MMD model's bind is
+    /// whatever the PMX author made it — neither is a T-pose by contract, so
+    /// both default off.
     pub fn binds_in_t_pose(self) -> bool {
-        !matches!(self, Rig::Unreal)
+        !matches!(self, Rig::Unreal | Rig::Mmd)
+    }
+
+    /// Whether this rig spells its bones in ASCII, i.e. whether the FBX writer
+    /// accepts them. Only MMD does not: its standard bones are Japanese, and the
+    /// FBX importers this has been checked against are not reliable about
+    /// non-ASCII bone names.
+    pub fn ascii_names(self) -> bool {
+        !matches!(self, Rig::Mmd)
     }
 
     /// The name this rig gives a canonical bone.
@@ -1279,6 +1303,7 @@ impl Rig {
             Rig::Vrm => vrm_name(bone),
             Rig::Unreal => unreal_name(bone),
             Rig::Daz => daz_name(bone),
+            Rig::Mmd => mmd_name(bone),
         }
     }
 }
@@ -1420,6 +1445,50 @@ fn daz_name(bone: usize) -> String {
         50 => "rFoot".to_string(),
         51 => "rToe".to_string(),
         other => BONES[other].to_string(),
+    }
+}
+
+/// MMD's standard bones, in Japanese, as PMX files spell them.
+///
+/// The thumb is numbered from 0 in MMD (its metacarpal is `親指0`), the other
+/// four fingers from 1; a model without `上半身3` still imports, the bone is just
+/// left unmapped, which is how MMD itself treats a three-segment spine.
+fn mmd_name(bone: usize) -> String {
+    if let Some((side, digit, segment)) = finger_parts(bone) {
+        let finger = ["親指", "人指", "中指", "薬指", "小指"][digit];
+        let side = if side == 'L' { "左" } else { "右" };
+        let index = if digit == 0 { segment - 1 } else { segment };
+        return format!("{side}{finger}{index}");
+    }
+    let (side, part) = match bone {
+        0 => ('C', "センター"),
+        1 => ('C', "上半身"),
+        2 => ('C', "上半身2"),
+        3 => ('C', "上半身3"),
+        4 => ('C', "首"),
+        5 => ('C', "頭"),
+        6 => ('L', "肩"),
+        7 => ('L', "腕"),
+        8 => ('L', "ひじ"),
+        9 => ('L', "手首"),
+        25 => ('R', "肩"),
+        26 => ('R', "腕"),
+        27 => ('R', "ひじ"),
+        28 => ('R', "手首"),
+        44 => ('L', "足"),
+        45 => ('L', "ひざ"),
+        46 => ('L', "足首"),
+        47 => ('L', "つま先"),
+        48 => ('R', "足"),
+        49 => ('R', "ひざ"),
+        50 => ('R', "足首"),
+        51 => ('R', "つま先"),
+        other => return BONES[other].to_string(),
+    };
+    match side {
+        'C' => part.to_string(),
+        'L' => format!("左{part}"),
+        _ => format!("右{part}"),
     }
 }
 
@@ -1610,13 +1679,23 @@ pub fn rewrite(
     Ok(bone_coverage(canonical.len()))
 }
 
-/// Alias corrections for Unreal's spine chain.
+/// Alias corrections for names the package does not resolve.
 ///
-/// The package has no entry for `spine_01..03`, so its duplicate-suffix fallback
-/// (`/[._]\d+$/`) strips the index and returns `Spine` for all three — Unreal's
-/// chest collapses onto its waist. These three entries are looked up in the
-/// direct pass, before that fallback, and name the canonical bones in order.
-const EXTRA: &[(&str, u8)] = &[("spine01", 1), ("spine02", 2), ("spine03", 3)];
+/// * **Unreal's spine.** The package has no entry for `spine_01..03`, so its
+///   duplicate-suffix fallback (`/[._]\d+$/`) strips the index and returns
+///   `Spine` for all three — Unreal's chest collapses onto its waist.
+/// * **MMD's third spine.** The standard rig stops at `上半身2`; `上半身3` is the
+///   name a PMX uses when it carries one, and our skeleton has three spine
+///   bones to write. A model without it simply leaves that joint unmapped.
+///
+/// Both are looked up in the direct pass, before the fallback, so no name that
+/// the package already resolved changes meaning.
+const EXTRA: &[(&str, u8)] = &[
+    ("spine01", 1),
+    ("spine02", 2),
+    ("spine03", 3),
+    ("上半身3", 3),
+];
 
 #[cfg(test)]
 mod tests {
@@ -1896,16 +1975,20 @@ mod tests {
         assert_eq!(canonicalize("Chest2"), None);
     }
 
-    /// Unreal's spine chain is the one place our table deliberately differs from
-    /// the package: its dedupe fallback answers `Spine` for all three bones.
+    /// The two places our table deliberately differs from the package: Unreal's
+    /// spine (its dedupe fallback answers `Spine` for all three bones) and MMD's
+    /// third spine (the standard rig has no name for it).
     #[test]
-    fn the_unreal_spine_is_the_only_local_addition() {
+    fn the_local_additions_name_the_spine_bones() {
         assert_eq!(canonicalize("spine_01").map(name), Some("Spine"));
         assert_eq!(canonicalize("spine_02").map(name), Some("Spine1"));
         assert_eq!(canonicalize("spine_03").map(name), Some("Spine2"));
+        assert_eq!(canonicalize("上半身3").map(name), Some("Spine2"));
         // Without the entries the fallback would strip the index and lose the
-        // chest, which is what the package does.
+        // chest, which is what the package does; the standard MMD chain stops at
+        // 上半身2, which is Spine1.
         assert_eq!(canonicalize("neck_01").map(name), Some("Neck"));
+        assert_eq!(canonicalize("上半身2").map(name), Some("Spine1"));
         for (alias, bone) in EXTRA {
             assert!((*bone as usize) < BONE_COUNT);
             assert!(
@@ -2044,7 +2127,7 @@ mod tests {
     /// rig.
     #[test]
     fn a_written_bvh_carries_the_vendor_names() {
-        for rig in [Rig::Mixamo, Rig::Vrm, Rig::Unreal, Rig::Daz] {
+        for rig in [Rig::Mixamo, Rig::Vrm, Rig::Unreal, Rig::Daz, Rig::Mmd] {
             let mut prepared = fixture_frames(2, |frame, joint| turned(joint + frame * 3));
             rewrite(&mut prepared, rig, true).expect("rewrite");
             let path = std::env::temp_dir().join(format!(
@@ -2081,6 +2164,33 @@ mod tests {
             assert_eq!(written, joints, "{:?}: the file's bone names", rig);
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    /// The FBX side of the same chain. It used to insist the root bone was
+    /// literally called `Hips`, which would have refused every vendored
+    /// export — `pelvis`, `hip`, `J_Bip_C_Hips` and `mixamorig:Hips` are all
+    /// legitimate roots. MMD's Japanese names stay refused: the FBX writer keeps
+    /// bone names ASCII, which is why the interface sends MMD to the BVH.
+    #[test]
+    fn the_fbx_writer_takes_every_ascii_rig_but_not_mmd() {
+        let path = std::env::temp_dir().join("velomocap-retarget.fbx");
+        for rig in Rig::ALL {
+            if !rig.ascii_names() {
+                continue;
+            }
+            let mut prepared = fixture_frames(2, |frame, joint| turned(joint + frame));
+            rewrite(&mut prepared, rig, false).expect("rewrite");
+            let report = crate::flow::write_prepared_fbx(&path, &prepared)
+                .unwrap_or_else(|error| panic!("{rig:?} was refused: {error:#}"));
+            assert_eq!(report.bones, BONE_COUNT, "{rig:?}: bone count");
+        }
+        let mut mmd = fixture(identity_motion);
+        rewrite(&mut mmd, Rig::Mmd, false).expect("rewrite");
+        assert!(
+            crate::flow::write_prepared_fbx(&path, &mmd).is_err(),
+            "the FBX writer is ASCII-only, so MMD has to be refused"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The property the correction exists for: after it, a canonical-rest rig
@@ -2199,5 +2309,41 @@ mod tests {
         assert_eq!(Rig::from_slug("nope"), None);
         assert!(Rig::Biped.binds_in_t_pose());
         assert!(!Rig::Unreal.binds_in_t_pose());
+        assert!(!Rig::Mmd.binds_in_t_pose(), "a PMX bind is per model");
+    }
+
+    /// The fingers, spelled out per vendor: this is the part of the table the
+    /// package *generates*, so it is the part that was missing, and every rig has
+    /// to name all 30 finger bones distinctly and resolvably.
+    #[test]
+    fn every_rig_names_the_fingers() {
+        // Left index segment 2 and left thumb segment 1, per rig.
+        let cases: [(Rig, &str, &str); 6] = [
+            (Rig::Biped, "LeftFinger11", "LeftFinger0"),
+            (Rig::Mixamo, "LeftHandIndex2", "LeftHandThumb1"),
+            (Rig::MixamoPrefixed, "mixamorig:LeftHandIndex2", "mixamorig:LeftHandThumb1"),
+            (Rig::Vrm, "J_Bip_L_Index2", "J_Bip_L_Thumb1"),
+            (Rig::Unreal, "index_02_l", "thumb_01_l"),
+            (Rig::Daz, "lIndex2", "lThumb1"),
+        ];
+        for (rig, index, thumb) in cases {
+            assert_eq!(rig.name(11), index, "{rig:?}: left index 2");
+            assert_eq!(rig.name(22), thumb, "{rig:?}: left thumb 1");
+        }
+        // MMD numbers the thumb from 0 and the rest from 1.
+        assert_eq!(Rig::Mmd.name(11), "左人指2");
+        assert_eq!(Rig::Mmd.name(22), "左親指0");
+        assert_eq!(Rig::Mmd.name(24), "左親指2");
+        assert_eq!(Rig::Mmd.name(40), "右薬指3");
+        for rig in Rig::ALL {
+            let mut names: Vec<String> = (0..BONE_COUNT).map(|bone| rig.name(bone)).collect();
+            names.sort();
+            names.dedup();
+            assert_eq!(names.len(), BONE_COUNT, "{rig:?}: duplicate bone names");
+            let fingers = (0..BONE_COUNT)
+                .filter(|bone| finger_parts(*bone).is_some())
+                .count();
+            assert_eq!(fingers, 30, "{rig:?}: finger count");
+        }
     }
 }

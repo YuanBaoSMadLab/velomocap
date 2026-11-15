@@ -925,13 +925,15 @@ fn validate(input: &FbxInput<'_>) -> Result<()> {
     {
         return Err(Error::new("Invalid FBX frame dimensions/timing"));
     }
+    // The root is bone 0 and is the one that carries the animated translation;
+    // its *name* is whatever the rig calls it (`Hips`, `pelvis`, `センター`), so
+    // only the shape is checked here. The names themselves are validated below.
     if input.names.len() != bones
         || input.parents.len() != bones
         || input.parents[0] != -1
         || input.names.iter().collect::<std::collections::HashSet<_>>().len() != bones
-        || input.names[0] != "Hips"
     {
-        return Err(Error::new(format!("Expected {bones}-bone Hips hierarchy")));
+        return Err(Error::new(format!("Expected a {bones}-bone hierarchy")));
     }
     if input.rest.len() != bones * 3
         || input.rest_frames.len() != bones * 9
@@ -967,9 +969,15 @@ fn validate(input: &FbxInput<'_>) -> Result<()> {
             return Err(Error::new("Invalid FBX rest rotation"));
         }
     }
-    if !input.names.iter().all(|n| {
-        n.is_ascii() && !n.contains(':') && !n.contains('\u{0}') && !n.contains('\u{1}')
-    }) {
+    // An FBX string is length-prefixed, so a `:` in a bone name is harmless —
+    // Mixamo's own files write `mixamorig:LeftArm`. Non-ASCII names stay out:
+    // the FBX importers this has been checked against are less predictable about
+    // them, and the only rig that needs them (MMD) is a BVH/PMX target.
+    if !input
+        .names
+        .iter()
+        .all(|n| n.is_ascii() && !n.contains('\u{0}') && !n.contains('\u{1}'))
+    {
         return Err(Error::new("Invalid FBX bone name"));
     }
     Ok(())

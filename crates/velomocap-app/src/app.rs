@@ -779,6 +779,16 @@ impl VeloMocap {
             return;
         };
         let path = video.with_extension("fbx");
+        // MMD's standard bones are Japanese, and the FBX writer keeps bone names
+        // ASCII (its importers are not reliable about anything else). Say which
+        // export does work instead of failing inside the writer.
+        if !self.export_rig.ascii_names() {
+            self.error = Some(format!(
+                "{} names are not ASCII: the FBX writer needs ASCII bone names. Export BVH instead.",
+                self.export_rig.label()
+            ));
+            return;
+        }
         if self.export_rest_correct {
             self.log(
                 "FBX: the file carries its own bind pose, so the rest correction is applied to BVH exports only.",
