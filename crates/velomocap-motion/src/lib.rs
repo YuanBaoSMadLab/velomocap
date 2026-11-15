@@ -7,6 +7,7 @@ pub mod correction;
 pub mod export;
 pub mod fit;
 pub mod flow;
+pub mod ik;
 pub mod pipeline;
 pub mod sam;
 
