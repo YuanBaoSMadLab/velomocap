@@ -164,6 +164,11 @@ pub fn apply(
     if settings.hand {
         hand_lock(clip, body, &thresholds, &mut report);
     }
+    // Kimodo's order: end effectors (hands) first, then the contact IK that
+    // stabilises the legs on the ground.
+    if settings.foot {
+        leg_ik(clip, body, settings, &thresholds, &mut report);
+    }
 
     clip.skeletons = clip
         .poses
@@ -253,6 +258,127 @@ fn ground_feet(
         clip.poses[frame].translation[1] += delta as f32;
     }
     report.vertical_shift = moved;
+}
+
+/// Kimodo's `TargetReachFalloff`: a Gaussian that fades the IK weight out as the
+/// target approaches the limit of what the two bones can reach, so the solver
+/// never straightens a limb into a locked pose.
+fn reach_falloff(target: [f64; 3], hip: [f64; 3], max_reach: f64) -> f64 {
+    let distance = distance3(target, hip);
+    let mut t = (distance / max_reach.max(1e-6) - 0.99).max(0.0) / 0.01;
+    t *= t;
+    (-2.0 * t * t).exp()
+}
+
+/// Leg IK on the contact frames, ported from `DoContactIK`'s two-bone branch:
+/// the ankle is pinned to where the sole already is, so the root correction does
+/// not have to carry the whole load. The joint's own orientation is untouched
+/// (only the hip and the knee move), which is what keeps the foot flat.
+fn leg_ik(
+    clip: &mut FlowClip,
+    body: &BodyModel,
+    settings: &CorrectionSettings,
+    thresholds: &Thresholds,
+    report: &mut CorrectionReport,
+) {
+    let fps = clip.fps.max(1.0);
+    let count = clip.skeletons.len();
+    if count < 2 {
+        return;
+    }
+    let rest = body.rest_joints(&clip.betas);
+    let legs: [(usize, usize, usize, usize); 2] = [
+        (1, 4, 7, 10), // left hip, knee, ankle, toe
+        (2, 5, 8, 11), // right hip, knee, ankle, toe
+    ];
+    let cap = thresholds.max_correction.min(0.05) as f64;
+    for (hip, knee, ankle, toe) in legs {
+        // Bone lengths from the rest pose: the reach limit for the falloff.
+        let thigh = distance3(
+            joint3(&rest, knee),
+            joint3(&rest, hip),
+        );
+        let shin = distance3(joint3(&rest, ankle), joint3(&rest, knee));
+        let max_reach = thigh + shin;
+
+        let mut contact = vec![false; count];
+        for index in 0..count {
+            let skeleton = &clip.skeletons[index];
+            let low = joint(skeleton, ankle)[1].min(joint(skeleton, toe)[1]);
+            let speed = if index == 0 {
+                0.0
+            } else {
+                horizontal_speed(
+                    joint(&clip.skeletons[index - 1], ankle),
+                    joint(skeleton, ankle),
+                    fps,
+                )
+            };
+            contact[index] =
+                low <= settings.floor + thresholds.contact_height && speed <= thresholds.contact_speed;
+        }
+
+        for (begin, end) in contact_runs(&contact, thresholds.min_run) {
+            let mut xs = Vec::new();
+            let mut zs = Vec::new();
+            for index in begin..end {
+                let at = joint(&clip.skeletons[index], ankle);
+                xs.push(at[0]);
+                zs.push(at[2]);
+            }
+            let anchor_x = median(&xs) as f64;
+            let anchor_z = median(&zs) as f64;
+            for index in begin..end {
+                let current = joint(&clip.skeletons[index], ankle);
+                let hip_pos = joint(&clip.skeletons[index], hip);
+                // Horizontal pin only: the height is already solved.
+                let target = [anchor_x, current[1] as f64, anchor_z];
+                let weight = reach_falloff(
+                    target,
+                    [
+                        hip_pos[0] as f64,
+                        hip_pos[1] as f64,
+                        hip_pos[2] as f64,
+                    ],
+                    max_reach,
+                );
+                if weight <= 0.02 {
+                    continue;
+                }
+                let blended = [
+                    (current[0] as f64 + (target[0] - current[0] as f64) * weight) as f32,
+                    current[1],
+                    (current[2] as f64 + (target[2] - current[2] as f64) * weight) as f32,
+                ];
+                let before = joint(&clip.skeletons[index], ankle);
+                let backup = clip.poses[index].clone();
+                if solve_arm(body, &mut clip.poses[index], &rest, hip, knee, ankle, blended) {
+                    let after = body.forward_joints(&clip.poses[index]);
+                    let settled = joint(&after, ankle);
+                    let moved = distance3(
+                        [settled[0] as f64, settled[1] as f64, settled[2] as f64],
+                        [before[0] as f64, before[1] as f64, before[2] as f64],
+                    );
+                    if moved > cap {
+                        // Further than a correction should ever move an ankle:
+                        // keep the pose the network produced.
+                        clip.poses[index] = backup;
+                    } else {
+                        clip.skeletons[index] = after;
+                        report.ik_frames += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn joint3(rest: &[f32], index: usize) -> [f64; 3] {
+    [
+        rest[index * 3] as f64,
+        rest[index * 3 + 1] as f64,
+        rest[index * 3 + 2] as f64,
+    ]
 }
 
 fn joint(skeleton: &Skeleton, index: usize) -> [f32; 3] {    [
