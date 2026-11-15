@@ -313,6 +313,51 @@ fn play(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Diagnostic: what cadence does a playback run actually deliver, and are
+    /// the indices monotonic? Prints the first frames with their arrival times.
+    #[test]
+    fn playback_stream_cadence() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/media/test-clip.mp4");
+        if !path.is_file() || velomocap_video::Tools::discover().is_err() {
+            eprintln!("skipping: no sample clip or no ffmpeg");
+            return;
+        }
+        let mut stream = VideoStream::spawn();
+        let fps = 30.0;
+        let started = Instant::now();
+        stream.request(&path, 0, true, 1.0, 480, fps);
+        let mut seen: Vec<(usize, f64)> = Vec::new();
+        while started.elapsed() < Duration::from_secs(3) && seen.len() < 40 {
+            if let Some((_, frame)) = stream.poll() {
+                let at = started.elapsed().as_secs_f64();
+                if seen.last().map(|last| last.0) != Some(frame.index) {
+                    seen.push((frame.index, at));
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        for (index, at) in &seen {
+            eprintln!("frame {index:3} at {at:.3} s");
+        }
+        let gaps: Vec<f64> = seen.windows(2).map(|pair| pair[1].1 - pair[0].1).collect();
+        let mean = gaps.iter().sum::<f64>() / gaps.len().max(1) as f64;
+        eprintln!(
+            "{} frames, mean gap {:.1} ms (expected {:.1} ms), max {:.1} ms",
+            seen.len(),
+            mean * 1000.0,
+            1000.0 / fps,
+            gaps.iter().cloned().fold(0.0, f64::max) * 1000.0
+        );
+        let monotonic = seen.windows(2).all(|pair| pair[1].0 > pair[0].0);
+        assert!(monotonic, "frame indices went backwards: {seen:?}");
+    }
+}
+
 fn publish(
     shared: &Arc<Mutex<Option<(u64, u64, Arc<StreamFrame>)>>>,
     version: &Arc<AtomicU64>,

@@ -3,6 +3,7 @@
 
 pub mod bvh_people;
 pub mod cleanup;
+pub mod correction;
 pub mod export;
 pub mod fit;
 pub mod flow;

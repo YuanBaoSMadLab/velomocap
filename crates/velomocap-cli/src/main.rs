@@ -197,6 +197,21 @@ enum Command {
         /// Write every frame's joint world rotations (f32 LE, frames x 52 x 9).
         #[arg(long)]
         dump_rotations: Option<PathBuf>,
+        /// Disable foot/hand contact correction.
+        #[arg(long)]
+        no_correction: bool,
+        /// Lock preset: tight, normal or loose.
+        #[arg(long, default_value = "normal")]
+        lock_preset: String,
+        /// Correction mode: flat or multi.
+        #[arg(long, default_value = "flat")]
+        lock_mode: String,
+        /// Ground height for the contact lock, metres.
+        #[arg(long, default_value_t = 0.0)]
+        floor: f32,
+        /// Vertical shift applied to the clip, metres.
+        #[arg(long, default_value_t = 0.0)]
+        pelvis: f32,
         /// Stop after this many frames (0 = whole video).
         #[arg(long, default_value_t = 0)]
         limit: usize,
@@ -448,6 +463,11 @@ fn main() -> Result<()> {
             dump_mesh,
             dump_joints,
             dump_rotations,
+            no_correction,
+            lock_preset,
+            lock_mode,
+            floor,
+            pelvis,
             limit,
             start,
             frames,
@@ -476,6 +496,11 @@ fn main() -> Result<()> {
             dump_mesh.as_deref(),
             dump_joints.as_deref(),
             dump_rotations.as_deref(),
+            no_correction,
+            &lock_preset,
+            &lock_mode,
+            floor,
+            pelvis,
             limit,
             start,
             frames,
@@ -1059,6 +1084,11 @@ fn flow_report(
     dump_mesh: Option<&std::path::Path>,
     dump_joints: Option<&std::path::Path>,
     dump_rotations: Option<&std::path::Path>,
+    no_correction: bool,
+    lock_preset: &str,
+    lock_mode: &str,
+    floor: f32,
+    pelvis: f32,
     limit: usize,
     start: usize,
     frames: usize,
@@ -1229,7 +1259,7 @@ fn flow_report(
         dump: dump.map(|p| p.to_path_buf()),
     };
     let started = Instant::now();
-    let clip = velomocap_motion::generate_flow(track, &camera_track, &model, &config)?;
+    let mut clip = velomocap_motion::generate_flow(track, &camera_track, &model, &config)?;
     println!(
         "flowhmr: {:.1}s, {} steps, backend {}",
         started.elapsed().as_secs_f64(),
@@ -1246,6 +1276,26 @@ fn flow_report(
             first[0], first[1], first[2], last[0], last[1], last[2]
         );
     }
+
+    // Contact correction, the same pass the app runs after generating.
+    let settings = velomocap_motion::correction::CorrectionSettings {
+        enabled: !no_correction,
+        mode: match lock_mode {
+            "multi" | "multi-level" => velomocap_motion::correction::CorrectionMode::MultiLevel,
+            _ => velomocap_motion::correction::CorrectionMode::Flat,
+        },
+        foot: true,
+        hand: true,
+        preset: match lock_preset {
+            "tight" => velomocap_motion::correction::LockPreset::Tight,
+            "loose" => velomocap_motion::correction::LockPreset::Loose,
+            _ => velomocap_motion::correction::LockPreset::Normal,
+        },
+        floor,
+        pelvis_offset: pelvis,
+    };
+    let correction = velomocap_motion::correction::apply(&mut clip, &model, &settings)?;
+    println!("  {}", correction.line());
 
     if let Some(path) = dump_rotations {
         let mut bytes = Vec::new();

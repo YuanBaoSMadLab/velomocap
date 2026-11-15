@@ -137,6 +137,12 @@ pub struct FlowSettings {
     /// 0 = every frame.
     pub max_frames: usize,
     pub gpu: bool,
+    /// Foot/hand contact correction applied to the generated clip.
+    pub correction: velomocap_motion::correction::CorrectionSettings,
+    /// Estimate the camera with VGGT; `false` treats it as a fixed camera.
+    pub estimate_camera: bool,
+    /// Smooth the estimated camera track over time.
+    pub refine_camera: bool,
 }
 
 /// The first frame of a clip, plus what its container reported.
@@ -335,7 +341,13 @@ fn run_flow(
         },
         ..Default::default()
     })?;
-    let camera = vggt.estimate(&tools, video)?;
+    let mut camera = vggt.estimate(&tools, video)?;
+    if !settings.estimate_camera {
+        // Fixed camera: reuse the first frame's extrinsics for the whole clip.
+        camera.freeze();
+    } else if settings.refine_camera {
+        camera.smooth(1);
+    }
 
     report("flow body model");
     let has_posedirs = velomocap_body::npz::members(&settings.body)
@@ -378,13 +390,28 @@ fn run_flow(
             }
             false
         };
-        let clip = match velomocap_motion::generate_flow(person, &camera, &model, &config) {
+        let mut clip = match velomocap_motion::generate_flow(person, &camera, &model, &config) {
             Ok(clip) => clip,
             Err(error) => {
                 if let Ok(mut state) = shared.lock() {
                     state.flow_note = format!("FlowHMR {}: {error}", person.name);
                 }
                 continue;
+            }
+        };
+        // Contact correction runs on the generated clip, so the viewport and
+        // every export see the same corrected motion.
+        let correction = match velomocap_motion::correction::apply(
+            &mut clip,
+            &model,
+            &settings.correction,
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                if let Ok(mut state) = shared.lock() {
+                    state.flow_note = format!("Correction {}: {error}", person.name);
+                }
+                velomocap_motion::correction::CorrectionReport::default()
             }
         };
         let mut bodies = Vec::with_capacity(clip.frames());
@@ -394,7 +421,9 @@ fn run_flow(
                 Err(_) => bodies.push(Vec::new()),
             }
         }
-        let summary = velomocap_motion::summarise_flow(&clip).join("; ");
+        let mut summary = velomocap_motion::summarise_flow(&clip);
+        summary.push(correction.line());
+        let summary = summary.join("; ");
         let bvh = match velomocap_motion::prepare_bvh(&clip, &model, clip.fps as f64) {
             Ok(prepared) => prepared,
             Err(error) => {

@@ -1280,18 +1280,33 @@ fn solver_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
     group(ui, i18n::t("Solver Settings"), |ui| {
         ui.label(egui::RichText::new(i18n::t("Camera")).size(11.0).color(MUTED));
         egui::ComboBox::from_id_salt("camera-mode")
-            .selected_text(i18n::t("Static Camera"))
+            .selected_text(if app.estimate_camera {
+                i18n::t("Estimated camera (VGGT)")
+            } else {
+                i18n::t("Static Camera")
+            })
             .width(ui.available_width())
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut 0, 0, i18n::t("Static Camera"));
+                ui.selectable_value(
+                    &mut app.estimate_camera,
+                    false,
+                    i18n::t("Static Camera"),
+                );
+                ui.selectable_value(
+                    &mut app.estimate_camera,
+                    true,
+                    i18n::t("Estimated camera (VGGT)"),
+                );
             });
         ui.add_space(3.0);
-        let mut refine = false;
         ui.add_enabled(
-            false,
-            egui::Checkbox::new(&mut refine, egui::RichText::new(i18n::t("Refine Camera Rotation")).size(11.0)),
+            app.estimate_camera,
+            egui::Checkbox::new(
+                &mut app.refine_camera,
+                egui::RichText::new(i18n::t("Refine Camera Rotation")).size(11.0),
+            ),
         )
-        .on_disabled_hover_text(i18n::t("Camera refinement is not part of this build"));
+        .on_disabled_hover_text(i18n::t("Only used when the camera is estimated"));
         ui.checkbox(
             &mut app.layers.bones,
             egui::RichText::new(i18n::t("Bone overlay")).size(11.0),
@@ -1310,60 +1325,103 @@ fn solver_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
 }
 
 fn correction_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
+    use velomocap_motion::correction::{CorrectionMode, LockPreset};
     group(ui, i18n::t("Motion Correction"), |ui| {
-        let mut enabled = false;
-        ui.add_enabled(
-            false,
-            egui::Checkbox::new(&mut enabled, egui::RichText::new(i18n::t("Enable Correction")).size(11.0)),
+        ui.checkbox(
+            &mut app.correction.enabled,
+            egui::RichText::new(i18n::t("Enable Correction")).size(11.0),
         )
-        .on_disabled_hover_text(i18n::t("Automatic contact correction is not part of this build"));
-        ui.add_enabled_ui(false, |ui| {
+        .on_hover_text(i18n::t(
+            "Pin planted feet and resting hands after the motion is generated",
+        ));
+        ui.add_enabled_ui(app.correction.enabled, |ui| {
             ui.label(egui::RichText::new(i18n::t("Correction Mode")).size(11.0).color(MUTED));
             egui::ComboBox::from_id_salt("correction-mode")
-                .selected_text(i18n::t("Flat Ground"))
+                .selected_text(match app.correction.mode {
+                    CorrectionMode::Flat => i18n::t("Flat Ground"),
+                    CorrectionMode::MultiLevel => i18n::t("Multi-level"),
+                })
                 .width(ui.available_width())
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut 0, 0, i18n::t("Flat Ground"));
+                    ui.selectable_value(
+                        &mut app.correction.mode,
+                        CorrectionMode::Flat,
+                        i18n::t("Flat Ground"),
+                    );
+                    ui.selectable_value(
+                        &mut app.correction.mode,
+                        CorrectionMode::MultiLevel,
+                        i18n::t("Multi-level"),
+                    );
                 });
-            let mut foot = true;
-            let mut hand = false;
             ui.horizontal(|ui| {
-                ui.checkbox(&mut foot, egui::RichText::new(i18n::t("Foot")).size(11.0));
-                ui.checkbox(&mut hand, egui::RichText::new(i18n::t("Hand")).size(11.0));
+                ui.checkbox(
+                    &mut app.correction.foot,
+                    egui::RichText::new(i18n::t("Foot")).size(11.0),
+                );
+                ui.checkbox(
+                    &mut app.correction.hand,
+                    egui::RichText::new(i18n::t("Hand")).size(11.0),
+                );
             });
             ui.label(egui::RichText::new(i18n::t("Lock Preset")).size(11.0).color(MUTED));
             egui::ComboBox::from_id_salt("lock-preset")
-                .selected_text(i18n::t("Normal"))
+                .selected_text(match app.correction.preset {
+                    LockPreset::Tight => i18n::t("Tight"),
+                    LockPreset::Normal => i18n::t("Normal"),
+                    LockPreset::Loose => i18n::t("Loose"),
+                })
                 .width(ui.available_width())
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut 0, 0, i18n::t("Normal"));
+                    ui.selectable_value(
+                        &mut app.correction.preset,
+                        LockPreset::Tight,
+                        i18n::t("Tight"),
+                    );
+                    ui.selectable_value(
+                        &mut app.correction.preset,
+                        LockPreset::Normal,
+                        i18n::t("Normal"),
+                    );
+                    ui.selectable_value(
+                        &mut app.correction.preset,
+                        LockPreset::Loose,
+                        i18n::t("Loose"),
+                    );
                 });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(i18n::t("Floor Height")).size(11.0));
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut app.correction.floor)
+                            .speed(0.005)
+                            .range(-2.0..=2.0)
+                            .suffix(" m"),
+                    )
+                    .changed()
+                {
+                    // The grid follows the correction floor so both agree.
+                    app.floor = app.correction.floor;
+                }
+                if ui
+                    .add(egui::Button::new(i18n::t("Reset")).min_size(egui::vec2(44.0, 16.0)))
+                    .clicked()
+                {
+                    app.correction.floor = 0.0;
+                    app.floor = 0.0;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(i18n::t("Pelvis Offset")).size(11.0));
+                ui.add(
+                    egui::DragValue::new(&mut app.correction.pelvis_offset)
+                        .speed(0.005)
+                        .range(-1.0..=1.0)
+                        .suffix(" m"),
+                );
+            });
         });
-        ui.add_space(4.0);
-        // Floor height is live: it moves the ground plane the viewport draws and
-        // the bodies sit on, so it is one setting that visibly does something.
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(i18n::t("Floor Height")).size(11.0));
-            ui.add(
-                egui::DragValue::new(&mut app.floor)
-                    .speed(0.005)
-                    .range(-2.0..=2.0)
-                    .suffix(" m"),
-            );
-            if ui
-                .add(egui::Button::new(i18n::t("Reset")).min_size(egui::vec2(44.0, 16.0)))
-                .on_hover_text(i18n::t("Put the ground back where the clip put it"))
-                .clicked()
-            {
-                app.floor = 0.0;
-            }
-        });
-        ui.add_space(2.0);
-        ui.label(
-            egui::RichText::new(i18n::t("Foot/hand contact correction is not in this build."))
-                .size(10.0)
-                .color(MUTED),
-        );
     });
 }
 

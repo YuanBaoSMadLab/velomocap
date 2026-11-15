@@ -95,6 +95,68 @@ impl CameraTrack {
     /// This is what the motion generator conditions on: world-to-camera
     /// rotations normalised against frame zero, so the choice of world axes
     /// does not matter.
+    /// Use one camera for every frame: a tripod shot instead of per-frame noise.
+    pub fn freeze(&mut self) {
+        let Some(first) = self.extrinsics.first().copied() else {
+            return;
+        };
+        for matrix in &mut self.extrinsics {
+            *matrix = first;
+        }
+    }
+
+    /// Average each rotation over `2 * radius + 1` frames and re-orthonormalise.
+    /// This is the "refine camera rotation" switch: it removes the jitter from
+    /// the estimated track without moving the camera.
+    pub fn smooth(&mut self, radius: usize) {
+        if self.extrinsics.len() < 3 || radius == 0 {
+            return;
+        }
+        let source = self.extrinsics.clone();
+        let count = source.len();
+        for index in 0..count {
+            let begin = index.saturating_sub(radius);
+            let end = (index + radius + 1).min(count);
+            let span = (end - begin) as f32;
+            let mut acc = [[0.0f32; 3]; 3];
+            let mut position = [0.0f32; 3];
+            for matrix in &source[begin..end] {
+                for row in 0..3 {
+                    for column in 0..3 {
+                        acc[row][column] += matrix[row][column] / span;
+                    }
+                    position[row] += matrix[row][3] / span;
+                }
+            }
+            let mut x = [acc[0][0], acc[1][0], acc[2][0]];
+            let norm = (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt().max(1e-6);
+            for value in &mut x {
+                *value /= norm;
+            }
+            let mut y = [acc[0][1], acc[1][1], acc[2][1]];
+            let dot = x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+            for k in 0..3 {
+                y[k] -= x[k] * dot;
+            }
+            let norm = (y[0] * y[0] + y[1] * y[1] + y[2] * y[2]).sqrt().max(1e-6);
+            for value in &mut y {
+                *value /= norm;
+            }
+            let z = [
+                x[1] * y[2] - x[2] * y[1],
+                x[2] * y[0] - x[0] * y[2],
+                x[0] * y[1] - x[1] * y[0],
+            ];
+            let target = &mut self.extrinsics[index];
+            for row in 0..3 {
+                target[row][0] = x[row];
+                target[row][1] = y[row];
+                target[row][2] = z[row];
+                target[row][3] = position[row];
+            }
+        }
+    }
+
     pub fn relative_rotation_rows(&self) -> Vec<f32> {
         let first = match self.extrinsics.first() {
             Some(m) => rotation(m),

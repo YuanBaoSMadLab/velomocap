@@ -139,6 +139,12 @@ pub struct VeloMocap {
     pub smplh_model: PathBuf,
     pub camera_weights: PathBuf,
     pub use_flow: bool,
+    /// Foot/hand contact correction, from the sidebar.
+    pub correction: velomocap_motion::correction::CorrectionSettings,
+    /// Sidebar: estimate the camera (VGGT) instead of assuming a fixed one.
+    pub estimate_camera: bool,
+    /// Sidebar: smooth the estimated camera rotation.
+    pub refine_camera: bool,
         pub export_on_finish: bool,
         pub export_fbx_on_finish: bool,
     pub exported: bool,
@@ -246,6 +252,9 @@ impl VeloMocap {
             smplh_model,
             camera_weights,
             use_flow: true,
+            correction: velomocap_motion::correction::CorrectionSettings::default(),
+            estimate_camera: true,
+            refine_camera: true,
             export_on_finish: export,
             export_fbx_on_finish: export_fbx,
             exported: false,
@@ -632,6 +641,9 @@ impl VeloMocap {
                 camera_weights: self.camera_weights.clone(),
                 max_frames: self.max_frames,
                 gpu: self.gpu,
+                correction: self.correction,
+                estimate_camera: self.estimate_camera,
+                refine_camera: self.refine_camera,
             }),
         }));
     }
