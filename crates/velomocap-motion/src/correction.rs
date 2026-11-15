@@ -1504,7 +1504,7 @@ fn hand_lock(
     ];
     let rest = body.rest_joints(&clip.betas);
 
-    for (shoulder, elbow, wrist, hip) in hands {
+            for (hand_index, (shoulder, elbow, wrist, hip)) in hands.into_iter().enumerate() {
         let mut contact = vec![false; count];
         for index in 0..count {
             let skeleton = &clip.skeletons[index];
@@ -1534,22 +1534,49 @@ fn hand_lock(
                 median(&points[1]),
                 median(&points[2]),
             ];
-            report.hand_contacts += 1;
+            let ramp = 4usize;
+            let first = begin.saturating_sub(ramp);
+            let last = (end + ramp).min(count);
             // Fade the pin in and out over a few frames on either side. A run
             // that starts and stops at full strength between two frames is a
             // step in the arm's motion, which reads as a twitch. Kimodo carries
             // the correction into the swing frames for the same reason.
-            let ramp = 4usize;
-            let first = begin.saturating_sub(ramp);
-            let last = (end + ramp).min(count);
+            // The reference fades the arm correction with
+            // 1/(1+(reach_gap/.03)^4), smoothed over the stance with the 0.08 s
+            // kernel: an unreachable target is not forced, the correction softens.
+            let raw_gains: Vec<f32> = (begin..end)
+                .map(|index| {
+                    let (world, positions) =
+                        crate::anatomical::forward(body, &clip.poses[index], &rest);
+                    let sampled = positions[wrist];
+                    let gap = crate::anatomical::source_reach_gap(
+                        &rest,
+                        &world,
+                        &positions,
+                        hand_index,
+                        [target[0] as f64, target[1] as f64, target[2] as f64],
+                        sampled,
+                        15.0,
+                        60.0,
+                    );
+                    (1.0 / (1.0 + (gap / 0.03).powi(4))) as f32
+                })
+                .collect();
+            let gains = smooth_weights(&raw_gains, fps);
             for index in first..last {
-                let weight = if index < begin {
+                let ramp_weight = if index < begin {
                     (index + ramp + 1 - begin) as f64 / (ramp + 1) as f64
                 } else if index >= end {
                     (last - index) as f64 / (ramp + 1) as f64
                 } else {
                     1.0
                 };
+                let gain = if index >= begin && index < end {
+                    gains[index - begin] as f64
+                } else {
+                    1.0
+                };
+                let weight = ramp_weight * gain;
                 let source = clip.poses[index].clone();
                 let hint = bend_hint(&clip.skeletons[index], shoulder, elbow, wrist);
                 if solve_arm(body, &mut clip.poses[index], &rest, shoulder, elbow, wrist, target, hint) {
