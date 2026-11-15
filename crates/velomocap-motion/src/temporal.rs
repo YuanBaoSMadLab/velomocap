@@ -50,6 +50,71 @@ fn normal_operator(values: &[f64], out: &mut [f64], lambda: f64, work: &mut [f64
     }
 }
 
+/// The pose plan's weighted smoothing: minimise
+/// pose_w |x - ref|^2 + vel_w |V x|^2 + acc_w |A x|^2, the shape
+/// contact_pose_plan gives its least-squares root and swing targets (its
+/// pose_sigma / velocity_sigma / acceleration_sigma). Solved with the same
+/// conjugate-gradient loop as the plain smoother.
+pub fn plan_series(reference: &[f64], pose_w: f64, vel_w: f64, acc_w: f64) -> Vec<f64> {
+    let n = reference.len();
+    if n < 3 {
+        return reference.to_vec();
+    }
+    let mut x = vec![0.0f64; n];
+    let mut residual: Vec<f64> = reference.iter().map(|value| value * pose_w).collect();
+    let mut direction = residual.clone();
+    let mut applied = vec![0.0f64; n];
+    let mut work = vec![0.0f64; n];
+    let mut rr: f64 = residual.iter().map(|value| value * value).sum();
+    let target = rr * 1e-20;
+    for _ in 0..n.max(16) {
+        if rr <= target {
+            break;
+        }
+        // out = pose_w x + vel_w V^T V x + acc_w A^T A x
+        for value in applied.iter_mut() {
+            *value = 0.0;
+        }
+        for index in 0..n {
+            applied[index] += pose_w * direction[index];
+        }
+        if n > 1 {
+            for index in 0..n - 1 {
+                work[index] = direction[index + 1] - direction[index];
+            }
+            for index in 0..n - 1 {
+                let value = vel_w * work[index];
+                applied[index] -= value;
+                applied[index + 1] += value;
+            }
+        }
+        for index in 1..n - 1 {
+            work[index] = direction[index + 1] - 2.0 * direction[index] + direction[index - 1];
+        }
+        for index in 1..n - 1 {
+            let value = acc_w * work[index];
+            applied[index - 1] += value;
+            applied[index] -= 2.0 * value;
+            applied[index + 1] += value;
+        }
+        let pap: f64 = direction.iter().zip(&applied).map(|(a, b)| a * b).sum();
+        if pap.abs() < 1e-20 {
+            break;
+        }
+        let alpha = rr / pap;
+        for index in 0..n {
+            x[index] += alpha * direction[index];
+            residual[index] -= alpha * applied[index];
+        }
+        let next: f64 = residual.iter().map(|value| value * value).sum();
+        let beta = next / rr;
+        for index in 0..n {
+            direction[index] = residual[index] + beta * direction[index];
+        }
+        rr = next;
+    }
+    x
+}
 /// Solve `(lambda I + A^T A) x = lambda * reference`.
 fn smooth_series(reference: &[f64], lambda: f64) -> Vec<f64> {
     let n = reference.len();
@@ -229,6 +294,21 @@ fn matrix_of(pose: &Pose, joint: usize) -> [f64; 9] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_series_smooths_and_keeps_a_ramp() {
+        let mut spike: Vec<f64> = (0..24).map(|i| i as f64 * 0.01).collect();
+        spike[12] += 0.1;
+        let planned = plan_series(&spike, 1.0, 10.0, 40.0);
+        let before = (spike[12] - 0.5 * (spike[11] + spike[13])).abs();
+        let after = (planned[12] - 0.5 * (planned[11] + planned[13])).abs();
+        assert!(after < before * 0.5, "spike {before:.4} -> {after:.4}");
+        let ramp: Vec<f64> = (0..24).map(|i| i as f64 * 0.02).collect();
+        let kept = plan_series(&ramp, 1.0, 0.1, 0.1);
+        for (original, result) in ramp.iter().zip(&kept) {
+            assert!((original - result).abs() < 0.01, "{original:.4} -> {result:.4}");
+        }
+    }
 
     #[test]
     fn smoothing_removes_a_single_frame_spike() {
