@@ -279,14 +279,17 @@ fn run(
         move |frame: usize, total: usize, stage: &str| {
             let mut state = shared.lock().unwrap();
             state.progress.stage = match stage {
-                "loading mesh" | "loading detector" | "loading SAM 3D Body" | "opening video" => {
-                    CaptureStage::Loading
-                }
+                "loading mesh" | "loading detector" | "loading SAM 3D Body" | "opening video"
+                | "flow body model" | "flow camera" => CaptureStage::Loading,
                 "detecting" => CaptureStage::Detecting,
                 "reconstructing" => CaptureStage::Reconstructing,
+                "camera" => CaptureStage::Camera,
+                "flow" => CaptureStage::Motion,
+                "skin" => CaptureStage::Skin,
                 "done" => CaptureStage::Done,
                 _ => state.progress.stage,
             };
+            state.progress.stage_index = stage_index(stage);
             state.progress.frame = frame;
             state.progress.total = total;
             state.progress.message = stage.to_string();
@@ -325,6 +328,10 @@ fn run(
         cancelled: &cancelled,
     };
     let capture = velomocap_motion::capture_people_with(&video, &settings.config, &mut hooks)?;
+    // The detector and SAM module are gone at this point, but both allocators
+    // keep their blocks: without handing them back, the flow stage cannot fit
+    // and its weights end up paged into host memory.
+    release_vram(&shared, "after SAM");
 
     // FlowHMR: the coherent SMPL-H motion behind the preview and the exports.
     // A failure here must not lose the reconstruction, so it is reported and the
@@ -335,6 +342,7 @@ fn run(
             state.progress.message = format!("FlowHMR: {error:#}");
             state.flow_note = format!("FlowHMR failed: {error}");
         }
+        release_vram(&shared, "after motion");
     }
     let summary = capture.summary();
     let line = capture.timings.line();
@@ -357,9 +365,30 @@ fn run(
     state.timings = line;
     state.backend = backend;
     state.progress.stage = CaptureStage::Done;
+    state.progress.stage_index = STAGE_COUNT - 1;
+    state.progress.frame = 0;
+    state.progress.total = 0;
     state.progress.elapsed = started.elapsed().as_secs_f64();
     state.finished = true;
     Ok(())
+}
+
+/// Return freed device memory to the driver between stages.
+///
+/// Both allocators in play keep their own pools: PyTorch's caching allocator
+/// holds released blocks (`nvidia-smi` does not move when a module is dropped)
+/// and ONNX Runtime keeps a per-session arena. The next stage's weights then
+/// cannot fit, Windows pages them into host memory, and every kernel crawls.
+/// Dropping the models is not enough — the cache has to be trimmed explicitly.
+fn release_vram(shared: &Arc<Mutex<CaptureShared>>, stage: &str) {
+    velomocap_motion::vram::empty_cuda_cache();
+    let Some(line) = velomocap_motion::vram::cuda_memory_line() else {
+        return;
+    };
+    eprintln!("[vram] {stage}: {line}");
+    if let Ok(mut state) = shared.lock() {
+        state.vram = format!("{line} · {stage}");
+    }
 }
 
 /// Generate one FlowHMR clip per person and skin it for the viewport.
@@ -377,24 +406,30 @@ fn run_flow(
         }
     };
 
-    report("flow camera");
+    report_stage(shared, 0, 0, 0, "flow camera");
     let tools = velomocap_video::Tools::discover()?;
-    let mut vggt = VggtCamera::load(VggtConfig {
-        weights: settings.camera_weights.clone(),
-        session: SessionConfig {
-            gpu: settings.gpu,
+    // The camera model is scoped so its ~4.4 GB leaves the device before
+    // FlowHMR loads. Keeping both resident is what pushed the motion stage's
+    // weights into host memory and slowed the run down by an order of magnitude.
+    let camera = {
+        let mut vggt = VggtCamera::load(VggtConfig {
+            weights: settings.camera_weights.clone(),
+            session: SessionConfig {
+                gpu: settings.gpu,
+                ..Default::default()
+            },
             ..Default::default()
-        },
-        ..Default::default()
-    })?;
-    let mut camera = vggt.estimate(&tools, video)?;
-    if !settings.estimate_camera {
-        // Fixed camera: reuse the first frame's extrinsics for the whole clip.
-        camera.freeze();
-    } else if settings.refine_camera {
-        camera.smooth(1);
-    }
-
+        })?;
+        let mut camera = vggt.estimate(&tools, video)?;
+        if !settings.estimate_camera {
+            // Fixed camera: reuse the first frame's extrinsics for the whole clip.
+            camera.freeze();
+        } else if settings.refine_camera {
+            camera.smooth(1);
+        }
+        camera
+    };
+    release_vram(shared, "after camera");
     report("flow body model");
     let has_posedirs = velomocap_body::npz::members(&settings.body)
         .map(|names| names.iter().any(|name| name == "posedirs" || name.starts_with("posedirs.")))
@@ -427,7 +462,7 @@ fn run_flow(
 
     let mut clips = Vec::new();
     for (slot, person) in people.iter().enumerate() {
-        report(&format!("flow {}/{}", slot + 1, people.len()));
+        report_stage(shared, 3, slot, people.len(), "flow");
         let sentinel = || {
             if let Ok(state) = shared.lock() {
                 if state.progress.stage == CaptureStage::Failed {
@@ -461,10 +496,16 @@ fn run_flow(
             }
         };
         let mut bodies = Vec::with_capacity(clip.frames());
-        for pose in &clip.poses {
+        let poses = clip.poses.len().max(1);
+        for (pose_index, pose) in clip.poses.iter().enumerate() {
             match model.forward_mesh(pose) {
                 Ok((_, vertices)) => bodies.push(vertices),
                 Err(_) => bodies.push(Vec::new()),
+            }
+            // Skinning 90 frames of a 14k-triangle body is not instant; let the
+            // bar move instead of sitting at "generating motion".
+            if pose_index % 8 == 0 {
+                report_stage(shared, 4, pose_index, poses, "skin");
             }
         }
         let mut summary = velomocap_motion::summarise_flow(&clip);
@@ -509,6 +550,33 @@ fn run_flow(
     Ok(())
 }
 
+/// Report progress for a stage the flow pass owns.
+///
+/// The flow pass runs outside the SAM loop, so it sets its own stage and
+/// counters; without this the bar stayed at the SAM frame count for the whole
+/// (much longer) motion stage.
+fn report_stage(
+    shared: &Arc<Mutex<CaptureShared>>,
+    index: usize,
+    done: usize,
+    total: usize,
+    message: &str,
+) {
+    if let Ok(mut state) = shared.lock() {
+        state.progress.stage_index = index;
+        state.progress.stage = match message {
+            "flow camera" | "flow body model" => CaptureStage::Loading,
+            "camera" => CaptureStage::Camera,
+            "flow" => CaptureStage::Motion,
+            "skin" => CaptureStage::Skin,
+            _ => state.progress.stage,
+        };
+        state.progress.frame = done;
+        state.progress.total = total;
+        state.progress.message = message.to_string();
+    }
+}
+
 /// A decoded frame at preview resolution, for the Movie Clip panel.
 pub fn preview_from_frame(frame: &velomocap_video::Frame, target: usize) -> PreviewFrame {
     downscale(frame.index, &frame.rgb, frame.width, frame.height, target)
@@ -546,6 +614,46 @@ fn downscale(index: usize, rgb: &[u8], width: usize, height: usize, target: usiz
 }
 
 #[cfg(test)]
+    /// Every stage the bar can show has a name, and the flow pass maps onto the
+    /// same indices as the SAM pass — otherwise the bar jumps backwards.
+    #[test]
+    fn every_stage_has_a_name_and_a_stable_index() {
+        let names: Vec<&str> = (0..STAGE_COUNT).map(stage_name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "loading models",
+                "reconstructing people",
+                "estimating camera",
+                "generating motion",
+                "skinning",
+                "done",
+            ]
+        );
+        assert_eq!(stage_index("loading detector"), 0);
+        assert_eq!(stage_index("detecting"), 1);
+        assert_eq!(stage_index("camera"), 2);
+        assert_eq!(stage_index("flow"), 3);
+        assert_eq!(stage_index("skin"), 4);
+        assert_eq!(stage_index("done"), 5);
+        assert_eq!(stage_index("something else"), 5);
+    }
+
+    /// The VRAM readout must answer instead of crashing, and trimming the cache
+    /// must be safe on a CPU build. With LibTorch linked this prints the real
+    /// device numbers.
+    #[test]
+    fn vram_helpers_answer() {
+        match velomocap_motion::vram::cuda_memory() {
+            Some((used, total)) => {
+                assert!(total > 0, "total device memory must be positive");
+                assert!(used <= total, "used {used} exceeds total {total}");
+                eprintln!("vram: {used} / {total} bytes in use");
+            }
+            None => eprintln!("vram: no device visible from this build"),
+        }
+        velomocap_motion::vram::empty_cuda_cache();
+    }
 mod tests {
     use super::*;
 

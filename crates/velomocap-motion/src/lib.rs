@@ -32,3 +32,9 @@ pub use sam::{
     capture_people, capture_people_with, PeopleCapture, PersonFrame, PersonTrack, SamConfig,
     SamHooks,
 };
+
+/// Device-memory housekeeping, re-exported so callers do not have to depend on
+/// the C++ crate just to trim the CUDA cache between stages.
+pub mod vram {
+    pub use velomocap_cpp::sam3d::{cuda_memory, cuda_memory_line, empty_cuda_cache};
+}

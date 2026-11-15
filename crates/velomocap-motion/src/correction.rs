@@ -111,7 +111,7 @@ impl Default for CorrectionSettings {
             floor: 0.0,
             pelvis_offset: 0.0,
             leg_ik: true,
-            mesh_sole: false,
+            mesh_sole: true,
             smoothing: 0.0,
         }
     }

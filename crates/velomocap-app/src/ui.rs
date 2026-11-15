@@ -1012,16 +1012,28 @@ fn transport(app: &mut VeloMocap, ui: &mut egui::Ui) {
     if running {
         ui.add_space(8.0);
         let (frame, total, stage) = app.progress.clone();
-        let fraction = if total > 0 {
-            (frame as f32 / total as f32).clamp(0.0, 1.0)
+        // Two bars side by side: the whole run (which stage of six) and the work
+        // inside the current stage. The old single bar kept showing the SAM frame
+        // count, so the long camera and motion stages looked hung at 100 %.
+        let overall = (app.progress_stage as f32 + stage_fraction(frame, total))
+            / crate::capture::STAGE_COUNT as f32;
+        ui.add(
+            egui::ProgressBar::new(overall.clamp(0.0, 1.0))
+                .desired_width(200.0)
+                .text(stage),
+        )
+        .on_hover_text(i18n::t("Overall progress"));
+        let detail = if total > 0 {
+            format!("{frame}/{total}  {:.0}%", 100.0 * frame as f32 / total as f32)
         } else {
-            0.0
+            i18n::t("working…").to_string()
         };
         ui.add(
-            egui::ProgressBar::new(fraction)
-                .desired_width(180.0)
-                .text(format!("{stage} {frame}/{total}")),
-        );
+            egui::ProgressBar::new(stage_fraction(frame, total))
+                .desired_width(130.0)
+                .text(detail),
+        )
+        .on_hover_text(crate::capture::stage_name(app.progress_stage));
         if ui
             .add(
                 egui::Button::new(egui::RichText::new(i18n::t("Stop")).size(11.0))
@@ -1031,6 +1043,15 @@ fn transport(app: &mut VeloMocap, ui: &mut egui::Ui) {
         {
             app.cancel_capture();
         }
+    }
+}
+
+/// Fraction of a stage's own work that is done; `0` while it is unknown.
+fn stage_fraction(frame: usize, total: usize) -> f32 {
+    if total > 0 {
+        (frame as f32 / total as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
     }
 }
 
@@ -1555,6 +1576,18 @@ fn status_bar(app: &mut VeloMocap, ctx: &egui::Context) {
                     if busy {
                         let dot = egui::RichText::new("● working").size(10.5).color(ACCENT);
                         ui.label(dot);
+                    }
+                    // Device memory after the last stage: the number that shows
+                    // whether the previous model really left the GPU.
+                    if !app.vram.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("VRAM {}", app.vram))
+                                .size(10.5)
+                                .color(MUTED),
+                        )
+                        .on_hover_text(i18n::t(
+                            "Device memory after the last stage finished",
+                        ));
                     }
                 });
             });

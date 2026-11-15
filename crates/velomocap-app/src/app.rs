@@ -169,6 +169,10 @@ pub struct VeloMocap {
         pub max_frames: usize,
     pub capture: Option<CaptureJob>,
     pub progress: (usize, usize, String),
+    /// Index of the stage the run is in, for [\`capture::stage_name\`].
+    pub progress_stage: usize,
+    /// Device memory between stages, e.g. \`1.2 / 24.0 GB · after SAM\`.
+    pub vram: String,
         pub preview: Option<egui::TextureHandle>,
     pub preview_frame: usize,
     pub video_size: (usize, usize),
@@ -287,6 +291,8 @@ impl VeloMocap {
             max_frames,
             capture: None,
             progress: (0, 0, String::new()),
+            progress_stage: 0,
+            vram: String::new(),
             preview: None,
             preview_frame: 0,
             video_size: (0, 0),
@@ -464,7 +470,7 @@ impl VeloMocap {
             Err(error) => eprintln!("detect-only failed: {error}"),
         }
     }
-        pub fn poll_detection(&mut self) {
+        pub fn poll_detection(&mut self, ctx: &egui::Context) {
         let Some(receiver) = &self.detect_rx else {
             return;
         };
@@ -476,18 +482,40 @@ impl VeloMocap {
                 self.detect_rx = None;
                 self.status = i18n::candidate_line(count);
                 self.log(format!("Detected {count} people — pick who to reconstruct"));
+                if let Some(line) = self.release_vram("after detection") {
+                    self.log(format!("VRAM {line}"));
+                }
             }
             Ok(Err(error)) => {
                 self.detecting = false;
                 self.detect_rx = None;
                 self.error = Some(format!("detection failed: {error}"));
+                if let Some(line) = self.release_vram("after detection") {
+                    self.log(format!("VRAM {line}"));
+                }
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Detection loads the detector and runs it once; without asking
+                // for a repaint the window looks frozen until it lands.
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.detecting = false;
                 self.detect_rx = None;
             }
         }
+    }
+    /// Trim the CUDA cache between stages and report what the device shows.
+    ///
+    /// The detector, the camera and the motion model all leave their blocks in
+    /// the allocators' pools when they are dropped, so a 16 GB card runs out even
+    /// though nothing is "using" the memory any more. Returns the
+    /// `used / total · stage` line so callers can log it.
+    pub fn release_vram(&mut self, stage: &str) -> Option<String> {
+        velomocap_motion::vram::empty_cuda_cache();
+        let line = velomocap_motion::vram::cuda_memory_line()?;
+        self.vram = format!("{line} · {stage}");
+        Some(self.vram.clone())
     }
     pub fn load_video_keep_scene(&mut self, path: PathBuf) {
         let people = std::mem::take(&mut self.people);
@@ -798,6 +826,8 @@ impl VeloMocap {
         let fps: f64;
         let video_size: (usize, usize);
         let stage: CaptureStage;
+        let stage_index: usize;
+        let vram: String;
         let frame: usize;
         let total: usize;
         let people_count: usize;
@@ -818,6 +848,8 @@ impl VeloMocap {
             fps = state.fps;
             video_size = state.video_size;
             stage = state.progress.stage;
+            stage_index = state.progress.stage_index;
+            vram = state.vram.clone();
             frame = state.progress.frame;
             total = state.progress.total;
             people_count = state.progress.people;
@@ -972,7 +1004,20 @@ impl VeloMocap {
                 })
                 .unwrap_or(0.0);
             let _ = elapsed;
-            self.progress = (frame, total, i18n::t(stage.label()).to_string());
+            self.progress_stage = stage_index;
+            self.vram = vram;
+            let stage_label = capture::stage_name(stage_index);
+            self.progress = (
+                frame,
+                total,
+                i18n::zh_en(
+                    &format!("{}/{} {}", stage_index + 1, capture::STAGE_COUNT, i18n::t(stage_label)),
+                    &format!(
+                        "{}/{} {}", stage_index + 1, capture::STAGE_COUNT,
+                        stage_label
+                    ),
+                ),
+            );
             self.status = i18n::run_status(
                 i18n::t(stage.label()),
                 people_count,
@@ -990,7 +1035,10 @@ impl VeloMocap {
             }
         }
         if running {
-            ctx.request_repaint_after(Duration::from_millis(120));
+            // A run is heavy but it is not on this thread: repaint at the normal
+            // rate so the bars move and the window stays usable. It used to ask
+            // for a frame every 120 ms, which made the whole UI feel blocked.
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
         fn sync_people(&mut self, snapshot: &[velomocap_motion::PersonTrack]) {
@@ -1361,7 +1409,7 @@ struct CliArgs {
 impl eframe::App for VeloMocap {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
-        self.poll_detection();
+        self.poll_detection(ctx);
         self.poll_capture(ctx);
         self.poll_stream(ctx);
         self.shortcuts(ctx);

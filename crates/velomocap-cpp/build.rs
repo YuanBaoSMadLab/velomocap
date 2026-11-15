@@ -44,6 +44,38 @@ fn is_libtorch(path: &Path) -> bool {
         && path.join("lib/torch.lib").is_file()
 }
 
+/// The CUDA toolkit's `include` directory, newest installed version first.
+///
+/// `$CUDA_PATH` wins when it is set (that is what the installer exports); the
+/// toolkit's own directory is scanned otherwise. The torch wheel does not ship
+/// `cuda_runtime.h`, so this is the only place it can come from.
+fn find_cuda_include() -> Option<PathBuf> {
+    if let Ok(root) = std::env::var("CUDA_PATH") {
+        let include = PathBuf::from(root).join("include");
+        if include.join("cuda_runtime.h").is_file() {
+            return Some(include);
+        }
+    }
+    let root = Path::new("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA");
+    let version_key = |path: &Path| -> (u32, u32) {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let digits: String = name.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+        let mut parts = digits.split('.').filter_map(|part| part.parse::<u32>().ok());
+        (parts.next().unwrap_or(0), parts.next().unwrap_or(0))
+    };
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.join("include/cuda_runtime.h").is_file())
+        .collect();
+    candidates.sort_by_key(|path| version_key(path));
+    candidates.pop().map(|path| path.join("include"))
+}
+
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let root = manifest.join("../..");
@@ -97,12 +129,31 @@ fn main() {
             // They exist in the CUDA wheel and are absent from the CPU one.
             if lib.join("torch_cuda.lib").is_file() {
                 println!("cargo:rustc-link-lib=torch_cuda");
-                // The C++ CUDA helpers need the allocator and runtime headers.
-                build.define("VM_TORCH_CUDA", "1");
                 if lib.join("c10_cuda.lib").is_file() {
                     println!("cargo:rustc-link-lib=c10_cuda");
                 }
                 println!("cargo:rustc-cfg=torch_cuda");
+                // The CUDA housekeeping helpers (`empty_cuda_cache`,
+                // `cuda_mem_info`) need `c10/cuda/*` and `cuda_runtime.h`. The
+                // torch wheel ships the first but not the second, so the toolkit
+                // include directory has to be found — and `cudaMemGetInfo` needs
+                // its import library too. Without a toolkit the helpers compile
+                // to no-ops, which is the old behaviour.
+                if let Some(include) = find_cuda_include() {
+                    build.define("VM_TORCH_CUDA", "1");
+                    build.include(&include);
+                    if let Some(lib64) = include.parent().map(|root| root.join("lib").join("x64")) {
+                        if lib64.join("cudart.lib").is_file() {
+                            println!("cargo:rustc-link-search=native={}", lib64.display());
+                            println!("cargo:rustc-link-lib=cudart");
+                        }
+                    }
+                } else {
+                    println!(
+                        "cargo:warning=CUDA toolkit headers not found; \
+                         the VRAM housekeeping helpers are no-ops"
+                    );
+                }
             }
             build
                 .file(cpp.join("src/torch_sam3d.cpp"))
