@@ -1021,11 +1021,17 @@ impl VeloMocap {
     /// overwrite each other (they all used to be `<clip>.bvh`).
     pub fn export_path(&self, ext: &str, index: usize) -> Option<PathBuf> {
         let video = self.video.as_ref()?;
-        let name = self.export_name.trim();
+        let mut name = self.export_name.trim().to_string();
+        // Typing "walk.bvh" must not produce "walk.bvh.bvh".
+        for extension in [".bvh", ".fbx"] {
+            if name.to_ascii_lowercase().ends_with(extension) {
+                name.truncate(name.len() - extension.len());
+            }
+        }
         let stem = if name.is_empty() {
             video.file_stem()?.to_string_lossy().into_owned()
         } else {
-            name.to_string()
+            name
         };
         let suffix = if self.export_everyone {
             format!("-p{}", index + 1)
