@@ -329,6 +329,90 @@ fn contact_confidence(clip: &FlowClip, begin: usize, end: usize, confidence: f32
     (best / confidence).clamp(0.5, 1.0)
 }
 
+/// Kimodo's `couple_anchors`: two consecutive stances of the same foot that are
+/// separated by a very short release gap must not be pinned independently, or the
+/// foot teleports across the gap. Each stance may only be shifted as a whole
+/// (no rotation, no drift inside it), the shift is solved with a tridiagonal
+/// system that pulls neighbouring endpoints together, and every stance's
+/// adjustment is bounded to 12 cm.
+fn couple_anchor_offsets(
+    stances: &[(usize, usize)],
+    anchors: &[[f32; 3]],
+    support: &[[f32; 3]],
+    fps: f32,
+) -> Vec<[f32; 2]> {
+    let count = stances.len();
+    let mut adjustment = vec![[0.0f32; 2]; count];
+    if count < 2 {
+        return adjustment;
+    }
+    let gap_limit = fps * 0.12;
+    let mut diagonal = vec![1.0f64; count];
+    let mut off = vec![0.0f64; count - 1];
+    let mut rhs = vec![[0.0f64; 2]; count];
+
+    for pair in 0..count - 1 {
+        let (left, right) = (stances[pair], stances[pair + 1]);
+        let gap = right.0.saturating_sub(left.1);
+        if gap as f32 > gap_limit {
+            continue;
+        }
+        let weight = (10.0 * (gap_limit / (gap + 1) as f32).powi(3) as f64).min(1000.0);
+        let a = left.1 - 1;
+        let b = right.0;
+        for axis in [0usize, 2] {
+            let difference = ((anchors[b][axis] - support[b][axis])
+                - (anchors[a][axis] - support[a][axis])) as f64;
+            diagonal[pair] += weight;
+            diagonal[pair + 1] += weight;
+            off[pair] = -weight;
+            rhs[pair][if axis == 0 { 0 } else { 1 }] += weight * difference;
+            rhs[pair + 1][if axis == 0 { 0 } else { 1 }] -= weight * difference;
+        }
+    }
+
+    // Thomas algorithm on the tridiagonal system, once per column.
+    for column in 0..2 {
+        let mut c = vec![0.0f64; count];
+        let mut d = vec![0.0f64; count];
+        let mut b = diagonal.clone();
+        if b[0].abs() < 1e-12 {
+            continue;
+        }
+        c[0] = off[0] / b[0];
+        d[0] = rhs[0][column] / b[0];
+        for row in 1..count {
+            let denominator = b[row] - off[row - 1] * c[row - 1];
+            if denominator.abs() < 1e-12 {
+                break;
+            }
+            if row + 1 < count {
+                c[row] = off[row] / denominator;
+            }
+            d[row] = (rhs[row][column] - off[row - 1] * d[row - 1]) / denominator;
+        }
+        let mut x = vec![0.0f64; count];
+        x[count - 1] = d[count - 1];
+        for row in (0..count - 1).rev() {
+            x[row] = d[row] - c[row] * x[row + 1];
+        }
+        for stance in 0..count {
+            adjustment[stance][if column == 0 { 0 } else { 1 }] = x[stance] as f32;
+        }
+        b.clear();
+    }
+
+    // Never shift a stance more than 12 cm.
+    for delta in &mut adjustment {
+        let length = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+        if length > 0.12 {
+            delta[0] *= 0.12 / length;
+            delta[1] *= 0.12 / length;
+        }
+    }
+    adjustment
+}
+
 /// Kimodo's `TargetReachFalloff`: a Gaussian that fades the IK weight out as the
 /// target approaches the limit of what the two bones can reach, so the solver
 /// never straightens a limb into a locked pose.
@@ -600,8 +684,7 @@ fn support_point(clip: &FlowClip, frame: usize, ankle: usize, toe: usize) -> [f3
     ]
 }
 
-/// Kimodo's `airborne_excursions`, simplified to the gate that matters here: a
-/// stretch where the lowest sole is well above the floor and there is lower
+/// Kimodo's `airborne_excursions`, simplified to the gate that matters here: a/// stretch where the lowest sole is well above the floor and there is lower
 /// ground on both sides is a jump, so it must not be pinned as a contact.
 fn flight_frames(clip: &FlowClip, floor: f32) -> Vec<bool> {
     let count = clip.skeletons.len();
@@ -691,24 +774,44 @@ fn foot_lock(
                 && speed <= thresholds.contact_speed;
         }
         bridge_gaps(&mut contact, thresholds.bridge_frames);
-        for (begin, end) in contact_runs(&contact, thresholds.min_run) {
-            // Horizontal only: the vertical placement is solved when the clip is
-            // dropped onto its floor. Snapping Y on the contact frames only is
-            // what made the body bob up and down after a reconstruction.
-            //
+        let runs = contact_runs(&contact, thresholds.min_run);
+        if runs.is_empty() {
+            continue;
+        }
+
+        // Per-frame anchors, observed support points and hold strength for this
+        // foot, then the stance coupling that stops two neighbouring pins from
+        // teleporting the foot across a short release gap.
+        let mut anchors = vec![[0.0f32; 3]; count];
+        let mut support = vec![[0.0f32; 3]; count];
+        let mut holds = vec![1.0f32; count];
+        for (begin, end) in &runs {
             // The anchor is Kimodo's rolling anchor: a continuous no-slip path
             // through the stance, so a foot that rolls from heel to toe keeps its
             // contact patch still instead of jumping at the middle of the run.
-            let anchors = rolling_anchor(clip, begin, end, ankle, toe, ground);
+            let path = rolling_anchor(clip, *begin, *end, ankle, toe, ground);
             // Weak presets hold 60% of the correction, and a low network contact
             // probability softens it further instead of dropping the contact.
             let hold =
-                thresholds.strength * contact_confidence(clip, begin, end, thresholds.confidence);
+                thresholds.strength * contact_confidence(clip, *begin, *end, thresholds.confidence);
             report.foot_contacts += 1;
-            for (offset, index) in (begin..end).enumerate() {
-                let at = support_point(clip, index, ankle, toe);
-                let dx = (anchors[offset][0] - at[0]) as f64 * hold as f64;
-                let dz = (anchors[offset][2] - at[2]) as f64 * hold as f64;
+            for (offset, index) in (*begin..*end).enumerate() {
+                anchors[index] = path[offset];
+                support[index] = support_point(clip, index, ankle, toe);
+                holds[index] = hold;
+            }
+        }
+
+        let adjustments = couple_anchor_offsets(&runs, &anchors, &support, fps);
+        for (stance, (begin, end)) in runs.iter().enumerate() {
+            let adjustment = adjustments[stance];
+            for index in *begin..*end {
+                // Horizontal only: the vertical placement is solved when the clip
+                // is dropped onto its floor.
+                let dx = (anchors[index][0] + adjustment[0] - support[index][0]) as f64
+                    * holds[index] as f64;
+                let dz = (anchors[index][2] + adjustment[1] - support[index][2]) as f64
+                    * holds[index] as f64;
                 // Two feet in contact at once average their demands.
                 if pinned[index] {
                     target_x[index] = 0.5 * (target_x[index] + dx);
@@ -1168,6 +1271,60 @@ mod tests {
             worst.1,
             worst.0
         );
+    }
+
+    /// `couple_anchors`: two stances separated by a short gap must not keep
+    /// disagreeing anchors, and no stance may shift more than 12 cm.
+    #[test]
+    fn coupled_stances_meet_across_a_short_gap() {
+        let frames = 20;
+        // Two stances: 0..8 and 10..18, a two frame release gap between them.
+        let stances = vec![(0usize, 8usize), (10usize, 18usize)];
+        let mut anchors = vec![[0.0f32; 3]; frames];
+        let mut support = vec![[0.0f32; 3]; frames];
+        // The second stance's foot is pinned 10 cm away from the first.
+        for frame in 0..8 {
+            anchors[frame] = [0.0, 0.0, 0.0];
+            support[frame] = [0.0, 0.0, 0.0];
+        }
+        for frame in 10..18 {
+            anchors[frame] = [0.10, 0.0, 0.0];
+            // Same instant in the source: the disagreement is the anchor's.
+            support[frame] = [0.0, 0.0, 0.0];
+        }
+        let adjustments = couple_anchor_offsets(&stances, &anchors, &support, 30.0);
+        let left_end = (anchors[7][0] + adjustments[0][0]) - support[7][0];
+        let right_start = (anchors[10][0] + adjustments[1][0]) - support[10][0];
+        // The regulariser trades agreement against shifting either stance, so the
+        // residual is not zero, but the disagreement has to shrink a lot.
+        assert!(
+            (left_end - right_start).abs() < 0.05,
+            "endpoints still differ by {:.3} m ({left_end:.3} vs {right_start:.3})",
+            (left_end - right_start).abs()
+        );
+        for delta in &adjustments {
+            let length = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+            assert!(length <= 0.12 + 1e-6, "stance shifted {length:.3} m");
+        }
+    }
+
+    /// A long swing gap leaves the two stances independent.
+    #[test]
+    fn distant_stances_are_not_coupled() {
+        let frames = 40;
+        let stances = vec![(0usize, 8usize), (30usize, 38usize)];
+        let mut anchors = vec![[0.0f32; 3]; frames];
+        let mut support = vec![[0.0f32; 3]; frames];
+        for frame in 0..8 {
+            anchors[frame] = [0.0, 0.0, 0.0];
+        }
+        for frame in 30..38 {
+            anchors[frame] = [0.10, 0.0, 0.0];
+        }
+        let adjustments = couple_anchor_offsets(&stances, &anchors, &support, 30.0);
+        for delta in &adjustments {
+            assert!(delta[0].abs() < 1e-4 && delta[1].abs() < 1e-4, "adjusted {delta:?}");
+        }
     }
 
     /// `rolling_anchor`: during a pure heel-to-toe roll (no sliding) the
