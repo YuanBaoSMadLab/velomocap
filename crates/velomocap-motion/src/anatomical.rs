@@ -321,6 +321,50 @@ pub fn source_reach_gap(
     (dmin - high).max(low - dmax).max(0.0)
 }
 
+/// The reference's branch calibration: which side of the elbow the flexion goes
+/// to, decided once per stance from the source angles (never per frame, which is
+/// what makes an elbow flip between the two solutions). Frames below 8 degrees are
+/// ignored because the sign is meaningless near straight.
+///
+/// Returns `+1` or `-1`.
+pub fn elbow_branch(
+    rest: &[f32],
+    local_elbows: &[[f64; 9]],
+    hand: usize,
+) -> f64 {
+    let (shoulder, elbow, wrist) = if hand == 0 {
+        (16usize, 18usize, 20usize)
+    } else {
+        (17, 19, 21)
+    };
+    let u = sub(joint3(rest, elbow), joint3(rest, shoulder));
+    let v0 = sub(joint3(rest, wrist), joint3(rest, elbow));
+    let sign = if hand == 0 { 1.0 } else { -1.0 };
+    let calibration = math::align(&[sign, 0.0, 0.0], &u);
+    let axis = rotate(&calibration, [0.0, -sign, 0.0]);
+    let mut observed = Vec::new();
+    for local in local_elbows {
+        let v = rotate(local, v0);
+        let along = dot(v, axis);
+        let aa = dot(v, u) - along * dot(u, axis);
+        let bb = dot(cross(axis, v), u);
+        let angle = bb.atan2(aa);
+        if angle.abs() > 8.0f64.to_radians() {
+            observed.push(angle);
+        }
+    }
+    if observed.is_empty() {
+        return 1.0;
+    }
+    observed.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = observed[observed.len() / 2];
+    if median <= 0.0 {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
 /// Wrap an angle into `[-pi, pi]`.
 fn wrap(mut angle: f64) -> f64 {
     while angle > std::f64::consts::PI {
@@ -423,6 +467,21 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn elbow_branch_is_stable_for_a_straight_arm() {
+        let Some((body, rest)) = loaded() else {
+            return;
+        };
+        let mut pose = Pose::neutral(body.num_joints, 16);
+        pose.betas[0] = 0.3;
+        let (world, _) = forward(&body, &pose, &rest);
+        // A neutral (nearly straight) arm has no measurable branch, so the
+        // calibration must fall back to +1 instead of guessing from noise.
+        let local = math::tmul3(&world[16], &world[18]);
+        let branch = elbow_branch(&rest, &[local], 0);
+        assert!(branch == 1.0 || branch == -1.0, "branch {branch}");
+    }
+
     #[test]
     fn reach_gap_grows_with_distance() {
         let Some((body, rest)) = loaded() else {
