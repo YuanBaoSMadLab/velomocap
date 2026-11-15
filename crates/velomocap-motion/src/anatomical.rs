@@ -321,7 +321,24 @@ pub fn source_reach_gap(
     (dmin - high).max(low - dmax).max(0.0)
 }
 
+/// The upright elbow axis of an arm, straight from the rest skeleton: the
+/// reference derives xis = align([sign,0,0], upper) @ [0,-sign,0] the same way.
+/// Orienting the two-bone solve's bend plane against this keeps the elbow flexing
+/// on the side the skeleton allows instead of wherever the planar cross product
+/// happens to point.
+pub fn elbow_axis(rest: &[f32], hand: usize) -> [f64; 3] {
+    let (shoulder, elbow) = if hand == 0 {
+        (16usize, 18usize)
+    } else {
+        (17, 19)
+    };
+    let sign = if hand == 0 { 1.0 } else { -1.0 };
+    let u = sub(joint3(rest, elbow), joint3(rest, shoulder));
+    let calibration = math::align(&[sign, 0.0, 0.0], &u);
+    rotate(&calibration, [0.0, -sign, 0.0])
+}
 /// The reference's branch calibration: which side of the elbow the flexion goes
+
 /// to, decided once per stance from the source angles (never per frame, which is
 /// what makes an elbow flip between the two solutions). Frames below 8 degrees are
 /// ignored because the sign is meaningless near straight.
