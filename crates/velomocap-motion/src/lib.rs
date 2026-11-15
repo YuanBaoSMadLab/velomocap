@@ -2,6 +2,7 @@
 //! fitting path and the BVH exporter.
 
 pub mod anatomical;
+pub mod arm_plan;
 pub mod bvh_people;
 pub mod cleanup;
 pub mod correction;

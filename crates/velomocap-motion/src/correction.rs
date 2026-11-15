@@ -21,13 +21,15 @@
 //! | `SoleGeometry` | `sole::SoleGeometry` (default) |
 //! | `source_reach_gap` + reach gain | `anatomical::source_reach_gap` in `hand_lock` |
 //! | `palm_offsets`, `samples`, `plan` (palm contacts) | `palm::PalmGeometry`, `palm::plan` |
+//! | `contact_arm_plan.solve` (collar depression / swivel / wrist trim / elbow correction) | `arm_plan::Plan::solve`, applied by `plan_arm_stance` |
 //! | `scipy.optimize.least_squares` (both planning passes) | `solver::minimise` |
 //!
 //! Known differences that are **not** ported:
 //!
 //! | Reference | Why |
 //! | --- | --- |
-//! | `contact_arm_plan.solve` (least-squares over collar depression, arm swivel and wrist trim, plus branch calibration) | branch calibration, the reach gain and the palm targets are ported (`anatomical::elbow_branch`, `palm`); the coupled collar/swivel/wrist-trim optimiser is not, because it only acts when a palm support exists, and the reference's own default leaves hand correction off |
+//! | `contact_arm_plan.solve`'s two anchor x/z variables per stance | they let two overlapping palm supports be satisfied at once; this pass pins one palm at a time |
+//! | the world-fixed palm offset used inside the reference's `predict` | kept live here instead (`palm = wrist + R_upper·R_elbow·R_wrist_local·offset`), because a fixed world offset no longer matches the palm the applied pose produces once the arm swings |
 //! | `contact_pose_plan._optimise_window` (`scipy.optimize.least_squares`, 60 iterations, pose/velocity/acceleration/root sigmas) | the same objective is solved by `temporal::plan_series`; the window optimiser's extra collar/arm/swing coupling variables need a palm support to be meaningful |
 //! | `CorrectJointRotations` | no counterpart on purpose: it only moves a bone whose `fullBodyMask` is set, and the reference's own call passes a mask of zeros (`RGBMocap/mocap/correction.py` builds `c` from the contact array and passes `zero` for every body mask), so it is a no-op in that path |
 //!
@@ -39,8 +41,10 @@
 //!   pins, the rest is free, and the velocity/acceleration weights keep the root
 //!   from kinking where a contact run starts. Only X/Z move; the vertical
 //!   placement belongs to the floor solve.
-//! * Hands are pinned with a two-bone IK on the SMPL-H chain, then the chain is
-//!   written back as axis-angle rotations.
+//! * Hands are pinned through the window planner: `palm::plan` decides which
+//!   frames are supports, `arm_plan::Plan::solve` moves the collar, the shoulder
+//!   and the elbow of the whole stance at once, and the ramp frames around it get
+//!   a faded two-bone solve.
 
 use anyhow::Result;
 
@@ -1603,7 +1607,35 @@ fn hand_lock(
                 })
                 .collect();
             let branch = crate::anatomical::elbow_branch(&rest, &stance_local, hand_index);
+            // The stance itself is planned as one window
+            // (`contact_arm_plan.solve`): the collar may depress, the arm may
+            // swivel and the elbow correction is bounded, and the added change is
+            // smooth across the stance instead of being re-solved frame by frame.
+            let planned = plan_arm_stance(
+                body,
+                clip,
+                &rest,
+                palm.as_ref(),
+                &points,
+                hand_index,
+                begin,
+                end,
+                target,
+                branch,
+                fps,
+            );
+            if let Some(stance) = &planned {
+                let error = apply_arm_stance(body, clip, &rest, hand_index, begin, target, stance);
+                report.hand_contacts += 1;
+                report.ik_frames += end - begin;
+                report.max_hand_error = report.max_hand_error.max(error);
+            }
             for index in first..last {
+                // The window plan owns the stance frames; the ramp frames around
+                // it still get a single-frame solve, faded towards the source.
+                if planned.is_some() && index >= begin && index < end {
+                    continue;
+                }
                 let ramp_weight = if index < begin {
                     (index + ramp + 1 - begin) as f64 / (ramp + 1) as f64
                 } else if index >= end {
@@ -1676,6 +1708,128 @@ fn hand_lock(
             }
         }
     }
+}
+
+/// Build the window input for one palm stance (`contact_arm_plan.solve`).
+#[allow(clippy::too_many_arguments)]
+fn plan_arm_stance(
+    body: &BodyModel,
+    clip: &FlowClip,
+    rest: &[f32],
+    palm: Option<&crate::palm::PalmGeometry>,
+    points: &[[[f32; 3]; 2]],
+    hand: usize,
+    begin: usize,
+    end: usize,
+    pin: [f32; 3],
+    branch: f64,
+    fps: f32,
+) -> Option<Vec<crate::arm_plan::Planned>> {
+    let geometry = palm?;
+    let (collar, shoulder, elbow) = if hand == 0 {
+        (13usize, 16usize, 18usize)
+    } else {
+        (14, 17, 19)
+    };
+    let wrist = if hand == 0 { 20 } else { 21 };
+    let mut frames = Vec::with_capacity(end - begin);
+    let palm_offset_local = geometry.offsets()[hand];
+    for index in begin..end {
+        let (world, positions) = crate::anatomical::forward(body, &clip.poses[index], rest);
+        frames.push(crate::arm_plan::Frame {
+            collar_world: world[collar],
+            shoulder_world: world[shoulder],
+            elbow_world: world[elbow],
+            collar: positions[collar],
+            shoulder: positions[shoulder],
+            elbow: positions[elbow],
+            wrist: positions[wrist],
+            palm: [
+                points[index][hand][0] as f64,
+                points[index][hand][1] as f64,
+                points[index][hand][2] as f64,
+            ],
+            wrist_local: math::tmul3(&world[elbow], &world[wrist]),
+            palm_offset_local: [
+                palm_offset_local[0] as f64,
+                palm_offset_local[1] as f64,
+                palm_offset_local[2] as f64,
+            ],
+            influence: 1.0,
+            planned: true,
+        });
+    }
+    let plan = crate::arm_plan::Plan {
+        rest,
+        hand,
+        branch,
+        fps: fps as f64,
+        pin: [pin[0] as f64, pin[1] as f64, pin[2] as f64],
+        frames: &frames,
+    };
+    let planned = plan.solve();
+    if planned.len() != frames.len()
+        || planned
+            .iter()
+            .any(|frame| !frame.palm.iter().all(|value| value.is_finite()))
+    {
+        return None;
+    }
+    Some(planned)
+}
+
+/// Write a planned stance back into the clip's poses. Returns the largest palm
+/// error over the stance, in metres.
+fn apply_arm_stance(
+    body: &BodyModel,
+    clip: &mut FlowClip,
+    rest: &[f32],
+    hand: usize,
+    begin: usize,
+    pin: [f32; 3],
+    planned: &[crate::arm_plan::Planned],
+) -> f32 {
+    let (collar, shoulder, elbow) = if hand == 0 {
+        (13usize, 16usize, 18usize)
+    } else {
+        (14, 17, 19)
+    };
+    let parent = body.parents[collar];
+    let mut worst = 0.0f32;
+    for (offset, result) in planned.iter().enumerate() {
+        let index = begin + offset;
+        let (world, _) = crate::anatomical::forward(body, &clip.poses[index], rest);
+        let parent_world = if parent >= 0 {
+            world[parent as usize]
+        } else {
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        };
+        // Local rotations, so the chain below the elbow is untouched: the wrist
+        // keeps its own orientation and the palm rides the planned chain.
+        let local_collar = math::tmul3(&parent_world, &result.collar_world);
+        let local_shoulder = math::tmul3(&result.collar_world, &result.shoulder_world);
+        let rotations = [
+            (collar, local_collar),
+            (shoulder, local_shoulder),
+            (elbow, result.elbow_local),
+        ];
+        for (joint, matrix) in rotations {
+            let values = axis_angle(&matrix);
+            let at = (joint - 1) * 3;
+            if at + 3 <= clip.poses[index].body.len() {
+                clip.poses[index].body[at..at + 3].copy_from_slice(&values);
+            }
+        }
+        // How close the planned palm lands on its pin. The plan's own prediction
+        // is exact for the variables it solved, so this is the residual reach
+        // error, not an integration error.
+        let error = ((result.palm[0] - pin[0] as f64).powi(2)
+            + (result.palm[1] - pin[1] as f64).powi(2)
+            + (result.palm[2] - pin[2] as f64).powi(2))
+        .sqrt();
+        worst = worst.max(error as f32);
+    }
+    worst
 }
 
 /// Two-bone IK with Kimodo's analytic solve: stage 1 sets `|ac| = |at|` with the
@@ -2159,6 +2313,110 @@ mod tests {
             "joint {} differs by {:.4} m",
             worst.1,
             worst.0
+        );
+    }
+
+    /// The whole hand path, end to end on a synthetic clip: a palm planted on the
+    /// floor for the entire clip is detected, planned as one window and left on
+    /// its pin, while a hand hanging at the actor's side is not touched.
+    ///
+    /// The supplied video fixtures contain no palm support, so without this test
+    /// the arm path would only ever be exercised by its unit tests.
+    #[test]
+    fn a_planted_palm_is_detected_and_held() {
+        let Some((body, rest)) = loaded() else {
+            return;
+        };
+        let betas = vec![0.0f32; 16];
+        let frames = 24usize;
+        // The left arm swings down and forward (the z rotation is what points the
+        // arm at the ground), and the body is dropped until the palm is on the
+        // floor at `y = 0.03`.
+        let mut pose = Pose::neutral(body.num_joints, 16);
+        for (joint, angles) in [
+            (LEFT_SHOULDER, [0.0f32, 0.0, -1.0]),
+            (LEFT_ELBOW, [0.3, 0.0, 0.0]),
+        ] {
+            let at = (joint - 1) * 3;
+            pose.body[at..at + 3].copy_from_slice(&angles);
+        }
+        let geometry = crate::palm::PalmGeometry::build(&body, &betas).expect("palm geometry");
+        let probe = body.forward_joints(&pose);
+        pose.translation = [0.0, 0.03 - geometry.points(&probe)[0][1], 0.0];
+
+        let mut poses = Vec::with_capacity(frames);
+        let mut skeletons = Vec::with_capacity(frames);
+        for frame in 0..frames {
+            let mut current = pose.clone();
+            // The first third drifts: the wrist rolls 6 degrees, which moves the
+            // palm by a couple of centimetres, and the plan has to pull it back.
+            if frame < 8 {
+                let at = (LEFT_WRIST - 1) * 3;
+                current.body[at + 1] = 0.10;
+            }
+            let skeleton = body.forward_joints(&current);
+            skeletons.push(skeleton);
+            poses.push(current);
+        }
+        let mut clip = FlowClip {
+            fps: 30.0,
+            poses,
+            skeletons,
+            rot6d: Vec::new(),
+            trans: vec![[0.0; 3]; frames],
+            betas: betas.clone(),
+            foot_contacts: Vec::new(),
+            floor: 0.0,
+            floor_from_mesh: true,
+            offset: [0.0; 3],
+            source_frames: (0..frames).collect(),
+            anchors: 0,
+            anchor_residual: [0.0; 3],
+        };
+        let settings = CorrectionSettings {
+            hand: true,
+            foot: false,
+            mode: CorrectionMode::Flat,
+            floor: 0.0,
+            ..CorrectionSettings::default()
+        };
+        let thresholds = settings.thresholds();
+        let _ = thresholds;
+        let mut report = CorrectionReport::default();
+        hand_lock(&mut clip, &body, &settings, &mut report);
+        assert_eq!(report.hand_contacts, 1, "the planted palm was not found");
+        assert!(report.ik_frames >= frames - 8, "only {} IK frames", report.ik_frames);
+
+        // Every frame of the stance has its palm on the pin, which is the median
+        // palm point of the run.
+        let geometry = crate::palm::PalmGeometry::build(&body, &betas).expect("palm geometry");
+        let mut columns = [Vec::new(), Vec::new(), Vec::new()];
+        for frame in 0..frames {
+            let palm = geometry.points(&clip.skeletons[frame])[0];
+            for axis in 0..3 {
+                columns[axis].push(palm[axis]);
+            }
+        }
+        let pin = [
+            median(&columns[0]),
+            median(&columns[1]),
+            median(&columns[2]),
+        ];
+        let mut worst = 0.0f32;
+        for frame in 0..frames {
+            let palm = geometry.points(&clip.skeletons[frame])[0];
+            let error = ((palm[0] - pin[0]).powi(2)
+                + (palm[1] - pin[1]).powi(2)
+                + (palm[2] - pin[2]).powi(2))
+            .sqrt();
+            worst = worst.max(error);
+        }
+        assert!(worst < 0.02, "palm wanders {:.1} mm from its pin", worst * 1000.0);
+        // The plan's own contact error must be reported, not silently swallowed.
+        assert!(
+            report.max_hand_error < 0.02,
+            "reported hand residual {:.1} mm",
+            report.max_hand_error * 1000.0
         );
     }
 
