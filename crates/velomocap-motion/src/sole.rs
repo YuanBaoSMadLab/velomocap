@@ -217,12 +217,13 @@ impl SoleGeometry {
                 let patch = &skinned[offset..offset + self.patches[index].len()];
                 offset += self.patches[index].len();
                 let mut sum = [0.0f32; 3];
-                for vertex in &self.proxies[index] {
+                for vertex in 0..patch.len() {
+                    let at = vertex;
                     for axis in 0..3 {
-                        sum[axis] += patch[*vertex][axis];
+                        sum[axis] += patch[at][axis];
                     }
                 }
-                let count = self.proxies[index].len().max(1) as f32;
+                let count = patch.len().max(1) as f32;
                 let mut point = [sum[0] / count, sum[1] / count, sum[2] / count];
                 point[1] = patch
                     .iter()
