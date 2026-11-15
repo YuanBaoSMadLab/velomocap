@@ -43,6 +43,8 @@ extern "C" {
         error_len: usize,
     ) -> *mut std::ffi::c_void;
     fn vm_sam3d_free(handle: *mut std::ffi::c_void);
+    fn vm_cuda_empty_cache();
+    fn vm_cuda_mem_info(free_bytes: *mut i64, total_bytes: *mut i64) -> c_int;
     #[allow(clippy::too_many_arguments)]
     fn vm_sam3d_forward(
         handle: *mut std::ffi::c_void,
@@ -233,6 +235,42 @@ impl Drop for Sam3dTorch {
     fn drop(&mut self) {
         unsafe { vm_sam3d_free(self.handle) };
     }
+}
+
+/// Give the CUDA caching allocator's freed blocks back to the driver.
+///
+/// Dropping a module frees it from PyTorch's point of view, but the allocator
+/// keeps the blocks in its own pool: `nvidia-smi` does not move, and the next
+/// stage's weights get pushed into host memory instead of the device. Call this
+/// between stages. A no-op when the build has no LibTorch or no CUDA.
+pub fn empty_cuda_cache() {
+    unsafe { vm_cuda_empty_cache() }
+}
+
+/// Device memory as `(used, total)` bytes, when this build can ask the driver.
+///
+/// `None` on a CPU-only build, or when no device is visible.
+pub fn cuda_memory() -> Option<(u64, u64)> {
+    let mut free_bytes = 0i64;
+    let mut total_bytes = 0i64;
+    let code = unsafe { vm_cuda_mem_info(&mut free_bytes, &mut total_bytes) };
+    if code != 0 || total_bytes <= 0 {
+        return None;
+    }
+    let total = total_bytes as u64;
+    let free = (free_bytes.max(0) as u64).min(total);
+    Some((total - free, total))
+}
+
+/// `"1.2 / 24.0 GB"` for the console log, or `None` when there is no device.
+pub fn cuda_memory_line() -> Option<String> {
+    cuda_memory().map(|(used, total)| {
+        format!(
+            "{:.2} / {:.1} GB",
+            used as f64 / 1e9,
+            total as f64 / 1e9
+        )
+    })
 }
 
 /// Everything the whole-pipeline module produces.

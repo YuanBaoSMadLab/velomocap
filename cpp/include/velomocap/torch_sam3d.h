@@ -80,6 +80,18 @@ int vm_sam3d_forward_full(void* handle, const float* frame, int height, int widt
                           float* pred, int pred_count,
                           char* error, size_t error_len);
 
+
+// CUDA housekeeping, so one stage's model does not starve the next.
+//
+// PyTorch's caching allocator keeps freed device blocks in a per-process pool:
+// dropping a module frees it from PyTorch's point of view but `nvidia-smi` stays
+// high, and the next stage's weights then have nowhere to go — they end up
+// paged into host memory and every kernel crawls. Call this between stages.
+void vm_cuda_empty_cache(void);
+
+// Device memory in bytes. Returns 0 on success, 1 when this build or device
+// cannot report it.
+int vm_cuda_mem_info(long long* free_bytes, long long* total_bytes);
 #ifdef __cplusplus
 }
 #endif

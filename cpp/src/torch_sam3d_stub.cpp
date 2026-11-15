@@ -104,4 +104,11 @@ int vm_sam3d_forward_full(void* handle, const float* frame, int height, int widt
   return 4;
 }
 
+void vm_cuda_empty_cache(void) {}
+
+int vm_cuda_mem_info(long long* free_bytes, long long* total_bytes) {
+  (void)free_bytes;
+  (void)total_bytes;
+  return 1;
+}
 }  // extern "C"

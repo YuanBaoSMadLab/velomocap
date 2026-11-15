@@ -7,6 +7,11 @@
 
 #include <torch/script.h>
 
+#ifdef VM_TORCH_CUDA
+#include <c10/cuda/CUDACachingAllocator.h>
+#include <cuda_runtime_api.h>
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -265,4 +270,35 @@ int vm_sam3d_forward_full(void* opaque, const float* frame, int height, int widt
   }
 }
 
+// --- CUDA housekeeping -------------------------------------------------------
+
+void vm_cuda_empty_cache(void) {
+#ifdef VM_TORCH_CUDA
+  try {
+    c10::cuda::CUDACachingAllocator::emptyCache();
+  } catch (...) {
+    // Best effort: failing to trim the cache must never fail the pipeline.
+  }
+#endif
+}
+
+int vm_cuda_mem_info(long long* free_bytes, long long* total_bytes) {
+#ifdef VM_TORCH_CUDA
+  if (free_bytes == nullptr || total_bytes == nullptr) {
+    return 2;
+  }
+  size_t free_memory = 0;
+  size_t total_memory = 0;
+  if (cudaMemGetInfo(&free_memory, &total_memory) != cudaSuccess) {
+    return 1;
+  }
+  *free_bytes = static_cast<long long>(free_memory);
+  *total_bytes = static_cast<long long>(total_memory);
+  return 0;
+#else
+  (void)free_bytes;
+  (void)total_bytes;
+  return 1;
+#endif
+}
 }  // extern "C"

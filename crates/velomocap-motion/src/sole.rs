@@ -225,10 +225,10 @@ impl SoleGeometry {
                 }
                 let count = patch.len().max(1) as f32;
                 let mut point = [sum[0] / count, sum[1] / count, sum[2] / count];
-                point[1] = patch
-                    .iter()
-                    .map(|v| v[1])
-                    .fold(f32::INFINITY, f32::min);
+                let mut ys: Vec<f32> = patch.iter().map(|v| v[1]).collect();
+                ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let take = (ys.len() / 10).max(3).min(ys.len());
+                point[1] = ys[..take].iter().sum::<f32>() / take as f32;
                 out[foot][side] = point;
             }
         }

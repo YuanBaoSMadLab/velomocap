@@ -97,6 +97,8 @@ fn main() {
             // They exist in the CUDA wheel and are absent from the CPU one.
             if lib.join("torch_cuda.lib").is_file() {
                 println!("cargo:rustc-link-lib=torch_cuda");
+                // The C++ CUDA helpers need the allocator and runtime headers.
+                build.define("VM_TORCH_CUDA", "1");
                 if lib.join("c10_cuda.lib").is_file() {
                     println!("cargo:rustc-link-lib=c10_cuda");
                 }

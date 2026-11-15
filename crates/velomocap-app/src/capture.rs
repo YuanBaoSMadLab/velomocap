@@ -21,6 +21,12 @@ pub enum CaptureStage {
     Decoding,
     Detecting,
     Reconstructing,
+    /// VGGT-Omega: per-frame camera estimation.
+    Camera,
+    /// FlowHMR: one coherent clip per person.
+    Motion,
+    /// SMPL-H skinning of the generated poses, for the viewport.
+    Skin,
     Done,
     Failed,
 }
@@ -33,16 +39,53 @@ impl CaptureStage {
             CaptureStage::Decoding => "decoding",
             CaptureStage::Detecting => "detecting people",
             CaptureStage::Reconstructing => "reconstructing",
+            CaptureStage::Camera => "estimating camera",
+            CaptureStage::Motion => "generating motion",
+            CaptureStage::Skin => "skinning",
             CaptureStage::Done => "done",
             CaptureStage::Failed => "failed",
         }
     }
 }
 
+/// The stages a run goes through, in the order the progress display shows them.
+///
+/// Every stage reports its own `(done, total)`, so the bar moves during the long
+/// ones — camera and motion used to leave the SAM counter frozen at 100 % and the
+/// run looked hung.
+pub const STAGE_COUNT: usize = 6;
+
+pub fn stage_name(index: usize) -> &'static str {
+    match index {
+        0 => "loading models",
+        1 => "reconstructing people",
+        2 => "estimating camera",
+        3 => "generating motion",
+        4 => "skinning",
+        _ => "done",
+    }
+}
+
+fn stage_index(stage: &str) -> usize {
+    match stage {
+        "loading mesh" | "loading detector" | "loading SAM 3D Body" | "opening video"
+        | "flow body model" | "flow camera" => 0,
+        "detecting" | "reconstructing" => 1,
+        "camera" => 2,
+        "flow" => 3,
+        "skin" => 4,
+        _ => 5,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CaptureProgress {
     pub stage: CaptureStage,
+    /// Zero-based index into [`stage_name`]; the UI shows it as "stage n/6".
+    pub stage_index: usize,
+    /// Work done inside the current stage, not in the whole run.
     pub frame: usize,
+    /// Work the current stage has to do; `0` means "unknown, show a spinner".
     pub total: usize,
     /// People reconstructed in the frame being processed.
     pub people: usize,
@@ -54,6 +97,7 @@ impl Default for CaptureProgress {
     fn default() -> Self {
         Self {
             stage: CaptureStage::Idle,
+            stage_index: 0,
             frame: 0,
             total: 0,
             people: 0,
@@ -114,6 +158,8 @@ pub struct CaptureShared {
     pub smplh_faces: Option<Arc<Vec<[u32; 3]>>>,
     /// Why the motion stage produced nothing, when it did.
     pub flow_note: String,
+    /// Device memory as reported between stages, for the console and the HUD.
+    pub vram: String,
 }
 
 /// One person's generated clip, skinned and ready for the viewport.
