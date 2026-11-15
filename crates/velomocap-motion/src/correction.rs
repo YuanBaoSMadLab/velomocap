@@ -631,7 +631,15 @@ fn ground_feet(
         }
         // Only the lowest sole decides: a stepping foot is not a pin.
         let gap = lowest - settings.floor;
-        observation[frame] = (clip.poses[frame].translation[1] - gap) as f64;
+        // A swing frame whose sole would clip through the floor gets a bounded
+        // clearance target (`min(max(floor - height, 0), .12)` in the reference's
+        // swing guard). It is not a pin, so the corrector blends it.
+        let clearance = if gap < -0.01 {
+            (-gap).min(0.12)
+        } else {
+            0.0
+        };
+        observation[frame] = (clip.poses[frame].translation[1] - gap + clearance) as f64;
         if gap <= tolerance {
             margins[frame] = 0.0;
             pinned += 1;
