@@ -16,12 +16,19 @@
 //! | `rolling_anchor` | `rolling_anchor`, `rolling_path` |
 //! | `couple_anchors` | `couple_anchor_offsets` |
 //! | `smooth_auto_handoffs` / `_hermite` | `smooth_handoffs`, `hermite` |
-//! | `reachable_pelvis_lift` | the capped lift in `leg_ik` |
+//! | `reachable_pelvis_lift` / `reachable_pelvis_drop` | capped lift and drop in `leg_ik` |
+//! | `anatomical_ik.solve_legs`, `reach_lengths`, `minimum_reach_lengths` | `anatomical` |
+//! | `SoleGeometry` | `sole::SoleGeometry` (default) |
+//! | `source_reach_gap` + reach gain | `anatomical::source_reach_gap` in `hand_lock` |
 //!
-//! `CorrectJointRotations` has no counterpart on purpose: it only moves a bone
-//! whose `fullBodyMask` is set, and the reference's own call passes a mask of
-//! zeros (`RGBMocap/mocap/correction.py` builds `c` from the contact array and
-//! passes `zero` for every body mask), so the function is a no-op in that path.
+//! Known differences that are **not** ported:
+//!
+//! | Reference | Why |
+//! | --- | --- |
+//! | `contact_arm_plan.solve` (least-squares over collar depression, arm swivel and wrist trim, plus branch calibration) | a numeric optimiser, not a geometric rule; it only acts when a hand is in contact, which our fixture material never triggers |
+//! | `contact_pose_plan._optimise_window` (`scipy.optimize.least_squares`, 60 iterations, pose/velocity/acceleration/root sigmas) | same: a trajectory optimiser on top of the root plan we already solve with the ADMM corrector |
+//! | `CorrectJointRotations` | no counterpart on purpose: it only moves a bone whose `fullBodyMask` is set, and the reference's own call passes a mask of zeros (`RGBMocap/mocap/correction.py` builds `c` from the contact array and passes `zero` for every body mask), so it is a no-op in that path |
+//!
 //! `DoEffectorIK` is implemented as the position pin in `hand_lock`; its optional
 //! "keep the wrist orientation" branch is not needed because the IK only moves
 //! the shoulder and the elbow.
