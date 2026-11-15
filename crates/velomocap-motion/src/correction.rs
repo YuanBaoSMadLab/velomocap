@@ -105,7 +105,7 @@ impl Default for CorrectionSettings {
             preset: LockPreset::Normal,
             floor: 0.0,
             pelvis_offset: 0.0,
-            leg_ik: false,
+            leg_ik: true,
             smoothing: 0.0,
         }
     }
@@ -921,13 +921,34 @@ fn leg_ik(
                     (current[2] as f64 + want[2]) as f32,
                 ];
                 let source = clip.poses[index].clone();
-                let hint = bend_hint(&clip.skeletons[index], hip, knee, ankle);
-                if solve_arm(body, &mut clip.poses[index], &rest, hip, knee, ankle, blended, hint) {
-                    // Keep the end joint's orientation from swinging on one
-                    // frame: the toes below it would amplify that into a twitch.
-                    limit_end_rotation(body, &mut clip.poses[index], &rest, &source, hip, knee, ankle);
-                    clip.skeletons[index] = body.forward_joints(&clip.poses[index]);
-                    report.ik_frames += 1;
+                let (world, positions) = crate::anatomical::forward(body, &clip.poses[index], &rest);
+                if let Some(anatomy) = crate::anatomical::solve_leg(
+                    body,
+                    &mut clip.poses[index],
+                    &rest,
+                    &world,
+                    &positions,
+                    hip,
+                    knee,
+                    ankle,
+                    target,
+                ) {
+                    // An off-axis knee would mean the anatomical constraint
+                    // broke: keep the source pose rather than ship it.
+                    if anatomy.off_axis_deg < 1e-4 {
+                        scale_chain_towards_source(
+                            body,
+                            &mut clip.poses[index],
+                            &rest,
+                            &source,
+                            &[hip, knee],
+                            weight,
+                        );
+                        clip.skeletons[index] = body.forward_joints(&clip.poses[index]);
+                        report.ik_frames += 1;
+                    } else {
+                        clip.poses[index] = source;
+                    }
                 }
             }
         }

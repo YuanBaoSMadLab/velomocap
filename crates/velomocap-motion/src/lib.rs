@@ -1,6 +1,7 @@
 //! Motion: multi-person SAM 3D Body reconstruction, plus the legacy SMPL-X
 //! fitting path and the BVH exporter.
 
+pub mod anatomical;
 pub mod bvh_people;
 pub mod cleanup;
 pub mod correction;
