@@ -197,6 +197,8 @@ enum Command {
         /// Write every frame's joint world rotations (f32 LE, frames x 52 x 9).
         #[arg(long)]
         dump_rotations: Option<PathBuf>,
+        #[arg(long)]
+        dump_probes: Option<PathBuf>,
         /// Disable foot/hand contact correction.
         #[arg(long)]
         no_correction: bool,
@@ -486,6 +488,7 @@ fn main() -> Result<()> {
             dump_mesh,
             dump_joints,
             dump_rotations,
+            dump_probes,
             no_correction,
             no_foot,
             hand_lock,
@@ -526,6 +529,7 @@ fn main() -> Result<()> {
             dump_mesh.as_deref(),
             dump_joints.as_deref(),
             dump_rotations.as_deref(),
+            dump_probes.as_deref(),
             no_correction,
             no_foot,
             hand_lock,
@@ -1121,6 +1125,7 @@ fn flow_report(
     dump_mesh: Option<&std::path::Path>,
     dump_joints: Option<&std::path::Path>,
     dump_rotations: Option<&std::path::Path>,
+    dump_probes: Option<&std::path::Path>,
     no_correction: bool,
     no_foot: bool,
     hand_lock: bool,
@@ -1353,6 +1358,18 @@ fn flow_report(
     };
     let correction = velomocap_motion::correction::apply(&mut clip, &model, &settings)?;
     println!("  {}", correction.line());
+
+    if let Some(path) = dump_probes {
+        let rows = velomocap_motion::correction::dump_probe_points(&clip, &model);
+        let mut bytes = Vec::new();
+        for row in &rows {
+            for value in row {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        std::fs::write(path, &bytes)?;
+        println!("wrote {} ({} frames x 24 probe values)", path.display(), rows.len());
+    }
 
     if let Some(path) = dump_rotations {
         let mut bytes = Vec::new();

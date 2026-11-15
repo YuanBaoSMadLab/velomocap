@@ -1073,6 +1073,38 @@ fn smooth_weights(weights: &[f32], fps: f32) -> Vec<f32> {
         .collect()
 }
 
+/// Diagnostic: for every frame, the four skinned sole probes (foot x side) and the
+/// four joint-approximation points, so the two contact sources can be compared
+/// numerically instead of only through end-to-end metrics.
+pub fn dump_probe_points(clip: &FlowClip, body: &BodyModel) -> Vec<[f32; 24]> {
+    let Some(sole) = Sole::build(clip, body) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(clip.skeletons.len());
+    for (frame, skeleton) in clip.skeletons.iter().enumerate() {
+        let mut row = [0.0f32; 24];
+        for foot in 0..2 {
+            let probes = sole.points(skeleton, foot);
+            row[foot * 6..foot * 6 + 3].copy_from_slice(&probes.0);
+            row[foot * 6 + 3..foot * 6 + 6].copy_from_slice(&probes.1);
+            let ankle = if foot == 0 { LEFT_ANKLE } else { RIGHT_ANKLE };
+            let toe = if foot == 0 { LEFT_FOOT } else { RIGHT_FOOT };
+            let ankle_at = joint(skeleton, ankle);
+            let toe_at = joint(skeleton, toe);
+            let heel = [
+                ankle_at[0] + (ankle_at[0] - toe_at[0]) * 0.6,
+                ankle_at[1] + (ankle_at[1] - toe_at[1]) * 0.6,
+                ankle_at[2] + (ankle_at[2] - toe_at[2]) * 0.6,
+            ];
+            row[12 + foot * 6..12 + foot * 6 + 3].copy_from_slice(&toe_at);
+            row[12 + foot * 6 + 3..12 + foot * 6 + 6].copy_from_slice(&heel);
+        }
+        let _ = frame;
+        out.push(row);
+    }
+    out
+}
+
 fn joint3(rest: &[f32], index: usize) -> [f64; 3] {
     [
         rest[index * 3] as f64,
