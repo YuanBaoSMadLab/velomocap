@@ -42,7 +42,6 @@ mod kp {
 
 /// SMPL-X joint indices for the same landmarks.
 mod sj {
-    pub const PELVIS: usize = 0;
     pub const L_HIP: usize = 1;
     pub const R_HIP: usize = 2;
     pub const SPINE1: usize = 3;
@@ -305,7 +304,7 @@ impl<'a> Fitter<'a> {
                 params = candidate;
                 lambda = (lambda * 0.4).max(1e-7);
                 if (best_cost - candidate_cost).abs() < 1e-7 * best_cost.max(1.0) {
-                    best_cost = candidate_cost;
+                    // Converged: the assignment below would never be read.
                     converged = true;
                     break;
                 }

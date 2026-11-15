@@ -486,9 +486,11 @@ impl Sam3dBody {
             pred_cam,
             cam_t: input.camera_translation(pred_cam),
             pred,
-            // The ONNX chain stops at the body branch; the hand rows of the
-            // motion feature stay zero, which is what the reference does for
-            // frames it does not sample hands on.
+            // This ONNX export stops at the body branch: there is no hand head,
+            // so the hand rows of the 3072-wide motion feature stay zero. It is
+            // the fallback for a build without LibTorch (`--cpu`, or no
+            // `sam3d_full_ts.pt`); the TorchScript path is the one that fills
+            // them. `feature_rows` keeps the zeros rather than inventing a hand.
             left_token: Vec::new(),
             right_token: Vec::new(),
         })

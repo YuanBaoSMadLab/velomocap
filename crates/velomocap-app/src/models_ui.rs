@@ -71,7 +71,7 @@ fn header(app: &mut VeloMocap, ui: &mut egui::Ui) {
     }
 }
 
-fn group_section(app: &mut VeloMocap, ui: &mut egui::Ui, group: &GroupStatus) {
+fn group_section(_app: &mut VeloMocap, ui: &mut egui::Ui, group: &GroupStatus) {
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         let colour = if group.ready() { OK } else if group.group.required { ERR } else { WARN };

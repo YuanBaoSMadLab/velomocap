@@ -1289,7 +1289,7 @@ impl VeloMocap {
             self.export_note = Some(format!("{summary}\n{timings}"));
         }
         if stage != CaptureStage::Idle && stage != CaptureStage::Failed {
-            let people = if people_count > 0 {
+            let _people = if people_count > 0 {
                 format!("  ·  {people_count} people")
             } else {
                 String::new()

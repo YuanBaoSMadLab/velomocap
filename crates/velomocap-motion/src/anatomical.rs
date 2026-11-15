@@ -484,7 +484,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn elbow_branch_is_stable_for_a_straight_arm() {
         let Some((body, rest)) = loaded() else {
             return;
@@ -516,6 +515,8 @@ mod tests {
         assert!(gap > 0.1, "far target should have a gap, got {gap}");
     }
 
+    /// The leg solve has to land on the target and keep the knee on its hinge.
+    #[test]
     fn solve_leg_reaches_a_target_without_leaving_the_knee_axis() {
         let Some((body, rest)) = loaded() else {
             return;

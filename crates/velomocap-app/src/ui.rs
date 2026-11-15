@@ -41,18 +41,18 @@ pub fn configure(ctx: &egui::Context) {
     visuals.faint_bg_color = egui::Color32::from_rgb(0x33, 0x33, 0x33);
     visuals.override_text_color = Some(TEXT);
     visuals.selection.bg_fill = ACCENT;
-    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-    visuals.window_stroke = egui::Stroke::new(1.0, BORDER);
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
+    visuals.window_stroke = egui::Stroke::new(1.0_f32, BORDER);
     visuals.widgets.noninteractive.bg_fill = PANEL_BG;
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER);
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
     visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(0x45, 0x45, 0x45);
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0x24, 0x24, 0x24));
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x24, 0x24, 0x24));
     visuals.widgets.inactive.corner_radius = 3.into();
     visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x55, 0x55, 0x55);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0x73, 0x73, 0x73));
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x73, 0x73, 0x73));
     visuals.widgets.hovered.corner_radius = 3.into();
     visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0x33, 0x33, 0x33);
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT_DIM);
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT_DIM);
     visuals.widgets.active.corner_radius = 3.into();
     visuals.widgets.open.bg_fill = egui::Color32::from_rgb(0x45, 0x45, 0x45);
     visuals.window_corner_radius = 2.into();
@@ -344,7 +344,7 @@ fn title_strip(app: &mut VeloMocap, ctx: &egui::Context) {
 fn panel(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(PANEL_BG)
-        .stroke(egui::Stroke::new(1.0, BORDER))
+        .stroke(egui::Stroke::new(1.0_f32, BORDER))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
@@ -436,7 +436,7 @@ fn people_column(app: &mut VeloMocap, ui: &mut egui::Ui, rect: egui::Rect) {
                 .color(if selected { egui::Color32::WHITE } else { TEXT });
             let button = egui::Button::new(text)
                 .fill(if selected { ACCENT } else { HEADER_BG })
-                .stroke(egui::Stroke::new(1.0, if selected { ACCENT_DIM } else { BORDER }))
+                .stroke(egui::Stroke::new(1.0_f32, if selected { ACCENT_DIM } else { BORDER }))
                 .min_size(egui::vec2(58.0, 20.0));
             let _ = ui.add_enabled(index == 0, button);
         }
@@ -463,7 +463,7 @@ fn people_column(app: &mut VeloMocap, ui: &mut egui::Ui, rect: egui::Rect) {
 
     egui::Frame::new()
         .fill(egui::Color32::from_rgb(0x24, 0x24, 0x24))
-        .stroke(egui::Stroke::new(1.0, BORDER))
+        .stroke(egui::Stroke::new(1.0_f32, BORDER))
         .inner_margin(egui::Margin::same(3))
         .show(ui, |ui| {
             ui.set_min_height((ui.available_height() - 28.0).max(60.0));
@@ -604,14 +604,14 @@ fn people_column(app: &mut VeloMocap, ui: &mut egui::Ui, rect: egui::Rect) {
         {
             app.start_capture();
         }
-        egui::ComboBox::from_id_salt("person-take")
-            .selected_text(i18n::t("Default"))
-            .width(84.0)
-            .show_ui(ui, |ui| {
-                // One take for now; the list exists so the layout matches.
-                let mut take = 0usize;
-                ui.selectable_value(&mut take, 0, i18n::t("Default"));
-            });
+        // Not a control: this build has one take per video. The reference's
+        // take selector lists several clips of a scene, and rendering an option
+        // list with one dead entry only invites the question of why it does
+        // nothing.
+        ui.label(egui::RichText::new(i18n::t("Default")).size(11.0))
+            .on_hover_text(i18n::t(
+                "One take per video in this build; the reference's multi-take scene is not implemented",
+            ));
     });
 }
 
@@ -677,7 +677,7 @@ fn video_view(app: &mut VeloMocap, ui: &mut egui::Ui, rect: egui::Rect) {
                 painter.rect_stroke(
                     egui::Rect::from_min_max(min, max),
                     2.0,
-                    egui::Stroke::new(if selected { 2.6 } else { 1.4 }, person.colour),
+                    egui::Stroke::new(if selected { 2.6_f32 } else { 1.4 }, person.colour),
                     egui::StrokeKind::Inside,
                 );
                 painter.text(
@@ -699,7 +699,7 @@ fn video_view(app: &mut VeloMocap, ui: &mut egui::Ui, rect: egui::Rect) {
                 painter.rect_stroke(
                     egui::Rect::from_min_max(min, max),
                     2.0,
-                    egui::Stroke::new(if selected { 2.6 } else { 1.4 }, colour),
+                    egui::Stroke::new(if selected { 2.6_f32 } else { 1.4 }, colour),
                     egui::StrokeKind::Inside,
                 );
                 painter.text(
@@ -1014,7 +1014,7 @@ fn transport(app: &mut VeloMocap, ui: &mut egui::Ui) {
         .add(
             egui::Button::new(egui::RichText::new(play_label).size(12.0))
                 .fill(ACCENT)
-                .stroke(egui::Stroke::new(1.0, ACCENT_DIM))
+                .stroke(egui::Stroke::new(1.0_f32, ACCENT_DIM))
                 .min_size(egui::vec2(34.0, 20.0)),
         )
         .on_hover_text(i18n::t("Play / pause (Space)"))
@@ -1220,7 +1220,7 @@ fn tracks(app: &mut VeloMocap, ui: &mut egui::Ui) {
                         / (frames.max(2) - 1) as f32);
                     painter.line_segment(
                         [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                        egui::Stroke::new(1.4, egui::Color32::WHITE),
+                        egui::Stroke::new(1.4_f32, egui::Color32::WHITE),
                     );
                 }
                 None => {
@@ -1456,7 +1456,7 @@ fn lock_rows(app: &mut VeloMocap, ui: &mut egui::Ui, frames: usize) {
                             bar,
                             1.0,
                             egui::Stroke::new(
-                                if selected { 1.6 } else { 1.0 },
+                                if selected { 1.6_f32 } else { 1.0 },
                                 if selected {
                                     egui::Color32::from_rgb(0xd9, 0xe8, 0xfa)
                                 } else {
@@ -1495,7 +1495,7 @@ fn lock_rows(app: &mut VeloMocap, ui: &mut egui::Ui, frames: usize) {
                     * (app.playhead.min(frames - 1) as f32 / (frames.max(2) - 1) as f32);
             painter.line_segment(
                 [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(0xe8, 0xe8, 0xe8)),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0xe8, 0xe8, 0xe8)),
             );
 
             // The reference's context menu, item for item.
@@ -1608,7 +1608,7 @@ fn sidebar(app: &mut VeloMocap, ctx: &egui::Context) {
 fn group<R>(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let mut frame = egui::Frame::new()
         .fill(PANEL_BG)
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0x20, 0x20, 0x20)))
+        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x20, 0x20, 0x20)))
         .inner_margin(egui::Margin::symmetric(7, 6));
     frame.outer_margin = egui::Margin::symmetric(0, 5);
     frame.show(ui, |ui| {
@@ -1627,12 +1627,13 @@ fn group<R>(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui) -> 
 
 fn model_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
     group(ui, i18n::t("Solver"), |ui| {
-        egui::ComboBox::from_id_salt("model")
-            .selected_text(i18n::t("SAM 3D Body · MHR"))
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut 0, 0, i18n::t("SAM 3D Body · MHR"));
-            });
+        // The reference lets the user choose a motion backend (ExMR / GVHMR /
+        // PEAR / …). This build has exactly one — FlowHMR with SAM 3D Body — so
+        // the row is a label, not a combo box with a single dead entry.
+        ui.label(egui::RichText::new(i18n::t("SAM 3D Body · MHR")).size(11.0))
+            .on_hover_text(i18n::t(
+                "The only reconstruction backend in this build; ExMR, GVHMR, PEAR, MAMMA, PromptHMR and GEM-X are not ported",
+            ));
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(i18n::t("Graphs")).size(11.0));

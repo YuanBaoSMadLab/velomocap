@@ -654,7 +654,7 @@ fn painted_labels(
         let x = render::dot(axis, right);
         let y = render::dot(axis, up);
         let tip = centre + egui::vec2(x, -y) * radius;
-        painter.line_segment([centre, tip], egui::Stroke::new(1.4, colour));
+        painter.line_segment([centre, tip], egui::Stroke::new(1.4_f32, colour));
         painter.circle_filled(tip, 7.0, colour);
         painter.text(
             tip + egui::vec2(0.0, -0.5),

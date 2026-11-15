@@ -767,6 +767,8 @@ fn downscale(index: usize, rgb: &[u8], width: usize, height: usize, target: usiz
         }
         velomocap_motion::vram::empty_cuda_cache();
     }
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -359,6 +359,9 @@ enum Command {
     ExportTracks {
         /// Video file.
         video: PathBuf,
+        /// Detection width in pixels (the frame is only ever shrunk to this).
+        #[arg(long, default_value_t = 960)]
+        width: usize,
     },
     /// Estimate per-frame cameras with VGGT-Omega (ONNX, no Python).
     Camera {
@@ -476,7 +479,7 @@ fn main() -> Result<()> {
             confidence,
             cpu,
         } => pose_report(&image, &weights, confidence, !cpu),
-        Command::ExportTracks { video } => export_video_tracks(&video),
+        Command::ExportTracks { video, width } => export_video_tracks(&video, width),
         Command::People {
             video,
             detector,
@@ -750,7 +753,7 @@ fn people_report(
     confidence: f32,
     gpu: bool,
 ) -> Result<()> {
-    use velomocap_motion::{capture_people, PersonTrack, SamConfig};
+    use velomocap_motion::{PersonTrack, SamConfig};
 
     let sam3d = if sam3d.is_dir() {
         sam3d.to_path_buf()
@@ -1320,6 +1323,9 @@ fn flow_report(
             let mut vggt = VggtCamera::load(VggtConfig {
                 weights: resolve_model(camera_weights),
                 interval: camera_interval,
+                // `--limit` bounds the clip, so the camera pass must not read the
+                // whole video for it.
+                max_frames: limit,
                 session: SessionConfig {
                     gpu,
                     ..Default::default()
@@ -1602,11 +1608,26 @@ fn lock_summary(tracks: &velomocap_motion::ContactTracks) -> String {
 }
 
 /// Read a camera track written by `velomocap-cli camera --json`.
+///
+/// The current format is an object (`model_size`, `sample_indices`, `frames`);
+/// a bare array is the older layout and still loads, with the network size and
+/// the sampled frames unknown.
 fn load_camera_track(path: &std::path::Path, frames: usize) -> Result<velomocap_infer::CameraTrack> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading {}", path.display()))?;
-    let rows: serde_json::Value = serde_json::from_str(&text).context("parsing the camera track")?;
-    let rows = rows.as_array().context("the camera track must be a JSON array")?;
+    let document: serde_json::Value =
+        serde_json::from_str(&text).context("parsing the camera track")?;
+    let (rows, header) = match &document {
+        serde_json::Value::Array(rows) => (rows, None),
+        serde_json::Value::Object(map) => {
+            let rows = map
+                .get("frames")
+                .and_then(|value| value.as_array())
+                .context("the camera track needs a `frames` array")?;
+            (rows, Some(map))
+        }
+        _ => anyhow::bail!("the camera track must be a JSON array or object"),
+    };
     anyhow::ensure!(!rows.is_empty(), "{} holds no cameras", path.display());
 
     let mut extrinsics = Vec::with_capacity(rows.len());
@@ -1634,15 +1655,44 @@ fn load_camera_track(path: &std::path::Path, frames: usize) -> Result<velomocap_
     );
     let width = intrinsics[0][0][2] as f64;
     let height = intrinsics[0][1][2] as f64;
+    let image_size = (
+        (2.0 * height).round() as usize,
+        (2.0 * width).round() as usize,
+    );
+    // The network size and the sampled frames come from the header when the file
+    // has one; an old bare array has neither, and the network size then falls
+    // back to the video's own (the track is already un-normalised, so nothing
+    // downstream depends on it).
+    let model_size = header
+        .and_then(|map| map.get("model_size"))
+        .and_then(|value| value.as_array())
+        .filter(|values| values.len() == 2)
+        .map(|values| {
+            (
+                values[0].as_u64().unwrap_or(0) as usize,
+                values[1].as_u64().unwrap_or(0) as usize,
+            )
+        })
+        .filter(|size| size.0 > 0 && size.1 > 0)
+        .unwrap_or(image_size);
+    let sample_indices = header
+        .and_then(|map| map.get("sample_indices"))
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_u64())
+                .map(|index| index as usize)
+                .collect::<Vec<usize>>()
+        })
+        .filter(|indices| !indices.is_empty())
+        .unwrap_or_else(|| (0..extrinsics.len()).collect());
     Ok(velomocap_infer::CameraTrack {
         extrinsics,
         intrinsics,
-        image_size: (
-            (2.0 * height).round() as usize,
-            (2.0 * width).round() as usize,
-        ),
-        model_size: (0, 0),
-        sample_indices: Vec::new(),
+        image_size,
+        model_size,
+        sample_indices,
     })
 }
 
@@ -1968,12 +2018,12 @@ fn track_video(
 }
 
 /// Same export the GUI's "Export tracks" button writes.
-fn export_video_tracks(video: &std::path::Path) -> Result<()> {
+fn export_video_tracks(video: &std::path::Path, width: usize) -> Result<()> {
     use velomocap_infer::{Detector, DetectorConfig, Tracker};
     use velomocap_video::{Decoder, Tools};
 
     let tools = Tools::discover()?;
-    let mut decoder = Decoder::open(&tools, video, Some(960))?;
+    let mut decoder = Decoder::open(&tools, video, Some(width.max(2)))?;
     let info = decoder.info().clone();
     let mut detector = Detector::load("models/detector/yolov8x.onnx", DetectorConfig::default())?;
     let mut tracker = Tracker::new(0.3, 8);
@@ -2051,7 +2101,21 @@ fn camera_track(
     }
 
     if let Some(path) = json {
-        let mut rows = String::from("[");
+        // The header carries what the intrinsics cannot: the network input size
+        // (so a reloaded track does not claim `0x0`) and which frames the graph
+        // actually looked at. `frames` keeps the original array shape, and the
+        // reader also accepts a bare array for older files.
+        let samples: Vec<String> = track
+            .sample_indices
+            .iter()
+            .map(|index| index.to_string())
+            .collect();
+        let mut rows = format!(
+            "{{\n \"model_size\": [{}, {}],\n \"sample_indices\": [{}],\n \"frames\": [",
+            track.model_size.0,
+            track.model_size.1,
+            samples.join(",")
+        );
         for (i, matrix) in track.extrinsics.iter().enumerate() {
             if i > 0 {
                 rows.push(',');
@@ -2072,7 +2136,7 @@ fn camera_track(
                 k.join(",")
             ));
         }
-        rows.push_str("\n]");
+        rows.push_str("\n ]\n}");
         std::fs::write(&path, rows)?;
         println!("camera track -> {}", path.display());
     }

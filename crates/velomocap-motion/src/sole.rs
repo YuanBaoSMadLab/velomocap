@@ -18,7 +18,7 @@
 //! maths assume.
 
 use anyhow::Result;
-use velomocap_body::{BodyModel, Pose, Skeleton};
+use velomocap_body::{BodyModel, Skeleton};
 
 /// One foot's two sole patches: back (heel side) then front (toe side).
 pub type FootProbes = [[f32; 3]; 2];
@@ -216,19 +216,25 @@ impl SoleGeometry {
                 let index = foot * 2 + side;
                 let patch = &skinned[offset..offset + self.patches[index].len()];
                 offset += self.patches[index].len();
+                // `patch[:, proxy].mean(1)`: the probe is the centroid of the 24
+                // lowest proxy vertices (the sole surface), not of the whole
+                // region — the region also covers the arch and the sides, which
+                // would pull the point off the contact patch.
+                let proxy = &self.proxies[index];
                 let mut sum = [0.0f32; 3];
-                for vertex in 0..patch.len() {
-                    let at = vertex;
+                for at in proxy {
                     for axis in 0..3 {
-                        sum[axis] += patch[at][axis];
+                        sum[axis] += patch[*at][axis];
                     }
                 }
-                let count = patch.len().max(1) as f32;
+                let count = proxy.len().max(1) as f32;
                 let mut point = [sum[0] / count, sum[1] / count, sum[2] / count];
-                let mut ys: Vec<f32> = patch.iter().map(|v| v[1]).collect();
-                ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let take = (ys.len() / 10).max(3).min(ys.len());
-                point[1] = ys[..take].iter().sum::<f32>() / take as f32;
+                // `value[:,1] = patch[...,1].min(1)`: the patch's own lowest
+                // vertex is the surface that touches the ground.
+                point[1] = patch
+                    .iter()
+                    .map(|v| v[1])
+                    .fold(f32::INFINITY, f32::min);
                 out[foot][side] = point;
             }
         }
@@ -244,6 +250,7 @@ impl SoleGeometry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use velomocap_body::Pose;
 
     fn loaded() -> Option<(BodyModel, Vec<f32>)> {
         let path = [

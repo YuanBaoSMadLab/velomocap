@@ -6,7 +6,6 @@
 //!
 //! | Reference | Here |
 //! | --- | --- |
-//! | `IK::TwoBoneIk`, `IK::OneBoneIk` | `ik::two_bone_ik`, `ik::one_bone_ik` |
 //! | `prepare_contacts` (flat mode) | `contacts::prepare`, applied by `detect` |
 //! | `airborne_excursions` | `contacts` (it owns the flight mask) |
 //! | the root X/Z drift (`interp` + `gaussian_filter1d`, 12 cm cap) | `foot_lock`, `interpolate` |
@@ -43,7 +42,7 @@
 //! | Reference | Why |
 //! | --- | --- |
 //! | `contact_arm_plan.solve`'s two anchor x/z variables per stance | they let two overlapping palm supports be satisfied at once; this pass pins one palm at a time |
-//! | `contact_arm_plan.solve`'s two anchor x/z variables per stance | they let two overlapping palm supports be satisfied at once; this pass pins one palm at a time |
+//! | `IK::TwoBoneIk`, `IK::OneBoneIk` | no counterpart: the leg solve is `anatomical::solve_leg` (a clamped two-bone solve on the calibrated knee hinge) and the arm solve is `solve_arm` + `arm_plan`. The reference's two IK bodies were ported, found to have no caller, and removed |
 //! | the world-fixed palm offset used inside the reference's `predict` | kept live here instead (`palm = wrist + R_upper·R_elbow·R_wrist_local·offset`), because a fixed world offset no longer matches the palm the applied pose produces once the arm swings |
 //! | the pose plan's per-swing-target height variables and its predicted (flex, hip rotation) state | the state exists to regularise the joint solve; this port bounds the root against the same `reach`/`minimum_reach` limits directly, and measures neutral on both fixtures |
 //! | `CorrectJointRotations` | no counterpart on purpose: it only moves a bone whose `fullBodyMask` is set, and the reference's own call passes a mask of zeros (`RGBMocap/mocap/correction.py` builds `c` from the contact array and passes `zero` for every body mask), so it is a no-op in that path |
@@ -116,9 +115,13 @@ pub struct CorrectionSettings {
     /// while keeping a 0.5 s arm swing intact.
     pub smoothing: f64,
     /// Use the skinned foot-mesh sole points instead of the joint approximation.
-    /// Off until the probe extraction matches the reference exactly: with the
-    /// current selection the anchor follows the mesh and the quality guard rolls
-    /// the whole correction back.
+    ///
+    /// **On by default**, because it is what the reference does (`SoleGeometry`):
+    /// the probes are skinned surface vertices and the 24 lowest proxy vertices
+    /// are the sole. The joint approximation (ankle + a guessed heel) is the
+    /// fallback for a body without `posedirs`, and it is measurably worse — the
+    /// heel position is a constant fraction of the foot axis rather than the
+    /// mesh.
     pub mesh_sole: bool,
     /// Run the contact IK on the legs. On by default (the reference always runs
     /// its `DoContactIK`); it pins each stance's ankle to the rolling anchor, but
@@ -2493,7 +2496,7 @@ mod tests {
     /// the arm path would only ever be exercised by its unit tests.
     #[test]
     fn a_planted_palm_is_detected_and_held() {
-        let Some((body, rest)) = loaded() else {
+        let Some((body, _rest)) = loaded() else {
             return;
         };
         let betas = vec![0.0f32; 16];
@@ -2663,7 +2666,7 @@ mod tests {
         let frames = 40;
         let stances = vec![(0usize, 8usize), (30usize, 38usize)];
         let mut anchors = vec![[0.0f32; 3]; frames];
-        let mut support = vec![[0.0f32; 3]; frames];
+        let support = vec![[0.0f32; 3]; frames];
         for frame in 0..8 {
             anchors[frame] = [0.0, 0.0, 0.0];
         }
