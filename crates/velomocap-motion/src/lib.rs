@@ -10,6 +10,7 @@ pub mod export;
 pub mod fit;
 pub mod flow;
 pub mod ik;
+pub mod locks;
 pub mod palm;
 pub mod pipeline;
 pub mod pose_plan;
@@ -33,6 +34,7 @@ pub use pipeline::{
     CaptureResult, FitSink, FrameSink, Progress, Timings,
 };
 pub use fit::{fit_sequence, summarise, FitConfig, FittedFrame, Fitter};
+pub use locks::{ContactTracks, Interval, LOCK_VERSION, TRACK_COUNT, TRACK_LABELS};
 pub use sam::{
     capture_people, capture_people_with, PeopleCapture, PersonFrame, PersonTrack, SamConfig,
     SamHooks,

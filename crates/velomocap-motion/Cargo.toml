@@ -11,4 +11,6 @@ velomocap-body = { path = "../velomocap-body" }
 velomocap-infer = { path = "../velomocap-infer" }
 velomocap-video = { path = "../velomocap-video" }
 anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 velomocap-cpp = { path = "../velomocap-cpp" }

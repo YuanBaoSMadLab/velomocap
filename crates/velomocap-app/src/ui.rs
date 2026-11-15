@@ -6,7 +6,7 @@
 
 use eframe::egui;
 
-use crate::app::VeloMocap;
+use crate::app::{LockDrag, LockGrab, VeloMocap};
 use crate::i18n;
 use crate::capture::CaptureStage;
 use crate::viewport::{self, Scene, ViewMode};
@@ -1235,6 +1235,346 @@ fn tracks(app: &mut VeloMocap, ui: &mut egui::Ui) {
             }
         });
     }
+    // Contact locks: four sparse tracks per clip, drawn under the person rows so
+    // a lock reads against the video above it (the reference's `footlock_editor`).
+    if !app.flow.is_empty() || !app.people.is_empty() {
+        app.load_locks_if_needed();
+        lock_rows(app, ui, frames);
+    }
+}
+
+/// Colours of the four lock tracks, in the reference's order.
+const LOCK_COLOURS: [egui::Color32; 4] = [
+    egui::Color32::from_rgb(0x56, 0xb6, 0xa7),
+    egui::Color32::from_rgb(0xc7, 0x8f, 0x5f),
+    egui::Color32::from_rgb(0x79, 0xa9, 0xdb),
+    egui::Color32::from_rgb(0xbf, 0x8d, 0xcf),
+];
+
+/// Edge grab tolerance in pixels, like the reference's six-pixel edges.
+const LOCK_EDGE: f32 = 6.0;
+
+/// Where one drag wants a lock's interval to be.
+///
+/// Pure on purpose: the whole editing model (grow from the press, drag an edge
+/// without crossing the other one, slide a lock without leaving the clip) is
+/// testable without a window.
+fn lock_frame_edit(
+    grab: LockGrab,
+    anchor: usize,
+    interval: [usize; 2],
+    frame: usize,
+    frames: usize,
+) -> [usize; 2] {
+    let [start, end] = interval;
+    let limit = frames.max(1);
+    match grab {
+        LockGrab::Start => [frame.min(end.saturating_sub(1)), end],
+        LockGrab::End => [start, (frame + 1).max(start + 1).min(limit)],
+        LockGrab::New => {
+            let (low, high) = (anchor.min(frame), anchor.max(frame) + 1);
+            [low, high.min(limit).max(low + 1)]
+        }
+        LockGrab::Move => {
+            let span = end.saturating_sub(start).max(1);
+            let delta = frame as i64 - anchor as i64;
+            let mut moved = (start as i64 + delta).max(0) as usize;
+            if moved + span > limit {
+                moved = limit.saturating_sub(span);
+            }
+            [moved, (moved + span).min(limit)]
+        }
+    }
+}
+
+fn lock_rows(app: &mut VeloMocap, ui: &mut egui::Ui, frames: usize) {
+    let frame_of = |rect: egui::Rect, x: f32| track_frame(x, rect, frames);
+    let x_of = |rect: egui::Rect, frame: usize| {
+        let last = frames.max(2) - 1;
+        rect.left() + rect.width() * (frame.min(last) as f32 / last as f32)
+    };
+
+    // Delete the selection, undo/redo the edits.
+    if let Some((track, index)) = app.selected_lock {
+        let delete = ui.input(|state| {
+            state.key_pressed(egui::Key::Delete) || state.key_pressed(egui::Key::Backspace)
+        });
+        if delete && app.locks.track(track).is_some_and(|list| index < list.len()) {
+            app.delete_selected_lock();
+        }
+    }
+    let undo = ui.input(|state| state.modifiers.command && state.key_pressed(egui::Key::Z));
+    let redo_y = ui.input(|state| state.modifiers.command && state.key_pressed(egui::Key::Y));
+    let shift = ui.input(|state| state.modifiers.shift);
+    if undo {
+        if shift {
+            app.redo_lock();
+        } else {
+            app.undo_lock();
+        }
+    }
+    if redo_y {
+        app.redo_lock();
+    }
+
+    for track in 0..velomocap_motion::TRACK_COUNT {
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [64.0, 15.0],
+                egui::Label::new(
+                    egui::RichText::new(i18n::t(velomocap_motion::TRACK_LABELS[track]))
+                        .size(10.5)
+                        .color(TEXT),
+                ),
+            );
+            let width = ui.available_width();
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(width, 15.0), egui::Sense::click_and_drag());
+            let colour = LOCK_COLOURS[track];
+
+            // Press: grab an edge, the body of a lock, or empty space (a new
+            // lock grows from there, like the reference's editor).
+            if response.is_pointer_button_down_on() && app.lock_drag.is_none() {
+                if let Some(position) = response.interact_pointer_pos() {
+                    let frame = frame_of(rect, position.x);
+                    let before = app.locks.track(track).map(<[_]>::to_vec);
+                    let mut grab = (LockGrab::New, None);
+                    if let Some(intervals) = app.locks.track(track) {
+                        for (index, [start, end]) in intervals.iter().enumerate() {
+                            let (left, right) = (x_of(rect, *start), x_of(rect, *end));
+                            if (position.x - left).abs() <= LOCK_EDGE {
+                                grab = (LockGrab::Start, Some(index));
+                                break;
+                            }
+                            if (position.x - right).abs() <= LOCK_EDGE {
+                                grab = (LockGrab::End, Some(index));
+                                break;
+                            }
+                            if left <= position.x && position.x <= right {
+                                grab = (LockGrab::Move, Some(index));
+                                break;
+                            }
+                        }
+                    }
+                    if grab.0 == LockGrab::New {
+                        let mut list = before.clone().unwrap_or_default();
+                        list.push([frame, (frame + 1).min(frames)]);
+                        app.locks.set_track(track, list);
+                        app.locks.normalise(frames);
+                    }
+                    let index = match grab.1 {
+                        Some(index) => Some(index),
+                        None => app
+                            .locks
+                            .track(track)
+                            .and_then(|list| list.iter().position(|block| block.contains(&frame))),
+                    };
+                    app.selected_lock = index.map(|index| (track, index));
+                    app.lock_drag = Some(LockDrag {
+                        track,
+                        grab: grab.0,
+                        anchor: frame,
+                        index,
+                        before,
+                        moved: false,
+                    });
+                }
+            }
+
+            // Drag: recompute the grabbed lock; the release turns it into one
+            // undo step (a press that never moved stays a plain scrub).
+            if app.lock_drag.as_ref().is_some_and(|drag| drag.track == track) {
+                let pointer = ui.ctx().pointer_latest_pos();
+                if let Some(position) = pointer {
+                    let mut drag = app.lock_drag.clone().expect("checked above");
+                    let frame = frame_of(rect, position.x);
+                    if let Some(index) = drag.index {
+                        if let Some(interval) = app
+                            .locks
+                            .track(track)
+                            .and_then(|list| list.get(index).copied())
+                        {
+                            let next = lock_frame_edit(drag.grab, drag.anchor, interval, frame, frames);
+                            if next != interval {
+                                let mut list =
+                                    app.locks.track(track).map(<[_]>::to_vec).unwrap_or_default();
+                                if let Some(slot) = list.get_mut(index) {
+                                    *slot = next;
+                                }
+                                app.locks.set_track(track, list);
+                                app.locks.normalise(frames);
+                                // Normalising can merge or reorder, so the
+                                // selection follows the frame it was made at.
+                                if let Some(now) = app.locks.track(track).and_then(|list| {
+                                    list.iter()
+                                        .position(|block| block[0] <= next[0] && next[0] < block[1])
+                                }) {
+                                    app.selected_lock = Some((track, now));
+                                    drag.index = Some(now);
+                                }
+                                drag.moved = drag.moved || frame != drag.anchor;
+                            }
+                        }
+                    }
+                    app.lock_drag = Some(drag);
+                }
+                let released = response.drag_stopped() || !response.is_pointer_button_down_on();
+                if released {
+                    let drag = app.lock_drag.take().expect("checked above");
+                    if drag.grab == LockGrab::New && !drag.moved {
+                        match drag.before {
+                            Some(list) => app.locks.set_track(track, list),
+                            None => app.locks.reset_track(track),
+                        }
+                        app.selected_lock = None;
+                    } else {
+                        app.locks.normalise(frames);
+                        app.push_lock_edit(track, drag.before);
+                    }
+                }
+            }
+
+            // Draw the track.
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(0x1c, 0x1c, 0x1c));
+            match app.locks.track(track) {
+                Some(intervals) => {
+                    for (index, [start, end]) in intervals.iter().enumerate() {
+                        let left = x_of(rect, *start);
+                        let right = x_of(rect, (*end).min(frames.saturating_sub(1)));
+                        let bar = egui::Rect::from_min_max(
+                            egui::pos2(left, rect.top() + 2.0),
+                            egui::pos2((right.max(left + 1.0)).min(rect.right()), rect.bottom() - 2.0),
+                        );
+                        let selected = app.selected_lock == Some((track, index));
+                        painter.rect_filled(
+                            bar,
+                            1.0,
+                            colour.gamma_multiply(if selected { 0.95 } else { 0.6 }),
+                        );
+                        painter.rect_stroke(
+                            bar,
+                            1.0,
+                            egui::Stroke::new(
+                                if selected { 1.6 } else { 1.0 },
+                                if selected {
+                                    egui::Color32::from_rgb(0xd9, 0xe8, 0xfa)
+                                } else {
+                                    colour
+                                },
+                            ),
+                            egui::StrokeKind::Inside,
+                        );
+                        if bar.width() > 42.0 {
+                            painter.text(
+                                bar.center(),
+                                egui::Align2::CENTER_CENTER,
+                                if selected {
+                                    format!("{}–{}", start + 1, end)
+                                } else {
+                                    i18n::t("Lock").to_string()
+                                },
+                                egui::FontId::proportional(9.5),
+                                egui::Color32::from_rgb(0x0d, 0x0d, 0x0d),
+                            );
+                        }
+                    }
+                }
+                None => {
+                    painter.text(
+                        rect.left_center() + egui::vec2(6.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        i18n::t("automatic"),
+                        egui::FontId::proportional(9.5),
+                        MUTED,
+                    );
+                }
+            }
+            let x = rect.left()
+                + rect.width()
+                    * (app.playhead.min(frames - 1) as f32 / (frames.max(2) - 1) as f32);
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(0xe8, 0xe8, 0xe8)),
+            );
+
+            // The reference's context menu, item for item.
+            response.clone().context_menu(|ui| {
+                ui.label(i18n::t(velomocap_motion::TRACK_LABELS[track]));
+                if ui.button(i18n::t("Add lock here")).clicked() {
+                    let frame = ui
+                        .ctx()
+                        .pointer_latest_pos()
+                        .map(|position| frame_of(rect, position.x))
+                        .unwrap_or(app.playhead);
+                    let before = app.locks.track(track).map(<[_]>::to_vec);
+                    let mut list = before.clone().unwrap_or_default();
+                    list.push([frame, (frame + 1).min(frames)]);
+                    app.locks.set_track(track, list);
+                    app.locks.normalise(frames);
+                    app.push_lock_edit(track, before);
+                    ui.close();
+                }
+                let selected = app.selected_lock.map(|(index, _)| index) == Some(track);
+                if ui
+                    .add_enabled(selected, egui::Button::new(i18n::t("Delete lock")))
+                    .clicked()
+                {
+                    app.delete_selected_lock();
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(!app.lock_undo.is_empty(), egui::Button::new(i18n::t("Undo")))
+                    .clicked()
+                {
+                    app.undo_lock();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(!app.lock_redo.is_empty(), egui::Button::new(i18n::t("Redo")))
+                    .clicked()
+                {
+                    app.redo_lock();
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(
+                        app.locks.track(track).is_some(),
+                        egui::Button::new(i18n::t("Reset this track to automatic")),
+                    )
+                    .clicked()
+                {
+                    app.reset_locks(Some(track));
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        !app.locks.is_automatic(),
+                        egui::Button::new(i18n::t("Reset all locks to automatic")),
+                    )
+                    .clicked()
+                {
+                    app.reset_locks(None);
+                    ui.close();
+                }
+            });
+            if response.clicked() {
+                if let Some(position) = response.interact_pointer_pos() {
+                    app.seek_to(frame_of(rect, position.x));
+                    app.playing = false;
+                }
+            }
+        });
+    }
+    if app.locks_dirty {
+        ui.label(
+            egui::RichText::new(i18n::t("Locks edited — re-run to apply them"))
+                .size(9.5)
+                .color(MUTED),
+        );
+    }
 }
 
 fn sidebar(app: &mut VeloMocap, ctx: &egui::Context) {
@@ -1846,6 +2186,37 @@ fn person_palette() -> [egui::Color32; 5] {
 
 #[cfg(test)]
 mod tests {
+    /// The lock drag arithmetic: growing from the press, dragging an edge
+    /// without crossing the other one, and sliding a lock inside the clip.
+    #[test]
+    fn dragging_a_lock_edits_the_interval_it_grabbed() {
+        use super::{lock_frame_edit, LockGrab};
+        let frames = 100;
+        // A new lock grows from the press in either direction.
+        assert_eq!(lock_frame_edit(LockGrab::New, 10, [10, 11], 15, frames), [10, 16]);
+        assert_eq!(lock_frame_edit(LockGrab::New, 10, [10, 11], 4, frames), [4, 11]);
+        // Edges move, but never past each other.
+        assert_eq!(lock_frame_edit(LockGrab::Start, 10, [10, 20], 5, frames), [5, 20]);
+        assert_eq!(lock_frame_edit(LockGrab::Start, 10, [10, 20], 30, frames), [19, 20]);
+        assert_eq!(lock_frame_edit(LockGrab::End, 10, [10, 20], 30, frames), [10, 31]);
+        assert_eq!(lock_frame_edit(LockGrab::End, 10, [10, 20], 0, frames), [10, 11]);
+        // The body slides with the pointer and stays inside the clip.
+        assert_eq!(lock_frame_edit(LockGrab::Move, 15, [10, 20], 25, frames), [20, 30]);
+        assert_eq!(lock_frame_edit(LockGrab::Move, 0, [0, 10], 500, frames), [90, 100]);
+        assert_eq!(lock_frame_edit(LockGrab::Move, 50, [45, 55], 0, frames), [0, 10]);
+    }
+
+    /// An edit can only write frames the clip has.
+    #[test]
+    fn a_lock_never_leaves_the_clip() {
+        use super::{lock_frame_edit, LockGrab};
+        for grab in [LockGrab::New, LockGrab::Move, LockGrab::Start, LockGrab::End] {
+            let result = lock_frame_edit(grab, 3, [3, 6], 9_999, 10);
+            assert!(result[1] <= 10, "{grab:?} wrote past the end: {result:?}");
+            let result = lock_frame_edit(grab, 3, [3, 6], 0, 10);
+            assert!(result[1] > result[0], "{grab:?} emptied the lock: {result:?}");
+        }
+    }
     use super::track_frame;
 
     /// Clicking a track row must land on the frame under the pointer, and must

@@ -266,6 +266,20 @@ pub fn apply(
     body: &BodyModel,
     settings: &CorrectionSettings,
 ) -> Result<CorrectionReport> {
+    apply_with_locks(clip, body, settings, &crate::locks::ContactTracks::automatic())
+}
+
+/// Apply the correction with hand-drawn contact timing.
+///
+/// The tracks are data, not a setting: they belong to one clip, so they travel
+/// beside the settings rather than inside them (which is also what lets an
+/// existing caller keep using plain [`apply`]).
+pub fn apply_with_locks(
+    clip: &mut FlowClip,
+    body: &BodyModel,
+    settings: &CorrectionSettings,
+    locks: &crate::locks::ContactTracks,
+) -> Result<CorrectionReport> {
     let mut report = CorrectionReport::default();
     if !settings.enabled {
         return Ok(report);
@@ -302,14 +316,14 @@ pub fn apply(
     let before = quality(&clip.skeletons, settings.floor);
 
     if settings.foot {
-        foot_lock(sole.as_ref(), clip, settings, &thresholds, &mut report);
+        foot_lock(sole.as_ref(), clip, settings, locks, &thresholds, &mut report);
         ground_feet(clip, body, settings, &thresholds, &mut report);
         if settings.pose_plan {
             pose_plan_window(clip, body, settings, &mut report);
         }
     }
     if settings.hand {
-        hand_lock(clip, body, settings, &mut report);
+        hand_lock(clip, body, settings, locks, &mut report);
     }
     // Kimodo's order: end effectors (hands) first, then the contact IK that
     // stabilises the legs on the ground.
@@ -1446,6 +1460,7 @@ fn foot_lock(
     sole: Option<&Sole>,
     clip: &mut FlowClip,
     settings: &CorrectionSettings,
+    locks: &crate::locks::ContactTracks,
     thresholds: &Thresholds,
     report: &mut CorrectionReport,
 ) {
@@ -1475,8 +1490,16 @@ fn foot_lock(
     }
 
     for (foot_index, (ankle, toe)) in feet.into_iter().enumerate() {
+        // A hand-edited track replaces the detected mask for this foot, which is
+        // what the reference does with `contact_ranges` — except that it clears
+        // both feet at once; per track is the same thing for the editor's
+        // workflow and keeps an untouched foot on its own detection.
+        let manual = locks.runs(foot_index, count);
         let contact = contact_mask(sole, clip, foot_index, ankle, toe, thresholds, fps);
-        let runs = contact_runs(&contact, thresholds.min_run);
+        let runs = match &manual {
+            Some(runs) => runs.clone(),
+            None => contact_runs(&contact, thresholds.min_run),
+        };
         if runs.is_empty() {
             continue;
         }
@@ -1493,9 +1516,16 @@ fn foot_lock(
             // contact patch still instead of jumping at the middle of the run.
             let path = rolling_anchor(sole, clip, *begin, *end, foot_index, ankle, toe, ground);
             // Weak presets hold 60% of the correction, and a low network contact
-            // probability softens it further instead of dropping the contact.
-            let hold =
-                thresholds.strength * contact_confidence(clip, *begin, *end, thresholds.confidence);
+            // probability softens it further instead of dropping the contact. A
+            // hand-drawn lock is the user's decision, so it is held at full
+            // strength: the network's own guess must not soften it.
+            let hold = match &manual {
+                Some(_) => thresholds.strength,
+                None => {
+                    thresholds.strength
+                        * contact_confidence(clip, *begin, *end, thresholds.confidence)
+                }
+            };
             report.foot_contacts += 1;
             for (offset, index) in (*begin..*end).enumerate() {
                 anchors[index] = path[offset];
@@ -1591,6 +1621,7 @@ fn hand_lock(
     clip: &mut FlowClip,
     body: &BodyModel,
     settings: &CorrectionSettings,
+    locks: &crate::locks::ContactTracks,
     report: &mut CorrectionReport,
 ) {
     let fps = clip.fps.max(1.0);
@@ -1636,7 +1667,14 @@ fn hand_lock(
         } else {
             (RIGHT_SHOULDER, RIGHT_ELBOW, RIGHT_WRIST)
         };
-        for (begin, end) in planned.runs[hand_index].iter().cloned() {
+        // Tracks 2 and 3 are the hands, in the same order as the feet
+        // (`flow_correction.py` splits `ranges[2:]` off for `apply_hands`).
+        let runs = match locks.runs(crate::locks::LEFT_HAND + hand_index, count)
+        {
+            Some(runs) => runs,
+            None => planned.runs[hand_index].clone(),
+        };
+        for (begin, end) in runs.iter().cloned() {
             let mut columns = [Vec::new(), Vec::new(), Vec::new()];
             for index in begin..end {
                 let palm_point = points[index][hand_index];
@@ -2357,6 +2395,73 @@ mod tests {
     /// The chain the IK solves on must reproduce `forward_joints` exactly,
     /// otherwise the solver aims at a different skeleton than the viewport and
     /// the exporter see.
+    /// A hand-drawn lock is honoured exactly where it was drawn, even on a clip
+    /// the detector rejects: the tracks replace the contact mask per limb, and a
+    /// track that was emptied means that limb never touches the ground (which is
+    /// what deleting every lock in the reference's editor means).
+    #[test]
+    fn manual_tracks_replace_the_detected_contacts() {
+        let Some((body, _rest)) = loaded() else {
+            eprintln!("skipping: SMPL-H model not found");
+            return;
+        };
+        // The actor slides sideways at 3.6 m/s: fast enough that no frame passes
+        // the detector's speed gate, so every contact below comes from the tracks.
+        let frames = 30usize;
+        let build = |body: &BodyModel| {
+            let mut pose = Pose::neutral(body.num_joints, 16);
+            let mut skeletons = Vec::with_capacity(frames);
+            let mut poses = Vec::with_capacity(frames);
+            for frame in 0..frames {
+                pose.translation = [frame as f32 * 0.12, 0.0, 0.0];
+                skeletons.push(body.forward_joints(&pose));
+                poses.push(pose.clone());
+            }
+            FlowClip {
+                fps: 30.0,
+                poses,
+                skeletons,
+                rot6d: Vec::new(),
+                trans: vec![[0.0; 3]; frames],
+                betas: vec![0.0; 16],
+                foot_contacts: Vec::new(),
+                floor: 0.0,
+                floor_from_mesh: false,
+                offset: [0.0; 3],
+                source_frames: (0..frames).collect(),
+                anchors: 0,
+                anchor_residual: [0.0; 3],
+            }
+        };
+        let thresholds = CorrectionSettings::default().thresholds();
+        let settings = CorrectionSettings::default();
+        let mut tracks = crate::locks::ContactTracks::automatic();
+        let mut report = CorrectionReport::default();
+        let mut clip = build(&body);
+        foot_lock(None, &mut clip, &settings, &tracks, &thresholds, &mut report);
+        assert_eq!(report.foot_contacts, 0, "a sliding clip has no stance");
+        tracks.set_track(crate::locks::LEFT_FOOT, vec![[4, 12]]);
+        tracks.set_track(crate::locks::RIGHT_FOOT, vec![[16, 24]]);
+        let mut report = CorrectionReport::default();
+        let mut clip = build(&body);
+        foot_lock(None, &mut clip, &settings, &tracks, &thresholds, &mut report);
+        assert_eq!(report.foot_contacts, 2, "one run per locked foot");
+
+        // Emptying a track is not "back to automatic": it says no contact.
+        tracks.set_track(crate::locks::LEFT_FOOT, Vec::new());
+        let mut report = CorrectionReport::default();
+        let mut clip = build(&body);
+        foot_lock(None, &mut clip, &settings, &tracks, &thresholds, &mut report);
+        assert_eq!(report.foot_contacts, 1, "the empty track locks nothing");
+
+        // And resetting every track goes back to detection, which finds nothing.
+        tracks.reset();
+        let mut report = CorrectionReport::default();
+        let mut clip = build(&body);
+        foot_lock(None, &mut clip, &settings, &tracks, &thresholds, &mut report);
+        assert_eq!(report.foot_contacts, 0, "back to automatic detection");
+    }
+
     #[test]
     fn forward_chain_matches_forward_joints() {
         let Some((body, rest)) = loaded() else {
@@ -2467,7 +2572,8 @@ mod tests {
         let thresholds = settings.thresholds();
         let _ = thresholds;
         let mut report = CorrectionReport::default();
-        hand_lock(&mut clip, &body, &settings, &mut report);
+        let tracks = crate::locks::ContactTracks::automatic();
+        hand_lock(&mut clip, &body, &settings, &tracks, &mut report);
         assert_eq!(report.hand_contacts, 1, "the planted palm was not found");
         assert!(report.ik_frames >= frames - 8, "only {} IK frames", report.ik_frames);
 

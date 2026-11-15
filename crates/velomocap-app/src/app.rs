@@ -144,6 +144,40 @@ pub struct Candidate {
     pub score: f32,
     pub selected: bool,
 }
+
+/// One whole-track edit, so an undo restores the track exactly.
+#[derive(Clone, Debug)]
+pub struct LockEdit {
+    pub track: usize,
+    /// `None` = the track was automatic before the edit.
+    pub before: Option<Vec<velomocap_motion::Interval>>,
+    pub after: Option<Vec<velomocap_motion::Interval>>,
+}
+
+/// Which part of a lock a drag grabbed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockGrab {
+    /// Empty track: a new lock grows from where the press landed.
+    New,
+    /// Between the two edges: the whole lock follows the pointer.
+    Move,
+    Start,
+    End,
+}
+
+/// A drag on a lock row, held until the button comes up.
+#[derive(Clone, Debug)]
+pub struct LockDrag {
+    pub track: usize,
+    pub grab: LockGrab,
+    /// Frame the press landed on.
+    pub anchor: usize,
+    /// The lock being edited, if any.
+    pub index: Option<usize>,
+    pub before: Option<Vec<velomocap_motion::Interval>>,
+    /// Whether the pointer left the press pixel, so a stray click stays a click.
+    pub moved: bool,
+}
 pub struct VeloMocap {
     pub video: Option<PathBuf>,
     pub detector: PathBuf,
@@ -225,6 +259,20 @@ pub struct VeloMocap {
     /// Re-express the exported rotations in the canonical rest frames, so a rig
     /// that binds in the canonical T-pose plays this clip exactly.
     pub export_rest_correct: bool,
+    /// Hand-drawn contact timing for the selected clip: four sparse tracks of
+    /// frame intervals (left foot, right foot, left hand, right hand).
+    pub locks: velomocap_motion::ContactTracks,
+    /// The lock the user is working on, as `(track, index)`.
+    pub selected_lock: Option<(usize, usize)>,
+    /// Whole-track snapshots, so one edit is one undo step.
+    pub lock_undo: Vec<LockEdit>,
+    pub lock_redo: Vec<LockEdit>,
+    /// A drag in progress on one of the lock rows.
+    pub lock_drag: Option<LockDrag>,
+    /// Loaded lazily, once the probe has reported the frame count.
+    locks_pending: bool,
+    /// The locks changed since the clip was generated: the next run applies them.
+    pub locks_dirty: bool,
     pub console: Vec<String>,
     pub show_console: bool,
     pub show_help: bool,
@@ -352,6 +400,13 @@ impl VeloMocap {
             export_note: None,
             export_rig: velomocap_motion::retarget::Rig::Biped,
             export_rest_correct: false,
+            locks: velomocap_motion::ContactTracks::automatic(),
+            selected_lock: None,
+            lock_undo: Vec::new(),
+            lock_redo: Vec::new(),
+            lock_drag: None,
+            locks_pending: true,
+            locks_dirty: false,
             console: Vec::new(),
             show_console: false,
             show_help: false,
@@ -725,7 +780,10 @@ impl VeloMocap {
                 camera_weights: self.camera_weights.clone(),
                 max_frames: self.max_frames,
                 gpu: self.gpu && self.memory_mode.uses_gpu(),
-                correction: self.correction,
+                // The hand-drawn contact timing travels with the run; the clip's
+                // own detection fills every track the user left alone.
+                correction: self.correction.clone(),
+                locks: self.locks.clone(),
                 estimate_camera: self.estimate_camera,
                 refine_camera: self.refine_camera,
             }),
@@ -744,6 +802,154 @@ impl VeloMocap {
             self.log("Cancellation requested.");
         }
     }
+    /// Where the hand-drawn contact timing of this clip lives.
+    pub fn locks_path(&self) -> Option<PathBuf> {
+        self.video
+            .as_ref()
+            .map(|video| video.with_extension("locks.json"))
+    }
+
+    /// Read the saved locks once the probe has told us the frame count.
+    ///
+    /// A stale document (another clip, a re-cut video) is reported and dropped
+    /// instead of being applied to motion it does not describe.
+    pub fn load_locks_if_needed(&mut self) {
+        if !self.locks_pending || self.video_frames == 0 {
+            return;
+        }
+        self.locks_pending = false;
+        let Some(path) = self.locks_path() else {
+            return;
+        };
+        if !path.exists() {
+            return;
+        }
+        let (locks, note) = velomocap_motion::ContactTracks::load(
+            &path,
+            self.frame_count(),
+            self.current_fps(),
+        );
+        match note {
+            None => {
+                if !locks.is_automatic() {
+                    let total: usize = locks
+                        .counts()
+                        .iter()
+                        .filter_map(|count| *count)
+                        .sum();
+                    self.log(format!(
+                        "Contact locks: {total} locks from {}",
+                        path.display()
+                    ));
+                }
+                self.locks = locks;
+            }
+            Some(note) => {
+                self.log(format!("Contact locks ignored: {note}"));
+                self.locks = velomocap_motion::ContactTracks::automatic();
+            }
+        }
+        self.lock_undo.clear();
+        self.lock_redo.clear();
+    }
+
+    /// Write the locks next to the clip; called after every edit.
+    pub fn save_locks(&mut self) {
+        let Some(path) = self.locks_path() else {
+            return;
+        };
+        let frames = self.frame_count();
+        let fps = self.current_fps();
+        self.locks = self.locks.normalised(frames);
+        match self.locks.save(&path, frames, fps) {
+            Ok(()) => self.locks_dirty = true,
+            Err(error) => {
+                self.error = Some(format!("{error:#}"));
+            }
+        }
+    }
+
+    /// Remember one track as it was before an edit and record the edit.
+    pub fn push_lock_edit(&mut self, track: usize, before: Option<Vec<velomocap_motion::Interval>>) {
+        let after = self.locks.track(track).map(<[_]>::to_vec);
+        if before == after {
+            return;
+        }
+        self.lock_undo.push(LockEdit {
+            track,
+            before,
+            after,
+        });
+        // The reference keeps 100 steps; a contact edit is cheaper to lose than
+        // the whole take.
+        if self.lock_undo.len() > 100 {
+            self.lock_undo.remove(0);
+        }
+        self.lock_redo.clear();
+        self.save_locks();
+    }
+
+    fn apply_lock_edit(&mut self, edit: &LockEdit, forward: bool) {
+        let target = if forward { &edit.after } else { &edit.before };
+        match target.clone() {
+            Some(track) => self.locks.set_track(edit.track, track),
+            None => self.locks.reset_track(edit.track),
+        }
+        self.selected_lock = None;
+        self.save_locks();
+    }
+
+    pub fn undo_lock(&mut self) {
+        if let Some(edit) = self.lock_undo.pop() {
+            self.apply_lock_edit(&edit, false);
+            self.lock_redo.push(edit);
+        }
+    }
+
+    pub fn redo_lock(&mut self) {
+        if let Some(edit) = self.lock_redo.pop() {
+            self.apply_lock_edit(&edit, true);
+            self.lock_undo.push(edit);
+        }
+    }
+
+    /// Delete the selected lock.
+    pub fn delete_selected_lock(&mut self) {
+        let Some((track, index)) = self.selected_lock else {
+            return;
+        };
+        let Some(track_before) = self.locks.track(track).map(<[_]>::to_vec) else {
+            return;
+        };
+        if index >= track_before.len() {
+            return;
+        }
+        let mut next = track_before.clone();
+        next.remove(index);
+        self.locks.set_track(track, next);
+        self.push_lock_edit(track, Some(track_before));
+        self.selected_lock = None;
+    }
+
+    /// Put one track, or every track, back on the clip's own detection.
+    pub fn reset_locks(&mut self, track: Option<usize>) {
+        match track {
+            Some(track) => {
+                let before = self.locks.track(track).map(<[_]>::to_vec);
+                self.locks.reset_track(track);
+                self.push_lock_edit(track, before);
+            }
+            None => {
+                for track in 0..velomocap_motion::TRACK_COUNT {
+                    let before = self.locks.track(track).map(<[_]>::to_vec);
+                    self.locks.reset_track(track);
+                    self.push_lock_edit(track, before);
+                }
+            }
+        }
+        self.selected_lock = None;
+    }
+
     /// The clip's export payload: renamed into the selected rig, and
     /// rest-corrected when asked. The default biped payload is the clip's own,
     /// which is what every export wrote before the retarget chain existed.
@@ -1024,6 +1230,9 @@ impl VeloMocap {
                     })
                     .collect();
                                                                 self.orbit.framed = false;
+                // The run that just landed used these locks, so the timeline no
+                // longer needs to ask for another one.
+                self.locks_dirty = false;
             }
         }
         if let Some(faces) = smplh_faces {

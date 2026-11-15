@@ -255,6 +255,9 @@ pub struct FlowSettings {
     pub gpu: bool,
     /// Foot/hand contact correction applied to the generated clip.
     pub correction: velomocap_motion::correction::CorrectionSettings,
+    /// Contact timing the user drew on the timeline; automatic tracks follow the
+    /// clip's own detection.
+    pub locks: velomocap_motion::ContactTracks,
     /// Estimate the camera with VGGT; `false` treats it as a fixed camera.
     pub estimate_camera: bool,
     /// Smooth the estimated camera track over time.
@@ -572,11 +575,13 @@ fn run_flow(
             }
         };
         // Contact correction runs on the generated clip, so the viewport and
-        // every export see the same corrected motion.
-        let correction = match velomocap_motion::correction::apply(
+        // every export see the same corrected motion. The user's lock tracks go
+        // with it: an edited limb follows the drawing, the rest follows detection.
+        let correction = match velomocap_motion::correction::apply_with_locks(
             &mut clip,
             &model,
             &settings.correction,
+            &settings.locks,
         ) {
             Ok(report) => report,
             Err(error) => {
