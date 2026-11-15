@@ -68,7 +68,8 @@ impl SoleGeometry {
             }
             let mut selected: Vec<usize> = Vec::new();
             for vertex in 0..vertices {
-                let influence = weights[ankle * vertices + vertex] + weights[toe * vertices + vertex];
+                let influence =
+                    weights[vertex * joints + ankle] + weights[vertex * joints + toe];
                 if influence > 0.6 {
                     selected.push(vertex);
                 }
@@ -129,7 +130,7 @@ impl SoleGeometry {
         let mut selected_weights = Vec::with_capacity(ids.len() * 22);
         for vertex in &ids {
             for joint in 0..22 {
-                selected_weights.push(weights[joint * vertices + vertex]);
+                selected_weights.push(weights[vertex * joints + joint]);
             }
         }
         let mut selected_shaped = Vec::with_capacity(ids.len() * 3);
