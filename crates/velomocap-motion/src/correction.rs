@@ -49,6 +49,7 @@ use crate::flow::FlowClip;
 use crate::ik::Transform;
 
 const LEFT_HIP: usize = 1;
+const RIGHT_HIP: usize = 2;
 const LEFT_ANKLE: usize = 7;
 const RIGHT_ANKLE: usize = 8;
 const LEFT_FOOT: usize = 10;
@@ -293,7 +294,7 @@ pub fn apply(
         ground_feet(clip, body, settings, &thresholds, &mut report);
     }
     if settings.hand {
-        hand_lock(clip, body, &thresholds, &mut report);
+        hand_lock(clip, body, settings, &mut report);
     }
     // Kimodo's order: end effectors (hands) first, then the contact IK that
     // stabilises the legs on the ground.
@@ -1135,12 +1136,6 @@ fn joint(skeleton: &Skeleton, index: usize) -> [f32; 3] {    [
     ]
 }
 
-fn horizontal_speed(a: [f32; 3], b: [f32; 3], fps: f32) -> f32 {
-    let dx = b[0] - a[0];
-    let dz = b[2] - a[2];
-    (dx * dx + dz * dz).sqrt() * fps
-}
-
 fn contact_runs(contact: &[bool], min_run: usize) -> Vec<(usize, usize)> {
     let mut runs = Vec::new();
     let mut start = None;
@@ -1505,7 +1500,7 @@ fn foot_lock(
 fn hand_lock(
     clip: &mut FlowClip,
     body: &BodyModel,
-    thresholds: &Thresholds,
+    settings: &CorrectionSettings,
     report: &mut CorrectionReport,
 ) {
     let fps = clip.fps.max(1.0);
@@ -1513,41 +1508,56 @@ fn hand_lock(
     if count < 2 {
         return;
     }
-    let hands: [(usize, usize, usize, usize); 2] = [
-        (LEFT_SHOULDER, LEFT_ELBOW, LEFT_WRIST, LEFT_HIP),
-        (RIGHT_SHOULDER, RIGHT_ELBOW, RIGHT_WRIST, LEFT_HIP),
-    ];
     let rest = body.rest_joints(&clip.betas);
+    // The reference detects palm supports, not wrist positions: a hand hanging at
+    // the actor's side is stationary too, so the geometric gates below are what
+    // make a contact real (`hand_lock.py::plan`).
+    let palm = crate::palm::PalmGeometry::build(body, &clip.betas).ok();
+    let mut points = Vec::with_capacity(count);
+    let mut shoulders = Vec::with_capacity(count);
+    let mut hips = Vec::with_capacity(count);
+    for skeleton in &clip.skeletons {
+        points.push(match &palm {
+            Some(geometry) => geometry.points(skeleton),
+            None => [joint(skeleton, LEFT_WRIST), joint(skeleton, RIGHT_WRIST)],
+        });
+        shoulders.push([
+            joint(skeleton, LEFT_SHOULDER),
+            joint(skeleton, RIGHT_SHOULDER),
+        ]);
+        hips.push([joint(skeleton, LEFT_HIP), joint(skeleton, RIGHT_HIP)]);
+    }
+    // Flat ground only admits supports on the floor itself; anything raised is a
+    // multi-level support, which is how the reference separates the two modes.
+    let surface = match settings.mode {
+        CorrectionMode::Flat => Some(settings.floor),
+        CorrectionMode::MultiLevel => None,
+    };
+    let speed_limit = if settings.preset == LockPreset::Loose {
+        0.10
+    } else {
+        0.18
+    };
+    let planned = crate::palm::plan(&points, &shoulders, &hips, fps, surface, speed_limit);
 
-            for (hand_index, (shoulder, elbow, wrist, hip)) in hands.into_iter().enumerate() {
-        let mut contact = vec![false; count];
-        for index in 0..count {
-            let skeleton = &clip.skeletons[index];
-            let speed = if index == 0 {
-                0.0
-            } else {
-                horizontal_speed(
-                    joint(&clip.skeletons[index - 1], wrist),
-                    joint(skeleton, wrist),
-                    fps,
-                )
-            };
-            // At rest and no higher than the chest.
-            let low = joint(skeleton, wrist)[1] <= joint(skeleton, hip)[1] + 0.45;
-            contact[index] = low && speed <= thresholds.contact_speed;
-        }
-        for (begin, end) in contact_runs(&contact, thresholds.min_run.max(2)) {
-            let mut points = [Vec::new(), Vec::new(), Vec::new()];
+    for hand_index in 0..2 {
+        let (shoulder, elbow, wrist) = if hand_index == 0 {
+            (LEFT_SHOULDER, LEFT_ELBOW, LEFT_WRIST)
+        } else {
+            (RIGHT_SHOULDER, RIGHT_ELBOW, RIGHT_WRIST)
+        };
+        for (begin, end) in planned.runs[hand_index].iter().cloned() {
+            let mut columns = [Vec::new(), Vec::new(), Vec::new()];
             for index in begin..end {
-                let at = joint(&clip.skeletons[index], wrist);
+                let palm_point = points[index][hand_index];
                 for axis in 0..3 {
-                    points[axis].push(at[axis]);
+                    columns[axis].push(palm_point[axis]);
                 }
             }
             let target = [
-                median(&points[0]),
-                median(&points[1]),
-                median(&points[2]),
+                median(&columns[0]),
+                median(&columns[1]),
+                median(&columns[2]),
             ];
             let ramp = 4usize;
             let first = begin.saturating_sub(ramp);
@@ -1563,7 +1573,11 @@ fn hand_lock(
                 .map(|index| {
                     let (world, positions) =
                         crate::anatomical::forward(body, &clip.poses[index], &rest);
-                    let sampled = positions[wrist];
+                    let sampled = [
+                        points[index][hand_index][0] as f64,
+                        points[index][hand_index][1] as f64,
+                        points[index][hand_index][2] as f64,
+                    ];
                     let gap = crate::anatomical::source_reach_gap(
                         &rest,
                         &world,
@@ -1602,8 +1616,21 @@ fn hand_lock(
                 };
                 let weight = ramp_weight * gain;
                 let source = clip.poses[index].clone();
+                // The pin is a palm point, so the wrist target is that point
+                // minus the palm offset: the reference plans
+                // `desired = wrist + pin - palm`, which is the same thing when
+                // the source wrist rotation is held (`contact_arm_plan.solve`).
+                let offset = match &palm {
+                    Some(geometry) => geometry.world_offsets(&clip.skeletons[index])[hand_index],
+                    None => [0.0f32; 3],
+                };
+                let wrist_target = [
+                    target[0] - offset[0],
+                    target[1] - offset[1],
+                    target[2] - offset[2],
+                ];
                 let hint = bend_hint(&clip.skeletons[index], shoulder, elbow, wrist);
-                if solve_arm(body, &mut clip.poses[index], &rest, shoulder, elbow, wrist, target, hint, branch) {
+                if solve_arm(body, &mut clip.poses[index], &rest, shoulder, elbow, wrist, wrist_target, hint, branch) {
                     // Same guard as the legs: no single frame may swing the wrist
                     // enough for the fingers to jump.
                     limit_end_rotation(
@@ -1633,9 +1660,9 @@ fn hand_lock(
                 if weight >= 1.0 {
                     let chain = forward_chain(body, &clip.poses[index], &rest);
                     let settled = chain[wrist].1;
-                    let error = ((settled[0] - target[0] as f64).powi(2)
-                        + (settled[1] - target[1] as f64).powi(2)
-                        + (settled[2] - target[2] as f64).powi(2))
+                    let error = ((settled[0] - wrist_target[0] as f64).powi(2)
+                        + (settled[1] - wrist_target[1] as f64).powi(2)
+                        + (settled[2] - wrist_target[2] as f64).powi(2))
                     .sqrt();
                     report.max_hand_error = report.max_hand_error.max(error as f32);
                 }
