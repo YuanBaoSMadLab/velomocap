@@ -543,6 +543,7 @@ impl Character {
             mapped[canonical] = true;
         }
         let swing = self.bind_swing(&joint_of, rest_positions);
+        let ground = self.ground_offset(&joint_of, rest_positions);
         // Walk parents first: each bone's world rotation is the clip's own delta
         // for that joint, and its pivot follows its parent's motion. Without the
         // second half a raised arm would rotate about the bind elbow.
@@ -576,7 +577,7 @@ impl Character {
                 }
                 None => [
                     bone.bind[0] + translation[0],
-                    bone.bind[1] + translation[1],
+                    bone.bind[1] + translation[1] + ground,
                     bone.bind[2] + translation[2],
                 ],
             };
@@ -627,6 +628,47 @@ impl Character {
             }
         }
         out
+    }
+
+    /// How far the root has to rise or fall for this character's feet to stand
+    /// where the clip's feet stand.
+    ///
+    /// The root follows the clip's pelvis, so an avatar whose legs are three
+    /// centimetres longer floats three centimetres in the air for the whole take.
+    /// Both sides measure the same thing — hips down to the lower ankle — so this
+    /// is a constant per character, not a per-frame correction that could jitter.
+    fn ground_offset(&self, joint_of: &[usize; 52], rest_positions: &[[f32; 3]]) -> f32 {
+        let clip_height = |canonical: usize| -> Option<f32> {
+            let joint = *joint_of.get(canonical)?;
+            if joint == usize::MAX {
+                return None;
+            }
+            rest_positions.get(joint).map(|at| at[1])
+        };
+        let bind_height = |canonical: usize| -> Option<f32> {
+            self.bones
+                .iter()
+                .find(|bone| bone.canonical == Some(canonical))
+                .map(|bone| bone.bind[1])
+        };
+        let lowest = |heights: [Option<f32>; 2]| -> Option<f32> {
+            let mut value = f32::INFINITY;
+            for height in heights.into_iter().flatten() {
+                value = value.min(height);
+            }
+            value.is_finite().then_some(value)
+        };
+        let (Some(clip_hips), Some(bind_hips)) = (clip_height(0), bind_height(0)) else {
+            return 0.0;
+        };
+        let (Some(clip_ankle), Some(bind_ankle)) = (
+            lowest([clip_height(46), clip_height(50)]),
+            lowest([bind_height(46), bind_height(50)]),
+        ) else {
+            return 0.0;
+        };
+        // Longer legs mean the character stands too high on the clip's pelvis.
+        (bind_hips - bind_ankle - (clip_hips - clip_ankle)).clamp(-0.15, 0.15)
     }
 
     /// The rotation that takes each bone from its bind direction to the clip's
@@ -1587,6 +1629,79 @@ mod tests {
         assert!(character.vertex_count() > 0);
     }
 
+    /// How far the model's legs sit from the clip's own leg length, which is what
+    /// a character's feet would float or sink by if the root only followed the
+    /// clip's pelvis.
+    #[test]
+    fn a_real_character_measures_its_legs() {
+        let (Some(path), Some(model)) = (
+            std::env::var_os("VELOMOCAP_CHARACTER"),
+            std::env::var_os("VELOMOCAP_SMPLH_MODEL"),
+        ) else {
+            return;
+        };
+        let character = Character::load(std::path::Path::new(&path)).expect("load");
+        let body = velomocap_body::BodyModel::load(std::path::Path::new(&model), 16).expect("body");
+        let skeleton = body.forward_joints(&velomocap_body::Pose::neutral(body.num_joints, 16));
+        let at = |name: &str| {
+            velomocap_body::JOINT_NAMES
+                .iter()
+                .position(|joint| *joint == name)
+                .map(|joint| skeleton.positions[joint * 3 + 1])
+        };
+        let (Some(hips), Some(left), Some(right)) =
+            (at("pelvis"), at("left_ankle"), at("right_ankle"))
+        else {
+            return;
+        };
+        let clip_legs = hips - left.min(right);
+        let bind = |canonical: usize| {
+            character
+                .bones
+                .iter()
+                .find(|bone| bone.canonical == Some(canonical))
+                .map(|bone| bone.bind[1])
+        };
+        let (Some(char_hips), Some(char_left), Some(char_right)) =
+            (bind(0), bind(46), bind(50))
+        else {
+            return;
+        };
+        let character_legs = char_hips - char_left.min(char_right);
+        let mut lo = f32::INFINITY;
+        for vertex in character.rest.chunks_exact(3) {
+            lo = lo.min(vertex[1]);
+        }
+        // What the pose would shift the root by, with the clip's own ankles.
+        let mut joint_of = [usize::MAX; 52];
+        for (canonical, name) in [(0, "pelvis"), (46, "left_ankle"), (50, "right_ankle")] {
+            joint_of[canonical] = velomocap_body::JOINT_NAMES
+                .iter()
+                .position(|joint| *joint == name)
+                .unwrap_or(usize::MAX);
+        }
+        let mut positions = vec![[0.0f32; 3]; skeleton.positions.len() / 3];
+        for (joint, at) in positions.iter_mut().enumerate() {
+            *at = [
+                skeleton.positions[joint * 3],
+                skeleton.positions[joint * 3 + 1],
+                skeleton.positions[joint * 3 + 2],
+            ];
+        }
+        eprintln!(
+            "{}: hips {:.3} m, ankle {:.3}/{:.3} m, legs {:.3} m vs clip {:.3} m ({}), mesh floor {:.3} m, root shift {:+.3} m",
+            character.name,
+            char_hips,
+            char_left,
+            char_right,
+            character_legs,
+            clip_legs,
+            if character_legs < clip_legs { "shorter" } else { "longer" },
+            lo,
+            character.ground_offset(&joint_of, &positions),
+        );
+    }
+
     /// The same real file, posed with a clip that has not moved: every joint's
     /// delta is the identity, so the skinning has to put every vertex back
     /// exactly where the bind pose had it. Anything the hierarchy, the pivots or
@@ -1952,5 +2067,27 @@ mod tests {
         // A quarter turn out of the bind, so the forearm joint ends up level.
         assert!((posed[0] - 1.0).abs() < 1e-5, "{posed:?}");
         assert!(posed[1].abs() < 1e-5, "{posed:?}");
+    }
+
+    /// Legs longer than the clip's must not lift the character off the floor.
+    #[test]
+    fn longer_legs_stand_on_the_clip_floor() {
+        let bones = vec![
+            bound("Hips", 0, None, [0.0, 0.95, 0.0]),
+            bound("LeftFoot", 46, Some(0), [0.0, 0.05, 0.0]),
+        ];
+        let mut character = handmade(bones, vec![0.0, 0.05, 0.0]);
+        character.joints[0][0] = 1;
+        let world = vec![neutral(); 52];
+        let rest = vec![neutral(); 52];
+        // The clip's rest leaves its ankle 0.078 m above the floor.
+        let mut rest_positions = vec![[0.0f32; 3]; 52];
+        rest_positions[0] = [0.0, 0.95, 0.0];
+        rest_positions[46] = [0.0, 0.078, 0.0];
+        let mut names = vec![String::new(); 52];
+        names[0] = "Hips".to_string();
+        names[46] = "LeftFoot".to_string();
+        let posed = character.pose(&world, &rest, &rest_positions, &names, [0.0; 3]);
+        assert!((posed[1] - 0.078).abs() < 1e-5, "{posed:?}");
     }
 }
