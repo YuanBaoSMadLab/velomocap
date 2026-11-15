@@ -390,25 +390,19 @@ fn leg_ik(
         }
 
         for (begin, end) in contact_runs(&contact, thresholds.min_run) {
-            let mut xs = Vec::new();
-            let mut zs = Vec::new();
-            for index in begin..end {
-                let at = support_point(clip, index, ankle, toe);
-                xs.push(at[0]);
-                zs.push(at[2]);
-            }
-            let anchor_x = median(&xs) as f64;
-            let anchor_z = median(&zs) as f64;
-            for index in begin..end {
+            // Same rolling anchor the root pass uses, so the leg IK and the root
+            // agree on where the contact patch should be.
+            let anchors = rolling_anchor(clip, begin, end, ankle, toe, settings.floor);
+            for (offset, index) in (begin..end).enumerate() {
                 let current = joint(&clip.skeletons[index], ankle);
                 let sole = support_point(clip, index, ankle, toe);
                 let hip_pos = joint(&clip.skeletons[index], hip);
                 // Move the ankle so that the sole's support point lands back on
                 // the anchor; the ankle itself is free to slide over it.
                 let target = [
-                    current[0] as f64 + (anchor_x - sole[0] as f64),
+                    current[0] as f64 + (anchors[offset][0] - sole[0]) as f64,
                     current[1] as f64,
-                    current[2] as f64 + (anchor_z - sole[2] as f64),
+                    current[2] as f64 + (anchors[offset][2] - sole[2]) as f64,
                 ];
                 let weight = reach_falloff(
                     target,
@@ -492,6 +486,76 @@ fn contact_runs(contact: &[bool], min_run: usize) -> Vec<(usize, usize)> {
         }
     }
     runs
+}
+
+/// The integration step of `rolling_anchor`, split out so it can be tested
+/// without a clip: `separations[i]` is heel - toe and `weights[i]` the heel
+/// weight at frame `i`.
+fn rolling_path(
+    separations: &[[f32; 3]],
+    weights: &[f32],
+    observed: &[[f32; 3]],
+    floor: f32,
+) -> Vec<[f32; 3]> {
+    let frames = separations.len();
+    let mut path = vec![[0.0f32; 3]; frames];
+    for frame in 1..frames {
+        let dw = weights[frame] - weights[frame - 1];
+        for axis in 0..3 {
+            path[frame][axis] = path[frame - 1][axis]
+                + 0.5 * (separations[frame][axis] + separations[frame - 1][axis]) * dw;
+        }
+    }
+    let mut offsets = [0.0f32; 3];
+    for axis in 0..3 {
+        let diffs: Vec<f32> = (0..frames).map(|f| observed[f][axis] - path[f][axis]).collect();
+        offsets[axis] = median(&diffs);
+    }
+    for frame in 0..frames {
+        path[frame][0] += offsets[0];
+        path[frame][1] = floor;
+        path[frame][2] += offsets[2];
+    }
+    path
+}
+
+/// Kimodo's `rolling_anchor`: a continuous no-slip anchor for one stance.
+///
+/// Taking the observed support point directly would move the anchor whenever the
+/// weight rolls, which reads as a sliding foot. Instead the *contact location*
+/// is integrated: as the weight transfers from one material point to the other,
+/// the anchor moves by the separation times the weight change. The result is
+/// then offset so its median matches the observed support points, and its height
+/// is the floor.
+fn rolling_anchor(
+    clip: &FlowClip,
+    begin: usize,
+    end: usize,
+    ankle: usize,
+    toe: usize,
+    floor: f32,
+) -> Vec<[f32; 3]> {
+    let frames = end - begin;
+    let mut separations = Vec::with_capacity(frames);
+    let mut weights = Vec::with_capacity(frames);
+    let mut observed = Vec::with_capacity(frames);
+    for frame in begin..end {
+        let (toe_at, heel) = sole_points(clip, frame, ankle, toe);
+        let weight = support_weight(toe_at, heel);
+        separations.push([
+            heel[0] - toe_at[0],
+            heel[1] - toe_at[1],
+            heel[2] - toe_at[2],
+        ]);
+        weights.push(weight);
+        observed.push([
+            toe_at[0] * (1.0 - weight) + heel[0] * weight,
+            toe_at[1].min(heel[1]),
+            toe_at[2] * (1.0 - weight) + heel[2] * weight,
+        ]);
+    }
+
+    rolling_path(&separations, &weights, &observed, floor)
 }
 
 /// The two material points of a sole: the toe joint and a heel estimated behind
@@ -628,28 +692,23 @@ fn foot_lock(
         }
         bridge_gaps(&mut contact, thresholds.bridge_frames);
         for (begin, end) in contact_runs(&contact, thresholds.min_run) {
-            let mut xs = Vec::new();
-            let mut zs = Vec::new();
-            for index in begin..end {
-                // Anchor on the sole's support point, not the ankle: a rolling
-                // foot then keeps its contact patch still while the ankle moves.
-                let at = support_point(clip, index, ankle, toe);
-                xs.push(at[0]);
-                zs.push(at[2]);
-            }
             // Horizontal only: the vertical placement is solved when the clip is
             // dropped onto its floor. Snapping Y on the contact frames only is
             // what made the body bob up and down after a reconstruction.
-            let anchor = [median(&xs), median(&zs)];
+            //
+            // The anchor is Kimodo's rolling anchor: a continuous no-slip path
+            // through the stance, so a foot that rolls from heel to toe keeps its
+            // contact patch still instead of jumping at the middle of the run.
+            let anchors = rolling_anchor(clip, begin, end, ankle, toe, ground);
             // Weak presets hold 60% of the correction, and a low network contact
             // probability softens it further instead of dropping the contact.
             let hold =
                 thresholds.strength * contact_confidence(clip, begin, end, thresholds.confidence);
             report.foot_contacts += 1;
-            for index in begin..end {
+            for (offset, index) in (begin..end).enumerate() {
                 let at = support_point(clip, index, ankle, toe);
-                let dx = (anchor[0] - at[0]) as f64 * hold as f64;
-                let dz = (anchor[1] - at[2]) as f64 * hold as f64;
+                let dx = (anchors[offset][0] - at[0]) as f64 * hold as f64;
+                let dz = (anchors[offset][2] - at[2]) as f64 * hold as f64;
                 // Two feet in contact at once average their demands.
                 if pinned[index] {
                     target_x[index] = 0.5 * (target_x[index] + dx);
@@ -1109,6 +1168,45 @@ mod tests {
             worst.1,
             worst.0
         );
+    }
+
+    /// `rolling_anchor`: during a pure heel-to-toe roll (no sliding) the
+    /// integrated contact location must follow the observed support point, which
+    /// is what makes the foot stay put while the weight transfers.
+    #[test]
+    fn rolling_path_follows_a_clean_roll() {
+        let frames = 11;
+        // Toe at x = 0, heel at x = 1, 20 cm apart.
+        let separations: Vec<[f32; 3]> = (0..frames).map(|_| [0.2, 0.0, 0.0]).collect();
+        // Weight rolls from the toe (0) to the heel (1).
+        let weights: Vec<f32> = (0..frames).map(|i| i as f32 / (frames - 1) as f32).collect();
+        // The observed support point rolls with it.
+        let observed: Vec<[f32; 3]> = weights.iter().map(|w| [0.2 * w, 0.0, 0.0]).collect();
+        let path = rolling_path(&separations, &weights, &observed, 0.0);
+        for (frame, anchor) in path.iter().enumerate() {
+            assert!(
+                (anchor[0] - observed[frame][0]).abs() < 1e-5,
+                "frame {frame}: anchor {} vs observed {}",
+                anchor[0],
+                observed[frame][0]
+            );
+            assert_eq!(anchor[1], 0.0, "the anchor sits on the floor");
+        }
+    }
+
+    /// A flat foot does not move its anchor at all.
+    #[test]
+    fn rolling_path_is_still_for_a_flat_foot() {
+        let frames = 8;
+        let separations: Vec<[f32; 3]> = (0..frames).map(|_| [0.18, 0.0, 0.0]).collect();
+        let weights = vec![0.5f32; frames];
+        let observed: Vec<[f32; 3]> = (0..frames).map(|_| [0.09, 0.0, 0.0]).collect();
+        let path = rolling_path(&separations, &weights, &observed, 0.0);
+        // The offset aligns the anchor with the observed contact point, and with
+        // no weight transfer the anchor never moves from there.
+        for anchor in &path {
+            assert!((anchor[0] - 0.09).abs() < 1e-5, "anchor at {}", anchor[0]);
+        }
     }
 
     /// `support_weights`: flat foot is 0.5, a rolled foot moves the weight to
