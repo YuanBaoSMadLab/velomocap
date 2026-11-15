@@ -119,6 +119,17 @@ pub struct Thresholds {
     pub bridge_frames: usize,
     /// Contact probability needed for a full-strength hold (`confidence`).
     pub confidence: f32,
+    /// Lower probability that keeps an existing stance alive (`release`). This
+    /// hysteresis is what stops the contact mask from flickering frame to frame,
+    /// which is what a per-frame pin turns into visible twitching.
+    pub release: f32,
+    /// Geometry gate for entering a contact, in metres per second. The network's
+    /// own probabilities are noisy, so a moving foot must never enter.
+    pub entry_speed: f32,
+    /// Vertical speed gate for entering a contact.
+    pub entry_vertical: f32,
+    /// How far above the foot's own lowest point a frame may be and still count.
+    pub entry_height: f32,
 }
 
 impl CorrectionSettings {
@@ -134,6 +145,10 @@ impl CorrectionSettings {
                 strength: 1.0,
                 bridge_frames: 2,
                 confidence: 0.65,
+                release: 0.5,
+                entry_speed: 0.7,
+                entry_vertical: 0.8,
+                entry_height: 0.12,
             },
             LockPreset::Normal => Thresholds {
                 contact_height: 0.07,
@@ -144,6 +159,10 @@ impl CorrectionSettings {
                 strength: 1.0,
                 bridge_frames: 2,
                 confidence: 0.65,
+                release: 0.65,
+                entry_speed: 0.7,
+                entry_vertical: 0.8,
+                entry_height: 0.12,
             },
             LockPreset::Loose => Thresholds {
                 contact_height: 0.12,
@@ -154,6 +173,10 @@ impl CorrectionSettings {
                 strength: 0.6,
                 bridge_frames: 0,
                 confidence: 0.75,
+                release: 0.75,
+                entry_speed: 0.7,
+                entry_vertical: 0.8,
+                entry_height: 0.12,
             },
         }
     }
@@ -224,6 +247,145 @@ pub fn apply(
         .map(|pose| body.forward_joints(pose))
         .collect();
     Ok(report)
+}
+
+/// The contact mask for one foot, built once and shared by every pass.
+///
+/// This is the part of the reference that makes the result *stable*: contacts are
+/// resolved once, with hysteresis (`confidence` to enter, `release` to stay),
+/// geometry gates (a moving foot never enters), bridging of short dropouts, and a
+/// minimum duration. A mask that flickers frame to frame turns a per-frame pin
+/// into visible twitching, which is exactly what a plain threshold produces.
+///
+/// The network's own contact probabilities are used when the head is actually
+/// informative: on some FlowHMR outputs the four channels never rise above a few
+/// tenths, and gating on them would drop every contact. In that case the gates
+/// fall back to geometry, which is what the reference does before it has a usable
+/// probability.
+fn contact_mask(
+    clip: &FlowClip,
+    foot: usize,
+    ankle: usize,
+    toe: usize,
+    thresholds: &Thresholds,
+    fps: f32,
+) -> Vec<bool> {
+    let count = clip.skeletons.len();
+    let mut active = vec![false; count];
+    if count == 0 {
+        return active;
+    }
+    let mut height = vec![0.0f32; count];
+    let mut speed = vec![0.0f32; count];
+    let mut vertical = vec![0.0f32; count];
+    let mut confidence = vec![0.0f32; count];
+    for frame in 0..count {
+        let skeleton = &clip.skeletons[frame];
+        height[frame] = joint(skeleton, ankle)[1].min(joint(skeleton, toe)[1]);
+        let point = support_point(clip, frame, ankle, toe);
+        if frame > 0 {
+            let previous = support_point(clip, frame - 1, ankle, toe);
+            let dx = point[0] - previous[0];
+            let dz = point[2] - previous[2];
+            speed[frame] = (dx * dx + dz * dz).sqrt() * fps;
+            vertical[frame] = (height[frame] - height[frame - 1]).abs() * fps;
+        }
+        // The four channels are two per foot in the reference (`reshape(n,2,2)`);
+        // which pair belongs to which foot differs between checkpoints, so take
+        // the foot's own pair and fall back to the largest of the row.
+        let row = clip.foot_contacts.get(frame).copied().unwrap_or([0.0; 4]);
+        let pair = if foot == 0 {
+            [row[0], row[1]]
+        } else {
+            [row[2], row[3]]
+        };
+        confidence[frame] = pair[0].max(pair[1]);
+    }
+    // Only trust the probabilities when this clip actually produces them.
+    let best = confidence.iter().cloned().fold(0.0f32, f32::max);
+    let use_probability = best >= thresholds.confidence * 0.9;
+
+    let lowest = height.iter().cloned().fold(f32::MAX, f32::min);
+    let mut entry = vec![false; count];
+    let mut holding = vec![false; count];
+    for frame in 0..count {
+        let geometry = speed[frame] < thresholds.entry_speed
+            && vertical[frame] < thresholds.entry_vertical
+            && height[frame] - lowest < thresholds.entry_height;
+        entry[frame] = geometry
+            && (!use_probability || confidence[frame] > thresholds.confidence);
+        holding[frame] = speed[frame] < 0.25
+            && vertical[frame] < thresholds.entry_vertical
+            && (height[frame] - lowest).abs() < 0.04
+            && (!use_probability || confidence[frame] > thresholds.release);
+    }
+    active.copy_from_slice(&entry);
+
+    // Bridge a brief dropout only between two existing stances, close to the
+    // floor and without a step: never across a lifted foot.
+    let gap_frames = thresholds.bridge_frames;
+    if gap_frames > 0 {
+        let mut index = 0;
+        while index < count {
+            if active[index] {
+                index += 1;
+                continue;
+            }
+            let begin = index;
+            while index < count && !active[index] {
+                index += 1;
+            }
+            let end = index;
+            if begin == 0 || end == count || end - begin > gap_frames {
+                continue;
+            }
+            if !(begin..end).all(|frame| holding[frame]) {
+                continue;
+            }
+            let before = support_point(clip, begin - 1, ankle, toe);
+            let after = support_point(clip, end, ankle, toe);
+            let dx = after[0] - before[0];
+            let dz = after[2] - before[2];
+            if (dx * dx + dz * dz).sqrt() < 0.04 {
+                for hit in &mut active[begin..end] {
+                    *hit = true;
+                }
+            }
+        }
+    }
+
+    // Hysteresis: a stance that already exists survives while the foot only
+    // *holds*, which is what stops the mask from chattering on a noisy frame.
+    let runs: Vec<(usize, usize)> = contact_runs(&active, 1);
+    for (begin, end) in runs {
+        let mut first = begin;
+        while first > 0 && holding[first - 1] && !active[first - 1] {
+            first -= 1;
+            active[first] = true;
+        }
+        let mut last = end;
+        while last < count && holding[last] && !active[last] {
+            active[last] = true;
+            last += 1;
+        }
+    }
+
+    // Minimum duration, then the airborne gate.
+    let minimum = thresholds.min_run.max(2);
+    for (begin, end) in contact_runs(&active, 1) {
+        if end - begin < minimum {
+            for hit in &mut active[begin..end] {
+                *hit = false;
+            }
+        }
+    }
+    let flight = flight_frames(clip, lowest);
+    for frame in 0..count {
+        if flight[frame] {
+            active[frame] = false;
+        }
+    }
+    active
 }
 
 /// Kimodo's velocity weights: slow motion is preserved more strongly, so a
@@ -306,32 +468,6 @@ fn ground_feet(
         clip.poses[frame].translation[1] += delta as f32;
     }
     report.vertical_shift = moved;
-}
-
-/// Fill dropouts shorter than `frames` so a brief loss of the contact signal
-/// does not split one stance into two (`gap` in the reference's presets).
-fn bridge_gaps(contact: &mut [bool], frames: usize) {
-    if frames == 0 {
-        return;
-    }
-    let count = contact.len();
-    let mut index = 0;
-    while index < count {
-        if contact[index] {
-            index += 1;
-            continue;
-        }
-        let begin = index;
-        while index < count && !contact[index] {
-            index += 1;
-        }
-        let end = index;
-        if begin > 0 && end < count && end - begin <= frames {
-            for hit in &mut contact[begin..end] {
-                *hit = true;
-            }
-        }
-    }
 }
 
 /// How strongly a run is held, from the network's own contact probabilities.
@@ -527,7 +663,7 @@ fn leg_ik(
     ];
     let cap = thresholds.max_correction.min(0.05) as f64;
     let mut lifts = vec![0.0f32; count];
-    for (hip, knee, ankle, toe) in legs {
+    for (foot_index, (hip, knee, ankle, toe)) in legs.into_iter().enumerate() {
         // Bone lengths from the rest pose: the reach limit for the falloff.
         let thigh = distance3(
             joint3(&rest, knee),
@@ -536,24 +672,8 @@ fn leg_ik(
         let shin = distance3(joint3(&rest, ankle), joint3(&rest, knee));
         let max_reach = thigh + shin;
 
-        let flight = flight_frames(clip, settings.floor);
-        let mut contact = vec![false; count];
-        for index in 0..count {
-            let skeleton = &clip.skeletons[index];
-            let low = joint(skeleton, ankle)[1].min(joint(skeleton, toe)[1]);
-            let speed = if index == 0 {
-                0.0
-            } else {
-                horizontal_speed(
-                    joint(&clip.skeletons[index - 1], ankle),
-                    joint(skeleton, ankle),
-                    fps,
-                )
-            };
-            contact[index] = !flight[index]
-                && low <= settings.floor + thresholds.contact_height
-                && speed <= thresholds.contact_speed;
-        }
+        // One mask for every pass: hysteresis and geometry gates, resolved once.
+        let contact = contact_mask(clip, foot_index, ankle, toe, thresholds, fps);
 
         for (begin, end) in contact_runs(&contact, thresholds.min_run) {
             // Same rolling anchor the root pass uses, so the leg IK and the root
@@ -597,28 +717,35 @@ fn leg_ik(
                     }
                     continue;
                 }
-                let blended = [
-                    (current[0] as f64 + (target[0] - current[0] as f64) * weight) as f32,
-                    current[1],
-                    (current[2] as f64 + (target[2] - current[2] as f64) * weight) as f32,
+                // Clamp the *target* instead of rejecting the frame: a frame that
+                // is corrected next to a frame that is not is exactly what reads
+                // as a twitch, so the correction always ramps with distance.
+                let mut want = [
+                    (target[0] - current[0] as f64) * weight,
+                    0.0,
+                    (target[2] - current[2] as f64) * weight,
                 ];
-                let before = joint(&clip.skeletons[index], ankle);
-                let backup = clip.poses[index].clone();
-                if solve_arm(body, &mut clip.poses[index], &rest, hip, knee, ankle, blended) {
-                    let after = body.forward_joints(&clip.poses[index]);
-                    let settled = joint(&after, ankle);
-                    let moved = distance3(
-                        [settled[0] as f64, settled[1] as f64, settled[2] as f64],
-                        [before[0] as f64, before[1] as f64, before[2] as f64],
-                    );
-                    if moved > cap {
-                        // Further than a correction should ever move an ankle:
-                        // keep the pose the network produced.
-                        clip.poses[index] = backup;
-                    } else {
-                        clip.skeletons[index] = after;
-                        report.ik_frames += 1;
-                    }
+                let length = (want[0] * want[0] + want[2] * want[2]).sqrt();
+                if length > cap && length > 0.0 {
+                    want[0] *= cap / length;
+                    want[2] *= cap / length;
+                }
+                if want[0].abs() + want[2].abs() < 1e-5 {
+                    continue;
+                }
+                let blended = [
+                    (current[0] as f64 + want[0]) as f32,
+                    current[1],
+                    (current[2] as f64 + want[2]) as f32,
+                ];
+                let source = clip.poses[index].clone();
+                let hint = bend_hint(&clip.skeletons[index], hip, knee, ankle);
+                if solve_arm(body, &mut clip.poses[index], &rest, hip, knee, ankle, blended, hint) {
+                    // Keep the end joint's orientation from swinging on one
+                    // frame: the toes below it would amplify that into a twitch.
+                    limit_end_rotation(body, &mut clip.poses[index], &rest, &source, hip, knee, ankle);
+                    clip.skeletons[index] = body.forward_joints(&clip.poses[index]);
+                    report.ik_frames += 1;
                 }
             }
         }
@@ -863,26 +990,8 @@ fn foot_lock(
         ground = median(&lows);
     }
 
-    let flight = flight_frames(clip, ground);
-    for (ankle, toe) in feet {
-        let mut contact = vec![false; count];
-        for index in 0..count {
-            let skeleton = &clip.skeletons[index];
-            let low = joint(skeleton, ankle)[1].min(joint(skeleton, toe)[1]);
-            let speed = if index == 0 {
-                0.0
-            } else {
-                horizontal_speed(
-                    joint(&clip.skeletons[index - 1], ankle),
-                    joint(skeleton, ankle),
-                    fps,
-                )
-            };
-            contact[index] = !flight[index]
-                && low <= ground + thresholds.contact_height
-                && speed <= thresholds.contact_speed;
-        }
-        bridge_gaps(&mut contact, thresholds.bridge_frames);
+    for (foot_index, (ankle, toe)) in feet.into_iter().enumerate() {
+        let contact = contact_mask(clip, foot_index, ankle, toe, thresholds, fps);
         let runs = contact_runs(&contact, thresholds.min_run);
         if runs.is_empty() {
             continue;
@@ -1042,22 +1151,63 @@ fn hand_lock(
                 median(&points[2]),
             ];
             report.hand_contacts += 1;
-            for index in begin..end {
-                if solve_arm(body, &mut clip.poses[index], &rest, shoulder, elbow, wrist, target) {
+            // Fade the pin in and out over a few frames on either side. A run
+            // that starts and stops at full strength between two frames is a
+            // step in the arm's motion, which reads as a twitch. Kimodo carries
+            // the correction into the swing frames for the same reason.
+            let ramp = 4usize;
+            let first = begin.saturating_sub(ramp);
+            let last = (end + ramp).min(count);
+            for index in first..last {
+                let weight = if index < begin {
+                    (index + ramp + 1 - begin) as f64 / (ramp + 1) as f64
+                } else if index >= end {
+                    (last - index) as f64 / (ramp + 1) as f64
+                } else {
+                    1.0
+                };
+                let source = clip.poses[index].clone();
+                let hint = bend_hint(&clip.skeletons[index], shoulder, elbow, wrist);
+                if solve_arm(body, &mut clip.poses[index], &rest, shoulder, elbow, wrist, target, hint) {
+                    // Same guard as the legs: no single frame may swing the wrist
+                    // enough for the fingers to jump.
+                    limit_end_rotation(
+                        body,
+                        &mut clip.poses[index],
+                        &rest,
+                        &source,
+                        shoulder,
+                        elbow,
+                        wrist,
+                    );
+                    if weight < 1.0 {
+                        scale_chain_towards_source(
+                            body,
+                            &mut clip.poses[index],
+                            &rest,
+                            &source,
+                            &[shoulder, elbow],
+                            weight,
+                        );
+                    }
                     report.ik_frames += 1;
                 }
                 // How close the solved wrist actually sits to the pinned point.
-                let chain = forward_chain(body, &clip.poses[index], &rest);
-                let settled = chain[wrist].1;
-                let error = ((settled[0] - target[0] as f64).powi(2)
-                    + (settled[1] - target[1] as f64).powi(2)
-                    + (settled[2] - target[2] as f64).powi(2))
-                .sqrt();
-                report.max_hand_error = report.max_hand_error.max(error as f32);
+                // Only the frames inside the run are pinned; the ramp frames are
+                // deliberately between the source and the target.
+                if weight >= 1.0 {
+                    let chain = forward_chain(body, &clip.poses[index], &rest);
+                    let settled = chain[wrist].1;
+                    let error = ((settled[0] - target[0] as f64).powi(2)
+                        + (settled[1] - target[1] as f64).powi(2)
+                        + (settled[2] - target[2] as f64).powi(2))
+                    .sqrt();
+                    report.max_hand_error = report.max_hand_error.max(error as f32);
+                }
             }
             // The IK moved joints; the skeletons have to follow before the next
             // contact run looks at positions again.
-            for index in begin..end {
+            for index in first..last {
                 clip.skeletons[index] = body.forward_joints(&clip.poses[index]);
             }
         }
@@ -1078,6 +1228,7 @@ fn solve_arm(
     elbow: usize,
     wrist: usize,
     target: [f32; 3],
+    hint: Option<[f64; 3]>,
 ) -> bool {
     let target = [target[0] as f64, target[1] as f64, target[2] as f64];
     let start = {
@@ -1105,12 +1256,23 @@ fn solve_arm(
     let theta_bac_now = angle_between(sub3(a, b), sub3(a, c));
     let theta_bac_goal = cosine_rule(l_ab, l_at, l_bc);
 
-    let mut axis = cross3(sub3(c, a), sub3(b, a));
-    axis = if length3(axis) < 1e-8 {
-        [0.0, 0.0, 1.0]
+    // The bend plane. When the limb is nearly straight the cross product is
+    // numerically tiny and its direction is arbitrary, which makes the elbow
+    // flip from frame to frame - a visible twitch. In that case the plane from
+    // the previous frame is reused (Kimodo passes the same kind of hint through
+    // `hintOffset`).
+    let planar = cross3(sub3(c, a), sub3(b, a));
+    let straightness = length3(planar) / (distance3(a, c) * distance3(a, b)).max(1e-9);
+    let mut axis = if straightness < 0.05 {
+        hint.unwrap_or([0.0, 0.0, 1.0])
     } else {
-        normalise3(axis)
+        normalise3(planar)
     };
+    if length3(axis) < 1e-8 {
+        axis = [0.0, 0.0, 1.0];
+    } else {
+        axis = normalise3(axis);
+    }
 
     let mut moved = false;
     if (theta_abc_goal - theta_abc_now).abs() > 1e-6 {
@@ -1140,7 +1302,143 @@ fn solve_arm(
         let aim = math::align(&sub3(c, a), &sub3(target, a));
         moved |= rotate_joint_world(body, pose, rest, shoulder, &aim);
     }
+    if moved {
+        // The temporal limit is applied by the passes (see `limit_end_rotation`):
+        // a single solve in isolation has no previous frame to stay near.
+    }
     moved
+}
+
+/// Scale a solved chain back towards the source pose so the end joint's world
+/// orientation never changes by more than `MAX_IK_ROTATION_DEG` in one frame.
+fn limit_end_rotation(
+    body: &BodyModel,
+    pose: &mut Pose,
+    rest: &[f32],
+    original: &Pose,
+    shoulder: usize,
+    elbow: usize,
+    wrist: usize,
+) {
+    let solved = forward_chain(body, pose, rest);
+    let source = forward_chain(body, original, rest);
+    let end = solved[wrist].0;
+    let before = source[wrist].0;
+    // Angle of `end * before^T`.
+    let relative = math::mul_t3(&end, &before);
+    let trace = relative[0] + relative[4] + relative[8];
+    let angle = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0).acos();
+    let limit = MAX_IK_ROTATION_DEG.to_radians();
+    if angle <= limit || angle < 1e-6 {
+        return;
+    }
+    let keep = limit / angle;
+    for joint_index in [shoulder, elbow, wrist] {
+        let solved_rotation = solved[joint_index].0;
+        let source_rotation = source[joint_index].0;
+        let delta = math::mul_t3(&solved_rotation, &source_rotation);
+        let scaled = scale_rotation(&delta, keep);
+        let blended = math::mul3(&scaled, &source_rotation);
+        // Write the blended world rotation back through its parent.
+        let parent = body.parents[joint_index];
+        let world_rotation = if parent >= 0 {
+            let parent_world = &solved[parent as usize].0;
+            math::tmul3(parent_world, &blended)
+        } else {
+            blended
+        };
+        let angles = axis_angle(&world_rotation);
+        if joint_index == 0 {
+            pose.root = angles;
+        } else {
+            let at = (joint_index - 1) * 3;
+            pose.body[at] = angles[0];
+            pose.body[at + 1] = angles[1];
+            pose.body[at + 2] = angles[2];
+        }
+    }
+}
+
+/// Largest single-frame change of the IK end joint's orientation.
+const MAX_IK_ROTATION_DEG: f64 = 12.0;
+
+/// Shrink a rotation towards the identity by `scale`.
+fn scale_rotation(matrix: &[f64; 9], scale: f64) -> [f64; 9] {
+    let trace = matrix[0] + matrix[4] + matrix[8];
+    let angle = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0).acos();
+    if angle < 1e-9 {
+        return *matrix;
+    }
+    let axis = normalise3([
+        matrix[7] - matrix[5],
+        matrix[2] - matrix[6],
+        matrix[3] - matrix[1],
+    ]);
+    crate::ik::axis_angle_matrix(axis, angle * scale)
+}
+
+/// Scale a solved chain back towards the source pose by `keep` (0 = the source
+/// pose, 1 = the solved one). This is what makes the correction fade in and out
+/// instead of switching on between two frames.
+fn scale_chain_towards_source(
+    body: &BodyModel,
+    pose: &mut Pose,
+    rest: &[f32],
+    source: &Pose,
+    joints: &[usize],
+    keep: f64,
+) {
+    let keep = keep.clamp(0.0, 1.0);
+    if keep >= 0.9999 {
+        return;
+    }
+    let solved = forward_chain(body, pose, rest);
+    let original = forward_chain(body, source, rest);
+    for joint_index in joints {
+        let solved_rotation = solved[*joint_index].0;
+        let source_rotation = original[*joint_index].0;
+        let delta = math::mul_t3(&solved_rotation, &source_rotation);
+        let scaled = scale_rotation(&delta, keep);
+        let blended = math::mul3(&scaled, &source_rotation);
+        // Write the blended world rotation back through its parent.
+        let parent = body.parents[*joint_index];
+        let local = if parent >= 0 {
+            let parent_world = &solved[parent as usize].0;
+            math::tmul3(parent_world, &blended)
+        } else {
+            blended
+        };
+        let angles = axis_angle(&local);
+        if *joint_index == 0 {
+            pose.root = angles;
+        } else {
+            let at = (*joint_index - 1) * 3;
+            pose.body[at] = angles[0];
+            pose.body[at + 1] = angles[1];
+            pose.body[at + 2] = angles[2];
+        }
+    }
+}
+
+/// Current bend plane of a two-bone chain, used as the hint when the limb is
+/// nearly straight and the plane would otherwise be undefined.
+fn bend_hint(skeleton: &Skeleton, root: usize, middle: usize, end: usize) -> Option<[f64; 3]> {
+    let a = joint3_of(skeleton, root);
+    let b = joint3_of(skeleton, middle);
+    let c = joint3_of(skeleton, end);
+    let planar = cross3(sub3(c, a), sub3(b, a));
+    if length3(planar) < 1e-7 {
+        return None;
+    }
+    Some(normalise3(planar))
+}
+
+fn joint3_of(skeleton: &Skeleton, index: usize) -> [f64; 3] {
+    [
+        skeleton.positions[index * 3] as f64,
+        skeleton.positions[index * 3 + 1] as f64,
+        skeleton.positions[index * 3 + 2] as f64,
+    ]
 }
 
 /// Forward kinematics as `(rotation, position)` per joint, parent first.
@@ -1539,19 +1837,6 @@ mod tests {
         assert!((noise - 0.5).abs() < 1e-6, "noise {noise}");
     }
 
-    /// `gap` in the reference presets: a one frame dropout inside a stance is
-    /// bridged, a long one is not.
-    #[test]
-    fn short_dropouts_are_bridged() {
-        let mut contact = vec![true, true, false, true, true];
-        bridge_gaps(&mut contact, 1);
-        assert_eq!(contact, vec![true, true, true, true, true]);
-
-        let mut long = vec![true, true, false, false, true, true];
-        bridge_gaps(&mut long, 1);
-        assert_eq!(long, vec![true, true, false, false, true, true]);
-    }
-
     /// The analytic two-bone solve must put the wrist on its target and must not
     /// disturb the rest of the body.
     #[test]
@@ -1590,7 +1875,8 @@ mod tests {
             LEFT_SHOULDER,
             LEFT_ELBOW,
             LEFT_WRIST,
-            target
+            target,
+            None
         ));
 
         let after = body.forward_joints(&pose);
