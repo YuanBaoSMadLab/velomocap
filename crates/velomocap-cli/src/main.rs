@@ -211,6 +211,9 @@ enum Command {
         /// the reference's DoContactIK).
         #[arg(long)]
         no_leg_ik: bool,
+        /// Use the skinned foot-mesh sole points as the contact source.
+        #[arg(long)]
+        mesh_sole: bool,
         /// Temporal smoothing weight (0 = off, smaller is stronger).
         #[arg(long, default_value_t = 0.0)]
         smooth: f64,
@@ -487,6 +490,7 @@ fn main() -> Result<()> {
             no_foot,
             hand_lock,
             no_leg_ik,
+            mesh_sole,
             smooth,
             lock_preset,
             lock_mode,
@@ -526,6 +530,7 @@ fn main() -> Result<()> {
             no_foot,
             hand_lock,
             no_leg_ik,
+            mesh_sole,
             smooth,
             &lock_preset,
             &lock_mode,
@@ -1120,6 +1125,7 @@ fn flow_report(
     no_foot: bool,
     hand_lock: bool,
     no_leg_ik: bool,
+    mesh_sole: bool,
     smoothing: f64,
     lock_preset: &str,
     lock_mode: &str,
@@ -1342,7 +1348,7 @@ fn flow_report(
         floor,
         pelvis_offset: pelvis,
         leg_ik: !no_leg_ik,
-        mesh_sole: false,
+        mesh_sole,
         smoothing,
     };
     let correction = velomocap_motion::correction::apply(&mut clip, &model, &settings)?;

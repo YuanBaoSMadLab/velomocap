@@ -23,6 +23,20 @@ use velomocap_body::{BodyModel, Pose, Skeleton};
 /// One foot's two sole patches: back (heel side) then front (toe side).
 pub type FootProbes = [[f32; 3]; 2];
 
+/// Linear-interpolated quantile, the same convention numpy's quantile uses.
+fn quantile(values: &[f32], q: f32) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let position = q.clamp(0.0, 1.0) * (sorted.len() - 1) as f32;
+    let low = position.floor() as usize;
+    let high = (low + 1).min(sorted.len() - 1);
+    let weight = position - low as f32;
+    sorted[low] * (1.0 - weight) + sorted[high] * weight
+}
+
 pub struct SoleGeometry {
     /// Vertex indices of each of the four patches.
     patches: Vec<Vec<usize>>,
@@ -63,48 +77,46 @@ impl SoleGeometry {
                 anyhow::bail!("SMPL-H foot skin is unavailable");
             }
             // Split front from back along z (the model faces +z in its rest pose).
-            let mut zs: Vec<f32> = selected.iter().map(|v| shaped[v * 3 + 2]).collect();
-            zs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let median = zs[zs.len() / 2];
-            let q40 = zs[(zs.len() as f32 * 0.4) as usize];
-            let q65 = zs[((zs.len() as f32 * 0.65) as usize).min(zs.len() - 1)];
-
-            let mut back: Vec<usize> = selected
-                .iter()
-                .copied()
-                .filter(|v| shaped[v * 3 + 2] <= median)
-                .collect();
-            let mut front: Vec<usize> = selected
-                .iter()
-                .copied()
-                .filter(|v| shaped[v * 3 + 2] >= median)
-                .collect();
-            // Patch y is the sole: the lowest vertices of each half.
-            back.sort_by(|a, b| shaped[a * 3 + 1].partial_cmp(&shaped[b * 3 + 1]).unwrap());
-            front.sort_by(|a, b| shaped[a * 3 + 1].partial_cmp(&shaped[b * 3 + 1]).unwrap());
-            back.truncate(24);
-            front.truncate(24);
-            let _ = (q40, q65);
-
-            for patch in [back, front] {
-                let mut region: Vec<usize> = selected
+            let zs: Vec<f32> = selected.iter().map(|v| shaped[v * 3 + 2]).collect();
+            let median = quantile(&zs, 0.5);
+            // The reference pairs each region with a slightly tighter proxy set,
+            // then keeps the 24 lowest-y vertices of the proxy as the sole.
+            for (region_below, proxy_below) in [(true, 0.4f32), (false, 0.65)] {
+                let region: Vec<usize> = selected
                     .iter()
                     .copied()
                     .filter(|v| {
-                        let z = shaped[v * 3 + 2];
-                        // The owning region is the half the proxy came from.
-                        patch.iter().any(|p| p == v) || if patch.first().is_some_and(|p| shaped[*p * 3 + 2] <= median) {
+                        let z = shaped[*v * 3 + 2];
+                        if region_below {
                             z <= median
                         } else {
                             z >= median
                         }
                     })
                     .collect();
-                region.sort_unstable();
-                let proxy = patch
+                let mut proxy_ids: Vec<usize> = selected
+                    .iter()
+                    .copied()
+                    .filter(|v| {
+                        let z = shaped[*v * 3 + 2];
+                        if region_below {
+                            z <= quantile(&zs, proxy_below)
+                        } else {
+                            z >= quantile(&zs, proxy_below)
+                        }
+                    })
+                    .collect();
+                proxy_ids.sort_by(|a, b| {
+                    shaped[a * 3 + 1]
+                        .partial_cmp(&shaped[b * 3 + 1])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                proxy_ids.truncate(24);
+                proxy_ids.sort_unstable();
+                let proxy: Vec<usize> = proxy_ids
                     .iter()
                     .filter_map(|v| region.binary_search(v).ok())
-                    .collect::<Vec<usize>>();
+                    .collect();
                 patches.push(region);
                 proxies.push(proxy);
             }
