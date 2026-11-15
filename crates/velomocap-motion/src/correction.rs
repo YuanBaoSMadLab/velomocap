@@ -1166,10 +1166,43 @@ impl Sole {
     pub fn build(clip: &FlowClip, body: &BodyModel) -> Option<Self> {
         let geometry = crate::sole::SoleGeometry::build(body, &clip.betas).ok()?;
         let rest = body.rest_joints(&clip.betas);
-        let probes = clip
+        let raw: Vec<[[[f32; 3]; 2]; 2]> = clip
             .skeletons
             .iter()
             .map(|skeleton| geometry.sample(skeleton, &rest, 0))
+            .collect();
+        // The reference smooths the support weight inside each stance with a
+        // gaussian of sigma = max(0.5, fps * 0.04) frames. Smoothing the probe
+        // points once per clip has the same effect on the blended support point
+        // and stops the anchor following the skinning noise frame by frame.
+        let sigma = (clip.fps.max(1.0) * 0.04).max(0.5);
+        let radius = sigma.ceil().max(1.0) as isize;
+        let weights: Vec<f32> = (-radius..=radius)
+            .map(|offset| {
+                let o = offset as f32;
+                (-(o * o) / (2.0 * sigma * sigma)).exp()
+            })
+            .collect();
+        let total: f32 = weights.iter().sum();
+        let frames = raw.len();
+        let probes = (0..frames)
+            .map(|frame| {
+                let mut out = [[[0.0f32; 3]; 2]; 2];
+                for foot in 0..2 {
+                    for side in 0..2 {
+                        for axis in 0..3 {
+                            let mut sum = 0.0f32;
+                            for (slot, offset) in (-radius..=radius).enumerate() {
+                                let at = (frame as isize + offset).clamp(0, frames as isize - 1)
+                                    as usize;
+                                sum += raw[at][foot][side][axis] * weights[slot];
+                            }
+                            out[foot][side][axis] = sum / total;
+                        }
+                    }
+                }
+                out
+            })
             .collect();
         Some(Self { probes })
     }
