@@ -23,7 +23,6 @@ pub mod sam;
 pub mod sole;
 pub mod solver;
 pub mod temporal;
-pub mod trajectory;
 
 pub use bvh_people::write_person_bvh;
 pub use cleanup::{stabilise, CleanupConfig, CleanupReport};

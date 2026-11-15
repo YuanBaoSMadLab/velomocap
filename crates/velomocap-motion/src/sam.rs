@@ -451,7 +451,9 @@ pub fn capture_people_with(
     let backend = body.backend();
 
     (hooks.progress)(0, 0, "opening video");
-    let mut decoder = Decoder::open(&tools, video, Some(config.work_width))?;
+    // The reference re-encodes the clip to a constant 30 fps before anything
+    // touches it (`video.py`), so every stage below indexes a 30 fps stream.
+    let mut decoder = Decoder::open_flow(&tools, video, Some(config.work_width))?;
     let fps = if decoder.info().fps > 0.0 {
         decoder.info().fps
     } else {

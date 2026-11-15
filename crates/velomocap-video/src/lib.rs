@@ -462,6 +462,27 @@ impl Decoder {
         )
     }
 
+    /// `Decoder::open` for the motion pipeline: every clip is resampled to the
+    /// reference's constant 30 fps (`video.py`), so the model never sees a
+    /// 24/25/50/60 fps clip at its own rate.
+    pub fn open_flow(
+        tools: &Tools,
+        path: impl AsRef<Path>,
+        scale_to_width: Option<usize>,
+    ) -> Result<Self> {
+        let info = probe(tools, path.as_ref())?;
+        let (width, height) = match scale_to_width {
+            Some(target) if target > 0 && target < info.width => {
+                let scaled_h =
+                    (info.height as f64 * target as f64 / info.width as f64).round() as usize;
+                (target & !1, (scaled_h & !1).max(2))
+            }
+            _ => (info.width & !1, info.height & !1),
+        };
+        let filter = Self::flow_filter(&format!("scale={width}:{height}:flags=area"));
+        Self::spawn_with(tools, path.as_ref(), &filter, width, height, Some(Self::FLOW_FPS))
+    }
+
     /// Open a stream already cropped and scaled for VGGT-Omega, so the model
     /// receives exactly the `out_w × out_h` geometry [`VggtGeometry`] planned.
     pub fn open_vggt(
@@ -524,6 +545,59 @@ impl Decoder {
         Ok((decoder, geometry))
     }
 
+    /// `Decoder::open_vggt_with` for the motion pipeline: every clip is resampled
+    /// to the reference's constant 30 fps first.
+    pub fn open_vggt_with_flow(
+        tools: &Tools,
+        path: impl AsRef<Path>,
+        resolution: usize,
+        patch: usize,
+        portrait_only: bool,
+    ) -> Result<(Self, VggtGeometry)> {
+        let info = probe(tools, path.as_ref())?;
+        let geometry = VggtGeometry::plan_with(
+            info.width,
+            info.height,
+            resolution,
+            patch,
+            portrait_only,
+        );
+        let filter = Self::flow_filter(&geometry.filter());
+        let decoder = Self::spawn_with(
+            tools,
+            path.as_ref(),
+            &filter,
+            geometry.out_w,
+            geometry.out_h,
+            Some(Self::FLOW_FPS),
+        )?;
+        Ok((decoder, geometry))
+    }
+
+    /// `Decoder::open_vggt_canvas` for the motion pipeline: every clip is
+    /// resampled to the reference's constant 30 fps first.
+    pub fn open_vggt_canvas_flow(
+        tools: &Tools,
+        path: impl AsRef<Path>,
+        canvas: (usize, usize),
+        patch: usize,
+        portrait_only: bool,
+    ) -> Result<(Self, VggtGeometry)> {
+        let info = probe(tools, path.as_ref())?;
+        let geometry =
+            VggtGeometry::plan_canvas(info.width, info.height, canvas, patch, portrait_only);
+        let filter = Self::flow_filter(&geometry.filter());
+        let decoder = Self::spawn_with(
+            tools,
+            path.as_ref(),
+            &filter,
+            geometry.out_w,
+            geometry.out_h,
+            Some(Self::FLOW_FPS),
+        )?;
+        Ok((decoder, geometry))
+    }
+
     /// Open a decode stream that starts at `start_seconds` (fast seek placed
     /// before `-i`) and reports frame indices from `first_index`.
     ///
@@ -580,7 +654,34 @@ impl Decoder {
         width: usize,
         height: usize,
     ) -> Result<Self> {
-        let info = probe(tools, path)?;
+        Self::spawn_with(tools, path, filter, width, height, None)
+    }
+
+    /// The motion pipeline's frame rate: `flowhmr` re-encodes every clip to a
+    /// constant 30 fps (`video.py`, `-vf fps=30:start_time=0`) before any
+    /// inference, so the model never sees a 24/25/50/60 fps clip at its own rate.
+    pub const FLOW_FPS: f64 = 30.0;
+
+    /// The reference's resampling filter, prepended to an existing chain.
+    pub fn flow_filter(base: &str) -> String {
+        format!("fps={}:start_time=0,{base}", Self::FLOW_FPS)
+    }
+
+    fn spawn_with(
+        tools: &Tools,
+        path: &Path,
+        filter: &str,
+        width: usize,
+        height: usize,
+        fps: Option<f64>,
+    ) -> Result<Self> {
+        let mut info = probe(tools, path)?;
+        if let Some(fps) = fps {
+            // The stream is now constant-rate, so the frame count follows from the
+            // duration, and every per-frame time in the pipeline is `i / fps`.
+            info.frames = ((info.duration * fps).round() as usize).max(1);
+            info.fps = fps;
+        }
         let mut command = Command::new(&tools.ffmpeg);
         command
             .args(["-hide_banner", "-loglevel", "error", "-nostdin"])

@@ -282,9 +282,9 @@ enum Command {
         /// Euler steps for the flow-matching loop.
         #[arg(long, default_value_t = 20)]
         steps: usize,
-        /// Run VGGT on every N-th frame.
-        #[arg(long, default_value_t = 10)]
-        camera_stride: usize,
+        /// VGGT sampling interval: 0 = auto (reference interval, capped by the graph), or 1/2/5/10/30.
+        #[arg(long, default_value_t = 0)]
+        camera_interval: i32,
         /// Diagnostic: zero the SAM features, to prove the graph uses them.
         #[arg(long)]
         blank: bool,
@@ -367,12 +367,9 @@ enum Command {
         /// VGGT-Omega ONNX graph.
         #[arg(long, default_value = "models/flowhmr/vggt_omega_1b_512.onnx")]
         weights: PathBuf,
-        /// Run the network on every N-th frame (camera interpolated between).
-        #[arg(long, default_value_t = 10)]
-        stride: usize,
-        /// Cap on the number of network frames per clip.
-        #[arg(long, default_value_t = 8)]
-        max_samples: usize,
+        /// VGGT sampling interval: 0 = auto (reference interval, capped by the graph), or 1/2/5/10/30.
+        #[arg(long, default_value_t = 0)]
+        interval: i32,
         /// Use the CPU execution provider only.
         #[arg(long)]
         cpu: bool,
@@ -506,12 +503,11 @@ fn main() -> Result<()> {
         Command::Camera {
             video,
             weights,
-            stride,
-            max_samples,
+            interval,
             cpu,
             limit,
             json,
-        } => camera_track(&video, &weights, stride, max_samples, !cpu, limit, json),
+        } => camera_track(&video, &weights, interval, !cpu, limit, json),
         Command::Flow {
             video,
             detector,
@@ -554,7 +550,7 @@ fn main() -> Result<()> {
             width,
             confidence,
             steps,
-            camera_stride,
+            camera_interval,
             blank,
             zero_noise,
             dump,
@@ -620,7 +616,7 @@ fn main() -> Result<()> {
             width,
             confidence,
             steps,
-            camera_stride,
+            camera_interval,
             blank,
             zero_noise,
             dump.as_deref(),
@@ -1223,7 +1219,7 @@ fn flow_report(
     width: usize,
     confidence: f32,
     steps: usize,
-    camera_stride: usize,
+    camera_interval: i32,
     blank: bool,
     zero_noise: bool,
     dump: Option<&std::path::Path>,
@@ -1323,7 +1319,7 @@ fn flow_report(
             let tools = velomocap_video::Tools::discover()?;
             let mut vggt = VggtCamera::load(VggtConfig {
                 weights: resolve_model(camera_weights),
-                frame_stride: camera_stride.max(1),
+                interval: camera_interval,
                 session: SessionConfig {
                     gpu,
                     ..Default::default()
@@ -2002,8 +1998,7 @@ fn export_video_tracks(video: &std::path::Path) -> Result<()> {
 fn camera_track(
     video: &std::path::Path,
     weights: &std::path::Path,
-    stride: usize,
-    max_samples: usize,
+    interval: i32,
     gpu: bool,
     limit: usize,
     json: Option<PathBuf>,
@@ -2014,8 +2009,7 @@ fn camera_track(
     let tools = Tools::discover()?;
     let config = VggtConfig {
         weights: resolve_model(weights),
-        frame_stride: stride.max(1),
-        max_samples,
+        interval,
         max_frames: limit,
         session: SessionConfig {
             gpu,

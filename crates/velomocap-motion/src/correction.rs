@@ -1,15 +1,15 @@
 //! Contact correction for a generated SMPL-H clip.
 //!
-//! Ported from NVIDIA Kimodo's `MotionCorrection` (Apache-2.0, see `ik.rs` and
-//! `trajectory.rs` for the individual notices). Coverage against the original:
+//! Ported from the reference's `mocap/correction.py` (RGB MoCap, MIT), with the
+//! two-bone IK helpers from NVIDIA Kimodo's `MotionCorrection` (Apache-2.0; see
+//! `ik.rs` for that notice). Coverage:
 //!
 //! | Reference | Here |
 //! | --- | --- |
 //! | `IK::TwoBoneIk`, `IK::OneBoneIk` | `ik::two_bone_ik`, `ik::one_bone_ik` |
-//! | `TrajectoryCorrector` (ADMM) | `trajectory.rs` |
-//! | `CorrectHipsXZ` + `velocity_weights` | `foot_lock`, `velocity_weights` |
 //! | `prepare_contacts` (flat mode) | `contacts::prepare`, applied by `detect` |
 //! | `airborne_excursions` | `contacts` (it owns the flight mask) |
+//! | the root X/Z drift (`interp` + `gaussian_filter1d`, 12 cm cap) | `foot_lock`, `interpolate` |
 //! | `reachable_pelvis_drop` / `reachable_pelvis_lift` + their envelope | `root_height::plan` |
 //! | `pelvis_offset` (`Pelvis Height Offset (from Auto)`) | `root_height::plan`, step 3 |
 //! | the airborne clearance term | `root_height::plan`, step 4 |
@@ -17,8 +17,7 @@
 //! | `PRESETS` (`correction_settings.py`) | `Thresholds` |
 //! | `support_weights` / `support_samples` | `support_weight`, `support_point` |
 //! | `rolling_anchor` | `rolling_anchor`, `rolling_path` |
-//! | `couple_anchors` | `couple_anchor_offsets` |
-//! | `smooth_auto_handoffs` / `_hermite` | `smooth_handoffs`, `hermite` |
+//! | `couple_anchors`, `smooth_auto_handoffs`, `_hermite` | `couple_anchor_offsets`, `smooth_handoffs`, `hermite` |
 //! | `anatomical_ik.solve_legs`, `reach_lengths`, `minimum_reach_lengths` | `anatomical` |
 //! | `SoleGeometry` | `sole::SoleGeometry` (default) |
 //! | `source_reach_gap` + reach gain | `anatomical::source_reach_gap` in `hand_lock` |
@@ -27,16 +26,23 @@
 //! | `contact_pose_plan._optimise_window` (root height against the reach bounds) | `pose_plan::plan`, applied by `pose_plan_window` |
 //! | `scipy.optimize.least_squares` (both planning passes) | `solver::minimise` |
 //!
-//! The vertical chain is the reference's five steps, in its order: the X/Z pin
+//! The vertical chain is the reference's five steps, in its order: the X/Z drift
 //! (`foot_lock`), then `root_height` (drop → lift → user offset → airborne
 //! clearance), then the pose plan, then the leg solve. There is deliberately no
 //! "drop the lowest point onto the floor" pass: the floor is measured *from* the
 //! contact soles (`crate::floor`), so the body is already standing on it.
 //!
+//! The root's X/Z shift used to come from a ported Kimodo `TrajectoryCorrector`
+//! (an ADMM over position / velocity / acceleration). The reference has no such
+//! pass: it linearly interpolates the drift of the planted supports, smooths it
+//! with a gaussian of `max(1, fps·0.06)` frames and clamps it to 12 cm. That is
+//! what `foot_lock` does now, and `trajectory.rs` went with it.
+//!
 //! Known differences that are **not** ported:
 //!
 //! | Reference | Why |
 //! | --- | --- |
+//! | `contact_arm_plan.solve`'s two anchor x/z variables per stance | they let two overlapping palm supports be satisfied at once; this pass pins one palm at a time |
 //! | `contact_arm_plan.solve`'s two anchor x/z variables per stance | they let two overlapping palm supports be satisfied at once; this pass pins one palm at a time |
 //! | the world-fixed palm offset used inside the reference's `predict` | kept live here instead (`palm = wrist + R_upper·R_elbow·R_wrist_local·offset`), because a fixed world offset no longer matches the palm the applied pose produces once the arm swings |
 //! | the pose plan's per-swing-target height variables and its predicted (flex, hip rotation) state | the state exists to regularise the joint solve; this port bounds the root against the same `reach`/`minimum_reach` limits directly, and measures neutral on both fixtures |
@@ -76,11 +82,6 @@ const LEFT_ELBOW: usize = 18;
 const RIGHT_ELBOW: usize = 19;
 const LEFT_WRIST: usize = 20;
 const RIGHT_WRIST: usize = 21;
-
-/// Kimodo's default trajectory weights (`Utility.cpp`).
-const POS_WEIGHT: f64 = 0.001;
-const VEL_WEIGHT: f64 = 1.0;
-const ACC_WEIGHT: f64 = 10.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CorrectionMode {
@@ -208,6 +209,9 @@ pub struct CorrectionReport {
     pub jitter_after: f32,
     /// The pass was rolled back because it made the clip jumpier.
     pub skipped: bool,
+    /// No foot contact was detected at all, so the correction was skipped and the
+    /// clip is the source unchanged (`flow_correction.py`'s `contacts == 0`).
+    pub no_contacts: bool,
     /// The contact runs the detector found, per track (L foot, R foot, L hand,
     /// R hand). Empty for a limb it found nothing on, and for a limb whose track
     /// was hand-drawn — this is the editor's "automatic" baseline, and what
@@ -244,6 +248,9 @@ impl CorrectionReport {
         );
         if self.skipped {
             out.push_str(" (rolled back: it made the clip jumpier)");
+        }
+        if self.no_contacts {
+            out.push_str(" (no confident foot contacts: the source is kept)");
         }
         out
     }
@@ -314,11 +321,22 @@ pub fn apply_with_locks(
         }
     }
 
-    let mut foot = FootPass {
-        support: vec![[false; 2]; clip.skeletons.len()],
-        holds: vec![[0.0; 2]; clip.skeletons.len()],
-    };
-    if settings.foot {
+    // `flow_correction.py`: with no contact at all, the reference never writes
+    // `trans` and never touches the joints — the published motion is the source,
+    // bit for bit. The same rule here: no pin, no root plan and no pose plan, so
+    // a clip the detector found nothing in cannot drift because a clearance term
+    // decided to lift it.
+    let contacts = detected
+        .prepared
+        .active
+        .iter()
+        .any(|row| row[0] || row[1]);
+    if settings.foot && !contacts {
+        report.no_contacts = true;
+    }
+
+    let mut foot = FootPass::empty(clip.skeletons.len());
+    if settings.foot && contacts {
         foot = foot_lock(sole.as_ref(), clip, settings, locks, &thresholds, &detected, &mut report);
         // The reference's vertical chain: drop, lift, the user's own offset and
         // the airborne clearance, all before the pose plan sees the root.
@@ -332,7 +350,7 @@ pub fn apply_with_locks(
     }
     // Kimodo's order: end effectors (hands) first, then the contact IK that
     // stabilises the legs on the ground.
-    if settings.foot && settings.leg_ik {
+    if settings.foot && contacts && settings.leg_ik {
         leg_ik(sole.as_ref(), clip, body, settings, &thresholds, &foot, &mut report);
     }
 
@@ -358,6 +376,7 @@ pub fn apply_with_locks(
         report.skipped = true;
         report.max_shift = 0.0;
         report.vertical_shift = 0.0;
+        report.pelvis_drop = 0.0;
         report.pelvis_lift = 0.0;
     }
     Ok(report)
@@ -565,27 +584,6 @@ fn release_pivots(clip: &FlowClip, fps: f32, prepared: &mut crate::contacts::Pre
     }
 }
 
-/// Kimodo's velocity weights: slow motion is preserved more strongly, so a
-/// character that is standing still does not drift while the solver evens out
-/// the contacts.
-fn velocity_weights(clip: &FlowClip) -> Vec<f64> {
-    let count = clip.skeletons.len();
-    if count == 0 {
-        return Vec::new();
-    }
-    let mut weights = vec![1.0f64; count];
-    for frame in 1..count {
-        let x = (clip.skeletons[frame].positions[0] - clip.skeletons[frame - 1].positions[0]) as f64;
-        let z = (clip.skeletons[frame].positions[2] - clip.skeletons[frame - 1].positions[2]) as f64;
-        let speed = (x * x + z * z).sqrt() / 0.05;
-        weights[frame] = 1.0 / speed.max(1e-3);
-    }
-    if count > 1 {
-        weights[0] = weights[1];
-    }
-    weights
-}
-
 /// The reference's vertical chain, steps 1–4: the reach drop, the reach lift, the
 /// user's own pelvis offset and the airborne clearance (`correction.py`).
 ///
@@ -750,6 +748,7 @@ fn pose_plan_window(
     report.vertical_shift = report.vertical_shift.max(moved);
 }
 
+
 /// How strongly a run is held, from the network's own contact probabilities.
 /// The layout of the four channels differs between checkpoints, so the run is
 /// scored with the largest of them: a low score only softens the hold, it never
@@ -769,6 +768,9 @@ fn contact_confidence(clip: &FlowClip, begin: usize, end: usize, confidence: f32
     }
     (best / confidence).clamp(0.5, 1.0)
 }
+
+/// Kimodo's `_hermite`: `count` interior samples of the cubic that matches the
+/// endpoint values and velocities of a segment.
 
 /// Kimodo's `_hermite`: `count` interior samples of the cubic that matches the
 /// endpoint values and velocities of a segment.
@@ -993,11 +995,15 @@ fn leg_ik(
                 let sole_at = support_point(sole, clip, index, foot_index, ankle, toe);
                 let hip_pos = joint(&clip.skeletons[index], hip);
                 // Move the ankle so that the sole's support point lands back on
-                // the anchor; the ankle itself is free to slide over it.
+                // the anchor; the ankle itself is free to slide over it. The hold
+                // strength scales the residual goal offset (`strength` in
+                // `contact_offsets`), not the root drift: the root already took
+                // the full drift, so a weak preset leaves the rest to the pose.
+                let hold = foot.holds[index][foot_index] as f64;
                 let target = [
-                    current[0] as f64 + (anchors[offset][0] - sole_at[0]) as f64,
+                    current[0] as f64 + (anchors[offset][0] - sole_at[0]) as f64 * hold,
                     current[1] as f64,
-                    current[2] as f64 + (anchors[offset][2] - sole_at[2]) as f64,
+                    current[2] as f64 + (anchors[offset][2] - sole_at[2]) as f64 * hold,
                 ];
                 let hip_f = [
                     hip_pos[0] as f64,
@@ -1415,7 +1421,14 @@ fn foot_lock(
             }
         }
 
-        let adjustments = couple_anchor_offsets(&runs, &anchors, &support, fps);
+        let adjustments = if manual.is_some() {
+            // `prepare_contacts`: only explicit user stances get cross-gap
+            // position coupling; an automatic travel split must not accumulate
+            // into a false long-duration pin.
+            couple_anchor_offsets(&runs, &anchors, &support, fps)
+        } else {
+            vec![[0.0f32; 2]; runs.len()]
+        };
         let mut local_x = vec![0.0f64; count];
         let mut local_z = vec![0.0f64; count];
         let mut local_used = vec![false; count];
@@ -1424,16 +1437,18 @@ fn foot_lock(
             for index in *begin..*end {
                 // Horizontal only: the vertical placement belongs to the root
                 // chain, which measures reach against the legs, not the plane.
-                local_x[index] = (anchors[index][0] + adjustment[0] - support[index][0]) as f64
-                    * holds[index] as f64;
-                local_z[index] = (anchors[index][2] + adjustment[1] - support[index][2]) as f64
-                    * holds[index] as f64;
+                // The root takes the *full* drift; `strength` is applied to the
+                // remaining goal offset inside the leg IK, as the reference does.
+                local_x[index] = (anchors[index][0] + adjustment[0] - support[index][0]) as f64;
+                local_z[index] = (anchors[index][2] + adjustment[1] - support[index][2]) as f64;
                 local_used[index] = true;
             }
         }
-        // Stances that touch exactly get their correction carried across with a
-        // Hermite blend, so the anchor does not step at the boundary.
-        smooth_handoffs(&runs, &mut local_x, &mut local_z, fps);
+        if manual.is_none() {
+            // Stances that touch exactly get their correction carried across
+            // with a Hermite blend, so the anchor does not step at the boundary.
+            smooth_handoffs(&runs, &mut local_x, &mut local_z, fps);
+        }
         for index in 0..count {
             if !local_used[index] {
                 continue;
@@ -1454,49 +1469,62 @@ fn foot_lock(
         return pass;
     }
 
-    // Kimodo's trajectory corrector: the contact frames are pins (margin 0), the
-    // rest is free, and velocity/acceleration weights keep the root from
-    // jumping between them. This replaces the old per-frame blend, which could
-    // still kink the root where a contact run started.
-    let mut margins = vec![-1.0f64; count];
-    for index in 0..count {
-        if pinned[index] {
-            margins[index] = 0.0;
-        }
-    }
-    if !margins.iter().any(|margin| *margin == 0.0) {
-        return pass;
-    }
-    let reference = vec![0.0f64; count];
-    // Kimodo's velocity weights: standing still is weighted up so the root does
-    // not drift while the solver evens out the contacts.
-    let weights = velocity_weights(clip);
-    let corrector = crate::trajectory::TrajectoryCorrector::new(
-        &margins,
-        POS_WEIGHT,
-        VEL_WEIGHT,
-        ACC_WEIGHT,
-        &weights,
-        60,
-    );
-    let shift_x = corrector.interpolate(&target_x, &reference);
-    let shift_z = corrector.interpolate(&target_z, &reference);
+    // `prepare_contacts`: the root's X/Z shift is the drift of the planted
+    // supports, linearly interpolated across the whole clip (edge-held), smoothed
+    // with a gaussian of `max(1, fps·0.06)` frames and clamped to the reference's
+    // 12 cm. Not an ADMM trajectory solve: the reference has no such pass, and the
+    // linear-plus-gaussian curve is what keeps a long clip from drifting apart at
+    // its ends.
+    let support_frames: Vec<usize> = (0..count).filter(|index| pinned[*index]).collect();
+    let sigma = (fps * 0.06).max(1.0);
+    let mut shift_x = interpolate(&target_x, &support_frames, count);
+    let mut shift_z = interpolate(&target_z, &support_frames, count);
+    shift_x = crate::contacts::gaussian_smooth(&shift_x, sigma);
+    shift_z = crate::contacts::gaussian_smooth(&shift_z, sigma);
+    let mut shift_x: Vec<f64> = shift_x.iter().map(|value| *value as f64).collect();
+    let mut shift_z: Vec<f64> = shift_z.iter().map(|value| *value as f64).collect();
 
     let cap = thresholds.max_correction as f64;
     for index in 0..count {
-        let mut delta = [shift_x[index], 0.0, shift_z[index]];
-        let length = (delta[0] * delta[0] + delta[2] * delta[2]).sqrt();
+        let length = (shift_x[index] * shift_x[index] + shift_z[index] * shift_z[index]).sqrt();
         if length > cap && length > 0.0 {
-            let scale = cap / length;
-            delta[0] *= scale;
-            delta[2] *= scale;
+            shift_x[index] *= cap / length;
+            shift_z[index] *= cap / length;
         }
         report.max_shift = report.max_shift.max(length as f32);
         for axis in [0usize, 2] {
-            clip.poses[index].translation[axis] += delta[axis] as f32;
+            let delta = if axis == 0 { shift_x[index] } else { shift_z[index] };
+            clip.poses[index].translation[axis] += delta as f32;
         }
     }
     pass
+}
+
+/// `np.interp(arange(count), frames, values)`: linear between the known frames,
+/// held at both ends.
+fn interpolate(values: &[f64], frames: &[usize], count: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; count];
+    if frames.is_empty() || count == 0 {
+        return out;
+    }
+    for index in 0..count {
+        if index <= frames[0] {
+            out[index] = values[frames[0]] as f32;
+            continue;
+        }
+        if index >= *frames.last().unwrap() {
+            out[index] = values[*frames.last().unwrap()] as f32;
+            continue;
+        }
+        // The support frame at or before `index`, and the one after it.
+        let next = frames.partition_point(|frame| *frame <= index);
+        let low = frames[next - 1];
+        let high = frames[next];
+        let span = (high - low).max(1) as f64;
+        let weight = (index - low) as f64 / span;
+        out[index] = (values[low] * (1.0 - weight) + values[high] * weight) as f32;
+    }
+    out
 }
 
 fn hand_lock(
@@ -2350,6 +2378,68 @@ mod tests {
         let detected = detect(None, &clip, &settings, &thresholds);
         foot_lock(None, &mut clip, &settings, &tracks, &thresholds, &detected, &mut report);
         assert_eq!(report.foot_contacts, 0, "back to automatic detection");
+    }
+
+    /// `np.interp(arange(n), frames, values)`: linear between the known frames and
+    /// held at the ends. This is the curve the root's X/Z shift is built on.
+    #[test]
+    fn the_drift_interpolation_matches_numpy() {
+        let values = [0.0, 0.0, 4.0, 4.0, 9.0];
+        let frames = [0usize, 2, 4];
+        let out = interpolate(&values, &frames, 5);
+        assert_eq!(out, vec![0.0, 2.0, 4.0, 6.5, 9.0]);
+        // A single support frame holds everywhere.
+        assert_eq!(interpolate(&values, &[3], 5), vec![4.0; 5]);
+        assert!(interpolate(&values, &[], 5).iter().all(|value| *value == 0.0));
+    }
+
+    /// `flow_correction.py`: with no contact at all the reference writes nothing —
+    /// `trans` and every joint stay the source, bit for bit. Ours must too, so a
+    /// clip the detector found nothing in cannot drift because a clearance term
+    /// decided to lift it.
+    #[test]
+    fn a_clip_without_contacts_is_returned_unchanged() {
+        let Some((body, _rest)) = loaded() else {
+            eprintln!("skipping: SMPL-H model not found");
+            return;
+        };
+        let frames = 24usize;
+        let mut pose = Pose::neutral(body.num_joints, 16);
+        let mut poses = Vec::with_capacity(frames);
+        for frame in 0..frames {
+            pose.translation = [frame as f32 * 0.12, 0.0, 0.0];
+            poses.push(pose.clone());
+        }
+        let skeletons: Vec<Skeleton> = poses.iter().map(|p| body.forward_joints(p)).collect();
+        let mut clip = FlowClip {
+            fps: 30.0,
+            poses,
+            skeletons,
+            rot6d: Vec::new(),
+            trans: vec![[0.0; 3]; frames],
+            betas: vec![0.0; 16],
+            foot_contacts: Vec::new(),
+            floor: 0.0,
+            floor_from_contacts: false,
+            offset: [0.0; 3],
+            source_frames: (0..frames).collect(),
+            anchors: 0,
+            anchor_residual: [0.0; 3],
+        };
+        let before: Vec<[f32; 3]> = clip.poses.iter().map(|p| p.translation).collect();
+        let before_points: Vec<Vec<f32>> = clip.skeletons.iter().map(|s| s.positions.clone()).collect();
+        let report = apply(&mut clip, &body, &CorrectionSettings::default()).expect("apply");
+        assert!(report.no_contacts, "the sliding clip must report no contacts");
+        assert_eq!(report.foot_contacts, 0);
+        for (index, pose) in clip.poses.iter().enumerate() {
+            assert_eq!(pose.translation, before[index], "frame {index} root moved");
+        }
+        for (index, skeleton) in clip.skeletons.iter().enumerate() {
+            assert_eq!(
+                skeleton.positions, before_points[index],
+                "frame {index} joints moved"
+            );
+        }
     }
 
     #[test]

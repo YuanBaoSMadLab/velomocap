@@ -273,7 +273,11 @@ fn play(
     } else {
         (info.width & !1, info.height & !1)
     };
-    let filter = format!("scale={width}:{height}:flags=bilinear");
+    // Decode on the transport's own grid. The motion path resamples every clip to
+    // a constant 30 fps (`Decoder::open_flow`), so the preview has to be on that
+    // same grid or the person overlay would drift against the picture on a
+    // 24/25/50/60 fps source.
+    let filter = format!("fps={fps},scale={width}:{height}:flags=bilinear");
     let start_seconds = frame as f64 / fps;
     let Ok(mut decoder) = velomocap_video::Decoder::spawn_at(
         tools,

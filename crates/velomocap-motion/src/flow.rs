@@ -55,6 +55,8 @@ pub const HAND_TOKENS: usize = 2;
 pub const HIP_KEYPOINTS: [usize; 2] = [9, 10];
 /// The reference matches at most the first 30 frames.
 pub const ANCHOR_FRAMES: usize = 30;
+/// `flow_backend.MAX_FRAMES`: the pinned FlowHMR per-branch RoPE table, at 30 fps.
+pub const MAX_FRAMES: usize = 5000;
 
 #[derive(Clone, Debug)]
 pub struct FlowConfig {
@@ -172,7 +174,47 @@ pub fn feature_rows(track: &PersonTrack, frames: &[usize]) -> Result<Vec<f32>> {
         }
         previous = Some(frame);
     }
+    if !zero_hands {
+        interpolate_hands(&mut rows);
+    }
     Ok(rows)
+}
+
+/// `flow_hand_sampling.interpolate_hands`: the hand slots are consumed on every
+/// fourth frame (plus the last) and linearly interpolated in between.
+///
+/// The hand crops are near-duplicates over four frames, so conditioning on all
+/// of them only adds cost and noise; sampling at four and interpolating keeps the
+/// generator's hand context smooth without changing the body rows. Only
+/// `[1024..3072]` is touched.
+fn interpolate_hands(rows: &mut [f32]) {
+    let frames = rows.len() / FEATURE_DIM;
+    if frames < 2 {
+        return;
+    }
+    let mut anchors: Vec<usize> = (0..frames).step_by(4).collect();
+    if *anchors.last().unwrap() != frames - 1 {
+        anchors.push(frames - 1);
+    }
+    let hand = TOKEN_DIM * HAND_TOKENS;
+    let sampled: Vec<Vec<f32>> = anchors
+        .iter()
+        .map(|frame| rows[frame * FEATURE_DIM + TOKEN_DIM..frame * FEATURE_DIM + FEATURE_DIM].to_vec())
+        .collect();
+    let mut left = 0usize;
+    for frame in 0..frames {
+        while left + 1 < anchors.len() && anchors[left + 1] < frame {
+            left += 1;
+        }
+        let right = (left + 1).min(anchors.len() - 1);
+        let span = anchors[right].saturating_sub(anchors[left]).max(1) as f32;
+        let weight = (frame.saturating_sub(anchors[left])) as f32 / span;
+        for slot in 0..hand {
+            let a = sampled[left][slot];
+            let b = sampled[right][slot];
+            rows[frame * FEATURE_DIM + TOKEN_DIM + slot] = a * (1.0 - weight) + b * weight;
+        }
+    }
 }
 
 /// The clip frames the motion stage uses: contiguous, inside the camera track.
@@ -196,6 +238,15 @@ fn clip_frames(
     if max_frames > 0 && frames.len() > max_frames {
         frames.truncate(max_frames);
     }
+    // `flow_backend.validate_length`: the pinned model's per-branch RoPE table has
+    // this many slots, so a longer clip is not something the graph can represent
+    // — it has to be refused, not silently truncated inside the attention.
+    anyhow::ensure!(
+        frames.len() <= MAX_FRAMES,
+        "FlowHMR supports up to {MAX_FRAMES} frames ({:.1} s at 30 fps); this clip has {} — use --limit",
+        MAX_FRAMES as f32 / 30.0,
+        frames.len()
+    );
     Ok(frames)
 }
 
@@ -1006,6 +1057,35 @@ pub fn summarise(clip: &FlowClip) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `flow_hand_sampling`: hand slots are taken on frames 0, 4, 8, … and the
+    /// last one, and linearly interpolated in between; the body slot is never
+    /// touched.
+    #[test]
+    fn hand_slots_are_sampled_every_four_frames_and_interpolated() {
+        let frames = 10usize;
+        let mut rows = vec![0.0f32; frames * FEATURE_DIM];
+        for frame in 0..frames {
+            rows[frame * FEATURE_DIM] = frame as f32; // body marker
+            for slot in 0..TOKEN_DIM * HAND_TOKENS {
+                rows[frame * FEATURE_DIM + TOKEN_DIM + slot] = (frame * 10) as f32;
+            }
+        }
+        interpolate_hands(&mut rows);
+        // The body slot is untouched.
+        for frame in 0..frames {
+            assert_eq!(rows[frame * FEATURE_DIM], frame as f32);
+        }
+        // Anchors keep their own value: 0, 4, 8 and the last frame 9.
+        for frame in [0usize, 4, 8, 9] {
+            assert_eq!(rows[frame * FEATURE_DIM + TOKEN_DIM], (frame * 10) as f32);
+        }
+        // Frame 6 is halfway between 4 and 8.
+        assert!((rows[6 * FEATURE_DIM + TOKEN_DIM] - 60.0).abs() < 1e-4);
+        // Frame 9 is an anchor (the reference always includes the last frame), so
+        // frame 5 sits between 4 and 8, not between 4 and 9.
+        assert!((rows[5 * FEATURE_DIM + TOKEN_DIM] - 50.0).abs() < 1e-4);
+    }
 
     #[test]
     fn narrowband_matches_the_reference_config() {

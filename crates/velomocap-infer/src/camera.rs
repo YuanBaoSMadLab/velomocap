@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use ndarray::{Array2, Array5};
 
 use crate::{Backend, Model, SessionConfig};
-use velomocap_video::{Decoder, Tools, VggtGeometry};
+use velomocap_video::{Tools, VggtGeometry};
 
 /// Head layout of the exported network.
 const PATCH_SIZE: usize = 16;
@@ -33,15 +33,24 @@ pub struct VggtConfig {
     pub weights: PathBuf,
     /// Longest side of the network input, in pixels.
     pub resolution: usize,
-    /// Run the network on every N-th frame; the camera is interpolated between
-    /// samples. `1` runs it on every frame (accurate but slow, and the
-    /// inter-frame attention cost grows quadratically).
-    pub frame_stride: usize,
+    /// How the clip is sampled for the network (`flow_backend.camera_interval`).
+    ///
+    /// `0` is automatic: `max(1, ceil((frames-1)/127))`, so at most 128 frames
+    /// are sampled and the last one is always included. `1`, `2`, `5`, `10` and
+    /// `30` force that interval; `-1` means "no VGGT at all" (a locked static
+    /// camera), which the caller has to honour before it gets here.
+    pub interval: i32,
+    /// Frames the shipped graph can actually run in one shot.
+    ///
+    /// The exported VGGT keeps the whole inter-frame attention alive, so its cost
+    /// is quadratic in the sampled frame count: 112 frames at the 512×288 canvas
+    /// asks for ~180 GB, while 16 frames fits comfortably. The reference runs up
+    /// to 128 because its implementation chunks that attention; until this graph
+    /// is re-exported the same way, the reference's interval is raised when it
+    /// would exceed this count, and the last frame stays included.
+    pub graph_frames: usize,
     /// Stop after this many video frames (0 = whole video).
     pub max_frames: usize,
-    /// Clips are limited to this many network frames; longer clips are sampled
-    /// more sparsely so the inter-frame attention stays affordable.
-    pub max_samples: usize,
     /// Exact network canvas `(height, width)`, or `None` to derive it from the
     /// clip's aspect ratio.
     ///
@@ -57,9 +66,9 @@ impl Default for VggtConfig {
         Self {
             weights: PathBuf::from("models/flowhmr/vggt_omega_1b_512.onnx"),
             resolution: 512,
-            frame_stride: 10,
+            interval: 0,
+            graph_frames: 16,
             max_frames: 0,
-            max_samples: 16,
             canvas: Some((512, 288)),
             session: SessionConfig::default(),
         }
@@ -221,6 +230,25 @@ impl CameraTrack {
             })
             .collect()
     }
+}
+
+/// `flow_backend.camera_interval`: how many frames apart the network samples.
+///
+/// `0` is automatic — `max(1, ceil((frames-1)/127))`, which keeps the count at
+/// or below 128 for any clip length. `-1` means "do not run VGGT" (a locked
+/// static camera) and is the caller's decision, not the sampler's; every other
+/// value has to come from the reference's set, because the sampling is part of
+/// the method and an arbitrary stride is not comparable with it.
+pub fn camera_interval(frames: usize, requested: i32) -> Result<usize> {
+    anyhow::ensure!(frames > 0, "the camera sampler needs at least one frame");
+    if requested == 0 {
+        return Ok((((frames - 1) as f64 / 127.0).ceil().max(1.0)) as usize);
+    }
+    anyhow::ensure!(
+        matches!(requested, 1 | 2 | 5 | 10 | 30),
+        "unsupported camera sampling interval {requested}; use 0 (auto), 1, 2, 5, 10 or 30"
+    );
+    Ok(requested as usize)
 }
 
 /// Rotation table for an `h_patches × w_patches` grid.
@@ -459,14 +487,14 @@ impl VggtCamera {
         // traced with), so landscape clips are rotated a quarter turn and the
         // camera is un-rotated below.
         let (mut decoder, geometry) = match self.config.canvas {
-            Some(canvas) => velomocap_video::Decoder::open_vggt_canvas(
+            Some(canvas) => velomocap_video::Decoder::open_vggt_canvas_flow(
                 tools,
                 video,
                 canvas,
                 PATCH_SIZE,
                 true,
             )?,
-            None => Decoder::open_vggt_with(
+            None => velomocap_video::Decoder::open_vggt_with_flow(
                 tools,
                 video,
                 self.config.resolution,
@@ -477,35 +505,28 @@ impl VggtCamera {
         self.geometry = Some(geometry);
         let (h_patches, w_patches) = geometry.patch_grid(PATCH_SIZE);
 
-        // Sample the video: every `stride` frames, always including the last one
-        // so the interpolation covers the whole clip.
+        // Sample the video exactly as `flow_backend.camera_interval` does: an
+        // automatic interval that keeps the count at or below 128, an explicit
+        // one from the reference's set, and the last frame always included so the
+        // interpolation covers the whole clip.
         let total = if self.config.max_frames > 0 {
             self.config.max_frames
         } else {
             decoder.info().frames.max(1)
         };
-        let stride = self.config.frame_stride.max(1);
-        let mut wanted: Vec<usize> = (0..total).step_by(stride).collect();
+        let interval = camera_interval(total, self.config.interval)?;
+        // The reference's interval, raised only as far as the shipped graph's
+        // single-shot attention needs (`graph_frames`).
+        let limit = self.config.graph_frames.max(2);
+        let interval = interval.max(
+            (((total.saturating_sub(1)) as f64) / ((limit - 1) as f64)).ceil() as usize,
+        );
+        let mut wanted: Vec<usize> = (0..total).step_by(interval).collect();
         if wanted.is_empty() {
             wanted.push(0);
         }
         if *wanted.last().unwrap() != total - 1 {
             wanted.push(total - 1);
-        }
-        // Cap the number of network frames; the inter-frame attention is O((N·T)²).
-        if self.config.max_samples > 0 && wanted.len() > self.config.max_samples {
-            let keep = self.config.max_samples;
-            let step = (wanted.len() - 1) as f64 / (keep - 1) as f64;
-            let mut sampled: Vec<usize> = (0..keep)
-                .map(|i| wanted[((i as f64) * step).round() as usize])
-                .collect();
-            sampled.dedup();
-            if *sampled.last().unwrap() != total - 1 {
-                let last = *sampled.last().unwrap();
-                *sampled.last_mut().unwrap() = total - 1;
-                let _ = last;
-            }
-            wanted = sampled;
         }
 
         let want: std::collections::HashSet<usize> = wanted.iter().copied().collect();
@@ -700,6 +721,23 @@ fn mat_mul3(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reference's interval table: automatic stays at or below 128 samples
+    /// and a forced value has to be one of the five it allows.
+    #[test]
+    fn the_camera_interval_matches_the_reference() {
+        assert_eq!(camera_interval(90, 0).unwrap(), 1);
+        assert_eq!(camera_interval(128, 0).unwrap(), 1);
+        assert_eq!(camera_interval(129, 0).unwrap(), 2);
+        assert_eq!(camera_interval(5000, 0).unwrap(), 40);
+        // 5000 frames at an interval of 40 is 126 samples, inside the cap.
+        assert!(5000usize.div_ceil(40) <= 128);
+        for forced in [1, 2, 5, 10, 30] {
+            assert_eq!(camera_interval(300, forced).unwrap(), forced as usize);
+        }
+        assert!(camera_interval(300, 3).is_err());
+        assert!(camera_interval(0, 0).is_err());
+    }
 
     /// A static camera only has to say "nothing moved": every frame's rotation
     /// relative to frame zero must be the identity, which is what the estimator
