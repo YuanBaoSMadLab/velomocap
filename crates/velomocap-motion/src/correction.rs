@@ -78,37 +78,60 @@ impl Default for CorrectionSettings {
     }
 }
 
+/// Solver parameters, mapped from the reference's `PRESETS` table
+/// (`correction_settings.py`).
 pub struct Thresholds {
+    /// How close to the ground a sole must be to count as planted.
     pub contact_height: f32,
+    /// Horizontal speed above which a low foot is sliding, not planted.
     pub contact_speed: f32,
+    /// Frames a correction fades in and out over.
     pub blend_frames: usize,
+    /// Hard cap on how far a frame may be moved (`anchor_drift`).
     pub max_correction: f32,
+    /// Shortest contact run that is kept (`minimum`).
     pub min_run: usize,
+    /// How much of the correction is applied (`strength`: weak holds 60%).
+    pub strength: f32,
+    /// Dropouts shorter than this are bridged (`gap`).
+    pub bridge_frames: usize,
+    /// Contact probability needed for a full-strength hold (`confidence`).
+    pub confidence: f32,
 }
 
 impl CorrectionSettings {
     pub fn thresholds(&self) -> Thresholds {
         match self.preset {
+            // The reference calls these strong / normal / weak.
             LockPreset::Tight => Thresholds {
                 contact_height: 0.035,
                 contact_speed: 0.03,
                 blend_frames: 4,
                 max_correction: 0.20,
                 min_run: 2,
+                strength: 1.0,
+                bridge_frames: 2,
+                confidence: 0.65,
             },
             LockPreset::Normal => Thresholds {
                 contact_height: 0.07,
                 contact_speed: 0.06,
                 blend_frames: 3,
-                max_correction: 0.35,
+                max_correction: 0.12,
                 min_run: 2,
+                strength: 1.0,
+                bridge_frames: 2,
+                confidence: 0.65,
             },
             LockPreset::Loose => Thresholds {
                 contact_height: 0.12,
                 contact_speed: 0.12,
                 blend_frames: 2,
-                max_correction: 0.55,
+                max_correction: 0.12,
                 min_run: 1,
+                strength: 0.6,
+                bridge_frames: 0,
+                confidence: 0.75,
             },
         }
     }
@@ -258,6 +281,52 @@ fn ground_feet(
         clip.poses[frame].translation[1] += delta as f32;
     }
     report.vertical_shift = moved;
+}
+
+/// Fill dropouts shorter than `frames` so a brief loss of the contact signal
+/// does not split one stance into two (`gap` in the reference's presets).
+fn bridge_gaps(contact: &mut [bool], frames: usize) {
+    if frames == 0 {
+        return;
+    }
+    let count = contact.len();
+    let mut index = 0;
+    while index < count {
+        if contact[index] {
+            index += 1;
+            continue;
+        }
+        let begin = index;
+        while index < count && !contact[index] {
+            index += 1;
+        }
+        let end = index;
+        if begin > 0 && end < count && end - begin <= frames {
+            for hit in &mut contact[begin..end] {
+                *hit = true;
+            }
+        }
+    }
+}
+
+/// How strongly a run is held, from the network's own contact probabilities.
+/// The layout of the four channels differs between checkpoints, so the run is
+/// scored with the largest of them: a low score only softens the hold, it never
+/// drops a contact the geometry found.
+fn contact_confidence(clip: &FlowClip, begin: usize, end: usize, confidence: f32) -> f32 {
+    if clip.foot_contacts.len() < end || confidence <= 0.0 {
+        return 1.0;
+    }
+    let mut best = 0.0f32;
+    for frame in begin..end {
+        for value in clip.foot_contacts[frame] {
+            best = best.max(value);
+        }
+    }
+    if best <= 0.0 {
+        return 1.0;
+    }
+    (best / confidence).clamp(0.5, 1.0)
 }
 
 /// Kimodo's `TargetReachFalloff`: a Gaussian that fades the IK weight out as the
@@ -465,6 +534,7 @@ fn foot_lock(
             contact[index] =
                 low <= ground + thresholds.contact_height && speed <= thresholds.contact_speed;
         }
+        bridge_gaps(&mut contact, thresholds.bridge_frames);
         for (begin, end) in contact_runs(&contact, thresholds.min_run) {
             let mut xs = Vec::new();
             let mut zs = Vec::new();
@@ -477,17 +547,22 @@ fn foot_lock(
             // dropped onto its floor. Snapping Y on the contact frames only is
             // what made the body bob up and down after a reconstruction.
             let anchor = [median(&xs), median(&zs)];
+            // Weak presets hold 60% of the correction, and a low network contact
+            // probability softens it further instead of dropping the contact.
+            let hold =
+                thresholds.strength * contact_confidence(clip, begin, end, thresholds.confidence);
             report.foot_contacts += 1;
             for index in begin..end {
                 let at = joint(&clip.skeletons[index], ankle);
+                let dx = (anchor[0] - at[0]) as f64 * hold as f64;
+                let dz = (anchor[1] - at[2]) as f64 * hold as f64;
                 // Two feet in contact at once average their demands.
-                let share = if pinned[index] { 0.5 } else { 1.0 };
                 if pinned[index] {
-                    target_x[index] = 0.5 * (target_x[index] + (anchor[0] - at[0]) as f64);
-                    target_z[index] = 0.5 * (target_z[index] + (anchor[1] - at[2]) as f64);
+                    target_x[index] = 0.5 * (target_x[index] + dx);
+                    target_z[index] = 0.5 * (target_z[index] + dz);
                 } else {
-                    target_x[index] = (anchor[0] - at[0]) as f64 * share;
-                    target_z[index] = (anchor[1] - at[2]) as f64 * share;
+                    target_x[index] = dx;
+                    target_z[index] = dz;
                 }
                 pinned[index] = true;
             }
@@ -940,6 +1015,19 @@ mod tests {
             worst.1,
             worst.0
         );
+    }
+
+    /// `gap` in the reference presets: a one frame dropout inside a stance is
+    /// bridged, a long one is not.
+    #[test]
+    fn short_dropouts_are_bridged() {
+        let mut contact = vec![true, true, false, true, true];
+        bridge_gaps(&mut contact, 1);
+        assert_eq!(contact, vec![true, true, true, true, true]);
+
+        let mut long = vec![true, true, false, false, true, true];
+        bridge_gaps(&mut long, 1);
+        assert_eq!(long, vec![true, true, false, false, true, true]);
     }
 
     /// The analytic two-bone solve must put the wrist on its target and must not
