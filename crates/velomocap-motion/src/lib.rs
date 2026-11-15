@@ -13,6 +13,7 @@ pub mod floor;
 pub mod flow;
 pub mod ik;
 pub mod locks;
+pub mod metrics;
 pub mod palm;
 pub mod pipeline;
 pub mod placement;
@@ -38,6 +39,7 @@ pub use pipeline::{
 };
 pub use fit::{fit_sequence, summarise, FitConfig, FittedFrame, Fitter};
 pub use locks::{ContactTracks, Interval, LOCK_VERSION, TRACK_COUNT, TRACK_LABELS};
+pub use metrics::FootMetrics;
 pub use sam::{
     capture_people, capture_people_with, PeopleCapture, PersonFrame, PersonTrack, SamConfig,
     SamHooks,

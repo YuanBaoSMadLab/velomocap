@@ -304,12 +304,17 @@ pub fn prepare(
         speed[0] = speed[1];
         vertical[0] = vertical[1];
     }
-    // The four channels are two per foot; which pair belongs to which foot
-    // differs between checkpoints, so take the foot's own pair.
+    // The four channels are two per foot: `L ankle/toe, R ankle/toe`
+    // (`flow_correction.contact_probabilities`). `flow_correction` clips them to
+    // [0, 1] — the ODE output overshoots a little, and the reference's own gate
+    // asserts the range — so the clip is part of the port.
     let mut confidence = vec![[0.0f32; 2]; count];
     for frame in 0..count {
         let row = probabilities.get(frame).copied().unwrap_or([0.0; 4]);
-        confidence[frame] = [row[0].max(row[1]), row[2].max(row[3])];
+        confidence[frame] = [
+            row[0].max(row[1]).clamp(0.0, 1.0),
+            row[2].max(row[3]).clamp(0.0, 1.0),
+        ];
     }
     let mut geometry = vec![[false; 2]; count];
     for frame in 0..count {

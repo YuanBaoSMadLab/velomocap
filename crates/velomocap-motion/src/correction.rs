@@ -220,6 +220,18 @@ pub struct CorrectionReport {
     /// was hand-drawn — this is the editor's "automatic" baseline, and what
     /// `--dump-locks` writes out so the runs can be edited and fed back.
     pub detected: [Vec<[usize; 2]>; crate::locks::TRACK_COUNT],
+    /// What the planted feet did before and after the pass. This is the number
+    /// that reads as "the feet slide": measured on the sole probes, over the
+    /// frames the detector called contact.
+    pub feet_before: crate::metrics::FootMetrics,
+    pub feet_after: crate::metrics::FootMetrics,
+    /// The corrected sole probes per frame, for `--dump-soles` and a viewport
+    /// overlay. [foot][patch][xyz].
+    pub soles: Vec<crate::contacts::Probes>,
+    /// The same probes before the pass, so a dump can show both.
+    pub soles_before: Vec<crate::contacts::Probes>,
+    /// The contact mask the pass honoured, per frame and foot.
+    pub active: Vec<[bool; 2]>,
 }
 
 impl CorrectionReport {
@@ -254,6 +266,13 @@ impl CorrectionReport {
         }
         if self.no_contacts {
             out.push_str(" (no confident foot contacts: the source is kept)");
+        }
+        if !self.feet_before.empty() && !self.feet_after.empty() {
+            out.push_str("; ");
+            out.push_str(&crate::metrics::FootMetrics::delta_line(
+                &self.feet_before,
+                &self.feet_after,
+            ));
         }
         out
     }
@@ -322,6 +341,12 @@ pub fn apply_with_locks(
                 .map(|(begin, end)| [begin, end])
                 .collect();
         }
+        // What the planted soles do in the source: the baseline the pass has to
+        // improve on, measured on the same probes the detector used.
+        report.feet_before =
+            crate::metrics::measure(&detected.rows, &detected.prepared.active, settings.floor);
+        report.active = detected.prepared.active.clone();
+        report.soles_before = detected.rows.clone();
     }
 
     // `flow_correction.py`: with no contact at all, the reference never writes
@@ -363,6 +388,15 @@ pub fn apply_with_locks(
         .map(|pose| body.forward_joints(pose))
         .collect();
 
+    // The same measurement on the result, on the same contact frames: this is
+    // what the viewer sees, and what `--dump-soles` writes out.
+    if settings.foot && !detected.rows.is_empty() {
+        let rows = probe_rows(sole.as_ref(), clip);
+        report.feet_after =
+            crate::metrics::measure(&rows, &detected.prepared.active, settings.floor);
+        report.soles = rows;
+    }
+
     let after = quality(&clip.skeletons, settings.floor);
     report.jitter_before = before.jitter;
     report.jitter_after = after.jitter;
@@ -381,6 +415,8 @@ pub fn apply_with_locks(
         report.vertical_shift = 0.0;
         report.pelvis_drop = 0.0;
         report.pelvis_lift = 0.0;
+        report.feet_after = report.feet_before;
+        report.soles = detected.rows.clone();
     }
     Ok(report)
 }
@@ -434,6 +470,13 @@ fn quality(skeletons: &[Skeleton], floor: f32) -> Quality {
 
 /// 99th percentile of the per-joint second difference of the joint positions,
 /// in metres. This is the number that tracks what reads as twitching.
+///
+/// Exposed because the report quotes it and a dump has to be checkable against
+/// it: two different numbers for the same clip are a bug in the measurement.
+pub fn pose_jitter(skeletons: &[Skeleton]) -> f32 {
+    jitter_score(skeletons)
+}
+
 fn jitter_score(skeletons: &[Skeleton]) -> f32 {
     let count = skeletons.len();
     if count < 3 {
@@ -446,13 +489,10 @@ fn jitter_score(skeletons: &[Skeleton]) -> f32 {
         let next = &skeletons[frame + 1].positions;
         let joints = current.len() / 3;
         for joint in 0..joints {
-            let at = joint * 3;
-            let mut sum = 0.0f32;
-            for axis in 0..3 {
-                let second = current[at + axis] - 2.0 * previous[at + axis] + next[at + axis];
-                sum += second * second;
-            }
-            values.push(sum.sqrt());
+            let second = second_difference(previous, current, next, joint);
+            values.push(
+                (second[0] * second[0] + second[1] * second[1] + second[2] * second[2]).sqrt(),
+            );
         }
     }
     if values.is_empty() {
@@ -461,6 +501,22 @@ fn jitter_score(skeletons: &[Skeleton]) -> f32 {
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let index = ((values.len() as f32 * 0.99) as usize).min(values.len() - 1);
     values[index]
+}
+
+/// `previous - 2·current + next` for one joint: the frame at `current` is the
+/// middle one, so it is the term that gets doubled.
+///
+/// This used to be written as `current - 2·previous + next`, which is not a
+/// second difference at all: it reported 3-4× the real twitch (391 mm instead of
+/// 126 mm on a clip with a genuinely fast arm), and the "keep the correction only
+/// if it does not add jitter" gate was reading that inflated number.
+fn second_difference(previous: &[f32], current: &[f32], next: &[f32], joint: usize) -> [f32; 3] {
+    let at = joint * 3;
+    let mut out = [0.0f32; 3];
+    for axis in 0..3 {
+        out[axis] = previous[at + axis] - 2.0 * current[at + axis] + next[at + axis];
+    }
+    out
 }
 
 /// One frame's sole probes, in the layout `contacts::prepare` expects: per foot
@@ -546,11 +602,17 @@ fn detect(
 
 /// A turning clip pivots on the ball of the foot while the sole stays down.
 /// Pinning such a stance horizontally fights the motion and reads as jitter, so a
-/// run whose foot heading swings faster than 240 deg/s is released.
+/// stance whose foot heading *keeps* swinging faster than 240 deg/s is released.
 ///
 /// This is a deliberate addition: it is not in the reference, whose network does
 /// not pivot this hard on a turn. `contacts::prepare` is left alone so the floor
 /// estimate still sees every stance the geometry found.
+///
+/// The test is the **median** rate over the stance, not the fastest frame. A
+/// single flipped frame — FlowHMR does produce 180° joint flips on short clips —
+/// used to release a perfectly planted stance for its whole length: on a clip
+/// where the right foot stands still for all 30 frames, the right foot ended up
+/// with no contact at all while the reference held it for 30/30 frames.
 fn release_pivots(clip: &FlowClip, fps: f32, prepared: &mut crate::contacts::Prepared) {
     let count = clip.skeletons.len();
     if count < 2 {
@@ -567,7 +629,7 @@ fn release_pivots(clip: &FlowClip, fps: f32, prepared: &mut crate::contacts::Pre
             heading[frame] = (toe_at[2] - ankle_at[2]).atan2(toe_at[0] - ankle_at[0]);
         }
         for (begin, end) in foot_runs(&prepared.active, foot) {
-            let mut fastest = 0.0f32;
+            let mut rates = Vec::with_capacity(end - begin);
             for frame in begin + 1..end {
                 let mut delta = heading[frame] - heading[frame - 1];
                 while delta > std::f32::consts::PI {
@@ -576,9 +638,14 @@ fn release_pivots(clip: &FlowClip, fps: f32, prepared: &mut crate::contacts::Pre
                 while delta < -std::f32::consts::PI {
                     delta += std::f32::consts::TAU;
                 }
-                fastest = fastest.max(delta.abs() * fps);
+                rates.push(delta.abs() * fps);
             }
-            if fastest > 240.0f32.to_radians() {
+            if rates.is_empty() {
+                continue;
+            }
+            rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median = rates[rates.len() / 2];
+            if median > 240.0f32.to_radians() {
                 for frame in begin..end {
                     prepared.active[frame][foot] = false;
                 }
@@ -2740,6 +2807,21 @@ mod tests {
 
     /// The analytic two-bone solve must put the wrist on its target and must not
     /// disturb the rest of the body.
+    #[test]
+    fn the_second_difference_doubles_the_middle_frame() {
+        // Constant velocity: no acceleration, so no twitch.
+        let previous = [0.0f32, 0.0, 0.0];
+        let current = [1.0f32, 0.0, 0.0];
+        let next = [2.0f32, 0.0, 0.0];
+        assert_eq!(second_difference(&previous, &current, &next, 0), [0.0; 3]);
+        // The middle frame is the term that gets doubled: displacing it by 0.5 m
+        // gives a second difference of exactly 1.0 m. Written the other way round
+        // (`current - 2*previous + next`) this same sample reads 3.5 m, which is
+        // what the jitter score used to report for every clip.
+        let current = [1.5f32, 0.0, 0.0];
+        assert_eq!(second_difference(&previous, &current, &next, 0), [-1.0, 0.0, 0.0]);
+    }
+
     #[test]
     fn solve_arm_reaches_the_target() {
         let Some((body, rest)) = loaded() else {

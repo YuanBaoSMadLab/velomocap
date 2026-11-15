@@ -218,6 +218,10 @@ enum Command {
         dump_rotations: Option<PathBuf>,
         #[arg(long)]
         dump_probes: Option<PathBuf>,
+        /// Write the corrected sole probes per frame (f32 LE: frames x 2 feet x
+        /// 2 patches x 3), the data behind the foot-stability line.
+        #[arg(long)]
+        dump_soles: Option<PathBuf>,
         /// Disable foot/hand contact correction.
         #[arg(long)]
         no_correction: bool,
@@ -533,6 +537,7 @@ fn main() -> Result<()> {
             dump_joints,
             dump_rotations,
             dump_probes,
+            dump_soles,
             no_correction,
             no_foot,
             hand_lock,
@@ -599,6 +604,7 @@ fn main() -> Result<()> {
             dump_joints.as_deref(),
             dump_rotations.as_deref(),
             dump_probes.as_deref(),
+            dump_soles.as_deref(),
             no_correction,
             no_foot,
             hand_lock,
@@ -1202,6 +1208,7 @@ fn flow_report(
     dump_joints: Option<&std::path::Path>,
     dump_rotations: Option<&std::path::Path>,
     dump_probes: Option<&std::path::Path>,
+    dump_soles: Option<&std::path::Path>,
     no_correction: bool,
     no_foot: bool,
     hand_lock: bool,
@@ -1471,8 +1478,71 @@ fn flow_report(
             lock_summary(&detected)
         );
     }
-    let correction = velomocap_motion::correction::apply(&mut clip, &model, &settings)?;
-    println!("  {}", correction.line());
+    // The correction used to be applied a second time here (once with the locks,
+    // once without). Every pass that runs twice changes the clip twice: the
+    // smoothing, the root-height plan and the leg IK all stack, and the clip that
+    // was exported was not the clip the report above described.
+    if let Some(path) = dump_soles {
+        // A text table rather than a binary blob: the questions that matter are
+        // "which frames were called planted" and "how high was the sole on each
+        // of them", and both are easier to answer by reading lines. Both sides of
+        // the pass are written, with the contact probability the detector read,
+        // so the reference can be run on exactly the same samples.
+        let mut text = String::new();
+        text.push_str(&format!(
+            "# floor {:.4} m (resolved {:.4})\n# before: {}\n# after:  {}\n",
+            settings.floor,
+            clip.floor,
+            correction.feet_before.line(),
+            correction.feet_after.line()
+        ));
+        text.push_str("# which frame foot patch x y z active probability\n");
+        for (label, rows) in [
+            ("before", &correction.soles_before),
+            ("after", &correction.soles),
+        ] {
+            for frame in 0..rows.len() {
+                for foot in 0..2 {
+                    let active = correction
+                        .active
+                        .get(frame)
+                        .map(|mask| mask[foot])
+                        .unwrap_or(false);
+                    let probability = clip
+                        .foot_contacts
+                        .get(frame)
+                        .copied()
+                        .unwrap_or([f32::NAN; 4]);
+                    for patch in 0..2 {
+                        let at = rows[frame][foot][patch];
+                        text.push_str(&format!(
+                            "{} {} {} {} {:.5} {:.5} {:.5} {} {:.4} {:.4} {:.4} {:.4}\n",
+                            label,
+                            frame,
+                            foot,
+                            patch,
+                            at[0],
+                            at[1],
+                            at[2],
+                            if active { 1 } else { 0 },
+                            probability[0],
+                            probability[1],
+                            probability[2],
+                            probability[3]
+                        ));
+                    }
+                }
+            }
+        }
+        std::fs::write(path, &text)?;
+        println!(
+            "wrote {} ({} frames, {} contact frames on the left, {} on the right)",
+            path.display(),
+            correction.soles.len(),
+            correction.feet_after.frames[0],
+            correction.feet_after.frames[1]
+        );
+    }
 
     if let Some(path) = dump_probes {
         let rows = velomocap_motion::correction::dump_probe_points(&clip, &model);
