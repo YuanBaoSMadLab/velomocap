@@ -218,8 +218,9 @@ pub fn show(
     // reframes - the four gestures the footer advertises.
     if response.dragged_by(egui::PointerButton::Primary) {
         let delta = response.drag_delta();
-        // The scene follows the cursor: drag right and the subject turns to the
-        // right, which is what "grab and turn it" means to a user.
+        // Convention (measured, not guessed): dragging left moves the picture to
+        // the right, dragging right moves it left, and the pivot stays put. The
+        // Qt viewport (`mocap/viewport.py`) uses the same `-=` sign.
         orbit.yaw -= delta.x * 0.008;
         orbit.pitch = (orbit.pitch + delta.y * 0.008).clamp(-1.45, 1.45);
         orbit.framed = true;
@@ -287,9 +288,11 @@ pub fn show(
     canvas.resize(width, height);
     canvas.clear_gradient(SKY_TOP, SKY_BOTTOM);
 
-    if scene.layers.grid {
-        draw_grid(canvas, &camera, orbit.target, scene.floor);
-    }
+    let grid = if scene.layers.grid {
+        Some(draw_grid(canvas, &camera, orbit.target, scene.floor))
+    } else {
+        None
+    };
     if scene.layers.motion_path && scene.trail.len() > 1 {
         for pair in scene.trail.windows(2) {
             canvas.line(&camera, pair[0], pair[1], TRAIL);
@@ -355,7 +358,7 @@ pub fn show(
         );
     }
 
-    painted_labels(ui, rect, scene, orbit, &camera, size);
+    painted_labels(ui, rect, scene, orbit, &camera, size, grid);
 
     changed || response.dragged() || response.double_clicked()
 }
@@ -393,11 +396,67 @@ fn mix_channel(from: u8, to: u8, t: f32) -> u8 {
     (from as f32 + (to as f32 - from as f32) * t).clamp(0.0, 255.0) as u8
 }
 
-fn draw_grid(canvas: &mut Canvas, camera: &Camera, target: [f32; 3], floor: f32) {
-    let half = 8.0f32;
-    let step = 0.5f32;
-    let centre_x = (target[0] / 1.0).round();
-    let centre_z = (target[2] / 1.0).round();
+/// Spacing and half-extent of the floor grid for one camera pose, in metres.
+#[derive(Clone, Copy)]
+struct GridGeometry {
+    /// Distance between two lines.
+    step: f32,
+    /// Half the width of the patch that is drawn.
+    half: f32,
+}
+
+impl GridGeometry {
+    /// Every second line is the heavier one: 1 m over a 0.5 m grid, like the Qt
+    /// viewport.
+    fn major(self) -> f32 {
+        self.step * 2.0
+    }
+
+    fn extent(self) -> f32 {
+        self.half * 2.0
+    }
+}
+
+/// Pick a spacing and an extent that keep the floor readable at any zoom.
+///
+/// The old grid was 16 m across with a fixed 0.5 m step, so pulling back packed
+/// the lines below one pixel and the floor turned into a moiré that appeared to
+/// gain and lose lines as the camera moved, while pushing in wasted work on
+/// hundreds of lines the view could not resolve.
+fn grid_geometry(camera: &Camera, distance: f32) -> GridGeometry {
+    const MIN_CELL_PIXELS: f32 = 12.0;
+    let wanted = camera.metres_per_pixel(distance) * MIN_CELL_PIXELS;
+    let mut step = 0.5f32;
+    while step < wanted && step < 512.0 {
+        step *= 2.0;
+    }
+    let mut half = (distance * 1.6).max(8.0);
+    let mut count = (half / step).round().max(1.0);
+    // Bound the work per frame: about a hundred lines each way is already more
+    // than a viewport can resolve.
+    while count > 100.0 && step < 512.0 {
+        step *= 2.0;
+        count = (half / step).round().max(1.0);
+    }
+    half = count * step;
+    GridGeometry { step, half }
+}
+
+/// Whether a world coordinate lands on a heavy line.
+fn on_major(value: f32, major: f32) -> bool {
+    let nearest = (value / major).round();
+    (value - nearest * major).abs() < major * 1e-3
+}
+
+fn draw_grid(canvas: &mut Canvas, camera: &Camera, target: [f32; 3], floor: f32) -> GridGeometry {
+    let distance = render::length(render::sub(target, camera.eye));
+    let geometry = grid_geometry(camera, distance);
+    let (step, half) = (geometry.step, geometry.half);
+    // Anchor the patch to whole steps of the world grid, so every line stays on
+    // a fixed world coordinate: panning moves the edge of the patch, never the
+    // position or the shade of a line.
+    let centre_x = (target[0] / step).round() * step;
+    let centre_z = (target[2] / step).round() * step;
     // A slightly lighter plane under the lines, so the ground reads as a surface
     // instead of loose stripes.
     let plane = [
@@ -412,36 +471,49 @@ fn draw_grid(canvas: &mut Canvas, camera: &Camera, target: [f32; 3], floor: f32)
     // they wrote; the bodies that follow still occlude themselves correctly.
     canvas.begin_overlay();
 
-    let count = (half / step) as i32;
+    let major = geometry.major();
+    let count = (half / step).round() as i32;
     for index in -count..=count {
-        let offset = index as f32 * step;
-        let major = (offset % 1.0).abs() < 1e-3;
-        let colour = if major { GRID_MAJOR } else { GRID_MINOR };
+        let x = centre_x + index as f32 * step;
+        let z = centre_z + index as f32 * step;
+        // Shade from the world coordinate rather than the loop index, so a heavy
+        // line keeps its colour when the patch re-centres.
+        let along_z = if on_major(x, major) { GRID_MAJOR } else { GRID_MINOR };
+        let along_x = if on_major(z, major) { GRID_MAJOR } else { GRID_MINOR };
         canvas.line(
             camera,
-            [centre_x + offset, floor, centre_z - half],
-            [centre_x + offset, floor, centre_z + half],
-            colour,
+            [x, floor, centre_z - half],
+            [x, floor, centre_z + half],
+            along_z,
         );
         canvas.line(
             camera,
-            [centre_x - half, floor, centre_z + offset],
-            [centre_x + half, floor, centre_z + offset],
-            colour,
+            [centre_x - half, floor, z],
+            [centre_x + half, floor, z],
+            along_x,
         );
     }
-    canvas.line(
-        camera,
-        [centre_x - half, floor, centre_z],
-        [centre_x + half, floor, centre_z],
-        AXIS_X,
-    );
-    canvas.line(
-        camera,
-        [centre_x, floor, centre_z - half],
-        [centre_x, floor, centre_z + half],
-        AXIS_Z,
-    );
+    // The axes mark the *world* origin. Drawing them where the patch re-centred
+    // made them wander across the floor while panning, and because they were
+    // depth-tested against the grid line they sit on, the two fought over the
+    // same pixels and the red/blue lines blinked in and out.
+    if (0.0 - centre_z).abs() <= half {
+        canvas.line_overlay(
+            camera,
+            [centre_x - half, floor, 0.0],
+            [centre_x + half, floor, 0.0],
+            AXIS_X,
+        );
+    }
+    if (0.0 - centre_x).abs() <= half {
+        canvas.line_overlay(
+            camera,
+            [0.0, floor, centre_z - half],
+            [0.0, floor, centre_z + half],
+            AXIS_Z,
+        );
+    }
+    geometry
 }
 
 fn draw_bones(canvas: &mut Canvas, camera: &Camera, keypoints: &[f32]) {
@@ -467,6 +539,7 @@ fn painted_labels(
     orbit: &Orbit,
     _camera: &Camera,
     _size: [f32; 2],
+    grid: Option<GridGeometry>,
 ) {
     let painter = ui.painter_at(rect);
     painter.text(
@@ -532,17 +605,21 @@ fn painted_labels(
         egui::FontId::proportional(11.0),
         HINT,
     );
+    let grid_info = match grid {
+        Some(grid) => format!("{:.0} m | {} / {} m", grid.extent(), grid.step, grid.major()),
+        None => i18n::zh_en("关闭", "off"),
+    };
     painter.text(
         rect.right_bottom() + egui::vec2(-10.0, -10.0),
         egui::Align2::RIGHT_BOTTOM,
         match i18n::lang() {
             i18n::Lang::Zh => format!(
-                "地面 Y {:+.2} m | 20 m | 0.5 / 1 m | Y 向上   ·   {:+.1} m",
-                scene.floor, orbit.distance
+                "地面 Y {:+.2} m | {} | Y 向上   ·   {:+.1} m",
+                scene.floor, grid_info, orbit.distance
             ),
             i18n::Lang::En => format!(
-                "Grid Y {:+.2} m | 20 m | 0.5 / 1 m | Y Up   ·   {:+.1} m",
-                scene.floor, orbit.distance
+                "Grid Y {:+.2} m | {} | Y Up   ·   {:+.1} m",
+                scene.floor, grid_info, orbit.distance
             ),
         },
         egui::FontId::proportional(11.0),
@@ -564,8 +641,11 @@ fn painted_labels(
         -sin_pitch,
         -cos_pitch * cos_yaw,
     ];
-    let right = render::normalise(render::cross([0.0, 1.0, 0.0], forward));
-    let up = render::cross(forward, right);
+    // Same basis as `Camera::orbit`. Building the gizmo from `cross(up, forward)`
+    // instead pointed the whole triad the other way, so the widget turned against
+    // the scene: Y showed downwards and X pointed left.
+    let right = render::normalise(render::cross(forward, [0.0, 1.0, 0.0]));
+    let up = render::cross(right, forward);
     for (axis, colour, label) in [
         ([1.0, 0.0, 0.0], egui::Color32::from_rgb(214, 92, 92), "X"),
         ([0.0, 1.0, 0.0], egui::Color32::from_rgb(122, 200, 122), "Y"),
@@ -618,4 +698,185 @@ fn scene_bounds(scene: &Scene<'_>) -> Option<([f32; 3], [f32; 3])> {
         }
     }
     any.then_some((min, max))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The grid must stay legible at every zoom: cells wide enough to resolve,
+    /// lines spaced on a power-of-two multiple of the reference 0.5 m, and a
+    /// patch that reaches past the pivot. A fixed step over a fixed 16 m patch
+    /// is what made distant lines crowd into a moiré that seemed to gain and
+    /// lose lines as the camera moved.
+    #[test]
+    fn grid_spacing_stays_readable_at_every_zoom() {
+        for distance in [0.3f32, 1.0, 3.6, 10.0, 30.0, 80.0, 120.0] {
+            for size in [[480.0f32, 320.0], [1100.0, 800.0]] {
+                let camera = Camera::orbit([0.0, 0.9, 0.0], 0.28, 0.12, distance, size);
+                let grid = grid_geometry(&camera, distance);
+                let cell = grid.step / camera.metres_per_pixel(distance);
+                assert!(
+                    cell >= 10.0,
+                    "a {:.2} m cell is only {cell:.1} px wide at {distance} m",
+                    grid.step
+                );
+                let multiple = grid.step / 0.5;
+                assert!(
+                    (multiple.log2().fract()).abs() < 1e-4,
+                    "step {} is not a power-of-two multiple of 0.5 m",
+                    grid.step
+                );
+                let lines = grid.half / grid.step;
+                assert!(lines <= 100.0 + 0.5, "{lines} lines each way at {distance} m");
+                assert!(
+                    grid.half + 1e-3 >= (distance * 1.6).max(8.0),
+                    "the patch stops at {:.1} m when the camera is {distance} m out",
+                    grid.half
+                );
+            }
+        }
+    }
+
+    /// Zooming a little must not re-space the grid: the step is a function of
+    /// the distance, but it may only change when a cell would otherwise become
+    /// too small to read.
+    #[test]
+    fn grid_does_not_respace_over_a_small_zoom() {
+        let size = [1100.0f32, 800.0];
+        let camera = Camera::orbit([0.0, 0.9, 0.0], 0.28, 0.12, 3.6, size);
+        let baseline = grid_geometry(&camera, 3.6).step;
+        for step in 0..100 {
+            let distance = 3.0 + step as f32 * 0.02;
+            let camera = Camera::orbit([0.0, 0.9, 0.0], 0.28, 0.12, distance, size);
+            assert_eq!(
+                grid_geometry(&camera, distance).step,
+                baseline,
+                "the grid re-spaced at {distance} m"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod visual {
+    use super::*;
+
+    /// Visual harness: rasterise the floor grid at a given pose into a raw RGB
+    /// file, so the result can be looked at without opening the GUI.
+    ///
+    ///     VELOMOCAP_GRID_DUMP=out.rgb cargo test -p velomocap-app dump_grid_frame -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_grid_frame() {
+        let (width, height) = (642usize, 434usize);
+        let distance: f32 = std::env::var("VELOMOCAP_GRID_DISTANCE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(5.6);
+        let camera = Camera::orbit(
+            [0.0, 0.9, 0.0],
+            0.28,
+            0.12,
+            distance,
+            [width as f32, height as f32],
+        );
+        let mut canvas = Canvas::new(width, height);
+        canvas.clear_gradient(SKY_TOP, SKY_BOTTOM);
+        let grid = draw_grid(&mut canvas, &camera, [0.0, 0.9, 0.0], 0.0);
+        eprintln!(
+            "grid: step {} m, extent {:.0} m at {distance} m",
+            grid.step,
+            grid.extent()
+        );
+        let mut out = Vec::with_capacity(width * height * 3);
+        for pixel in &canvas.colour {
+            out.extend_from_slice(&pixel[0..3]);
+        }
+        let path = std::env::var("VELOMOCAP_GRID_DUMP")
+            .unwrap_or_else(|_| std::env::temp_dir().join("grid_frame.rgb").display().to_string());
+        std::fs::write(&path, &out).expect("writing the raw frame");
+        eprintln!("grid frame -> {path}");
+    }
+}
+
+#[cfg(test)]
+mod orbit_tests {
+    use crate::render::Camera;
+
+    /// The orbit convention, pinned numerically: a left drag turns the subject's
+    /// front to the left (the camera orbits to the right around the pivot),
+    /// which is what `mocap/viewport.py` does with `yaw -= delta.x`. The sign is
+    /// one character and a screenshot cannot show which way the scene turned.
+    #[test]
+    fn dragging_left_turns_the_subject_left() {
+        let size = [642.0f32, 434.0];
+        let target = [0.0, 0.9, 0.0];
+        // A point on the front of the subject, which is what a user watches.
+        let marker = [0.0, 0.9, 1.0];
+        let base_yaw = 0.28f32;
+        let screen_x = |yaw: f32| {
+            Camera::orbit(target, yaw, 0.12, 5.6, size)
+                .project(marker)
+                .expect("the marker stays in front of the camera")
+                .0[0]
+        };
+        // `show` applies `yaw -= delta.x * 0.008`.
+        let base = screen_x(base_yaw);
+        let left = screen_x(base_yaw - (-40.0 * 0.008));
+        let right = screen_x(base_yaw - (40.0 * 0.008));
+        assert!(
+            left < base,
+            "a left drag must turn the subject left ({base:.1} -> {left:.1})"
+        );
+        assert!(
+            right > base,
+            "a right drag must turn the subject right ({base:.1} -> {right:.1})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod orbit_dump {
+    use super::*;
+
+    /// Render the view before and after a 40 px drag to the left, so the orbit
+    /// direction can be looked at instead of argued about.
+    ///
+    ///     VELOMOCAP_ORBIT_DUMP=dir cargo test -p velomocap-app dump_orbit_pair -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_orbit_pair() {
+        let (width, height) = (642usize, 434usize);
+        let target = [0.0, 0.9, 0.0];
+        let dir = std::env::var("VELOMOCAP_ORBIT_DUMP")
+            .unwrap_or_else(|_| std::env::temp_dir().display().to_string());
+        for (name, drag) in [("before", 0.0f32), ("after", -40.0f32)] {
+            // `show` applies `yaw -= delta.x * 0.008`.
+            let yaw = 0.28 - drag * 0.008;
+            let camera = Camera::orbit(target, yaw, 0.12, 5.6, [width as f32, height as f32]);
+            let mut canvas = Canvas::new(width, height);
+            canvas.clear_gradient(SKY_TOP, SKY_BOTTOM);
+            draw_grid(&mut canvas, &camera, target, 0.0);
+            // Two upright posts so a horizontal shift is obvious at a glance.
+            for (x, colour) in [(2.0f32, [220, 90, 90]), (-2.0f32, [90, 160, 230])] {
+                for step in -2..=2 {
+                    let offset = step as f32 * 0.02;
+                    canvas.line(
+                        &camera,
+                        [x + offset, 0.0, 0.0],
+                        [x + offset, 2.0, 0.0],
+                        colour,
+                    );
+                }
+            }
+            let mut out = Vec::with_capacity(width * height * 3);
+            for pixel in &canvas.colour {
+                out.extend_from_slice(&pixel[0..3]);
+            }
+            let path = format!("{dir}/orbit_{name}.rgb");
+            std::fs::write(&path, &out).expect("writing the raw frame");
+            eprintln!("{name}: yaw {yaw:.3} -> {path}");
+        }
+    }
 }

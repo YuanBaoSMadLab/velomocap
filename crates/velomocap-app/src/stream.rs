@@ -50,6 +50,11 @@ struct Asked {
     frame: usize,
     playing: bool,
     speed: u16,
+    /// The frame rate the stream paces itself with. It arrives with the probe,
+    /// so the first request can go out before the container has been asked, and
+    /// pacing a 25 fps clip at 30 fps would drift until the picture and the
+    /// transport separated.
+    fps: u16,
 }
 
 pub struct VideoStream {
@@ -111,6 +116,7 @@ impl VideoStream {
             frame,
             playing,
             speed: (speed.max(0.05) * 100.0).round() as u16,
+            fps: (fps.max(0.0) * 100.0).round() as u16,
         };
         if self.asked == Some(asked) {
             return;
@@ -138,6 +144,14 @@ impl VideoStream {
             }
         };
         let _ = self.commands.send(command);
+    }
+
+    /// Forget the last request, so the next [`Self::request`] decodes again even
+    /// when it asks for the frame it was already showing. Used when the pane
+    /// changes owner (a reconstruction hands it back to the transport) and the
+    /// picture on screen no longer belongs to the playhead.
+    pub fn invalidate(&mut self) {
+        self.asked = None;
     }
 
     /// The clip generation the worker is serving; frames from an older one are
@@ -172,13 +186,21 @@ fn run(
     };
     let mut pending: Option<Command> = None;
     loop {
-        let command = match pending.take() {
+        let mut command = match pending.take() {
             Some(command) => command,
             None => match requests.recv() {
                 Ok(command) => command,
                 Err(_) => break,
             },
         };
+        // Coalesce before doing any work. Dragging the timeline enqueues one
+        // seek per mouse move and every seek starts its own ffmpeg, so honouring
+        // the whole backlog left the pane frozen for seconds after the pointer
+        // had already stopped — and the frames it eventually produced were
+        // dropped as stale anyway. Only the newest position matters.
+        while let Ok(newer) = requests.try_recv() {
+            command = newer;
+        }
         match command {
             Command::Seek {
                 generation,
@@ -316,6 +338,64 @@ fn play(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A burst of seeks is what dragging the timeline produces. They must
+    /// collapse to the newest position instead of being decoded one by one —
+    /// otherwise the pane freezes for seconds and every frame it finally
+    /// produces is stale anyway.
+    #[test]
+    fn rapid_seeks_collapse_to_the_newest_position() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/media/test-clip.mp4");
+        if !path.is_file() || velomocap_video::Tools::discover().is_err() {
+            eprintln!("skipping: no sample clip or no ffmpeg");
+            return;
+        }
+        let mut stream = VideoStream::spawn();
+        for frame in 0..30 {
+            stream.request(&path, frame, false, 1.0, 480, 30.0);
+        }
+        let started = Instant::now();
+        let mut first = None;
+        while started.elapsed() < Duration::from_secs(5) && first.is_none() {
+            if let Some((_, frame)) = stream.poll() {
+                first = Some((frame.index, started.elapsed().as_secs_f64()));
+            } else {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let (index, at) = first.expect("no frame arrived within five seconds");
+        eprintln!("burst of 30 seeks: first accepted frame {index} after {at:.3} s");
+        assert_eq!(
+            index, 29,
+            "the burst was decoded in order instead of collapsed to the last position"
+        );
+        // Decoding the whole burst takes ~100 ms per seek; collapsing it is what
+        // makes the picture follow the pointer instead of the backlog.
+        assert!(
+            at < 1.5,
+            "the newest seek took {at:.3} s to show, so the backlog was decoded"
+        );
+    }
+
+    /// The pane can change owner (reconstruction → transport) while the requested
+    /// frame stays the same; `invalidate` has to force a decode then, or the stale
+    /// picture would stay on screen.
+    #[test]
+    fn invalidate_forces_the_next_request_through() {
+        let mut stream = VideoStream::spawn();
+        let path = PathBuf::from("unused.mp4");
+        stream.request(&path, 7, false, 1.0, 480, 30.0);
+        let serial = stream.serial;
+        stream.request(&path, 7, false, 1.0, 480, 30.0);
+        assert_eq!(stream.serial, serial, "an identical request was not deduplicated");
+        stream.invalidate();
+        stream.request(&path, 7, false, 1.0, 480, 30.0);
+        assert_eq!(
+            stream.serial,
+            serial + 1,
+            "invalidate did not force a new decode"
+        );
+    }
 
     /// Diagnostic: what cadence does a playback run actually deliver, and are
     /// the indices monotonic? Prints the first frames with their arrival times.

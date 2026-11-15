@@ -24,6 +24,23 @@ impl FlowBody {
         pub fn frame(&self, playhead: usize) -> Option<&[f32]> {
         let index = playhead.checked_sub(self.first_frame)?;
         self.frames.get(index).map(|verts| verts.as_slice())
+    }
+    /// The clip's pose for `playhead`, held at the first and last baked frame.
+    ///
+    /// Outside the generated clip the viewport used to drop back to the
+    /// per-frame MHR body: a different body, with different topology and its own
+    /// per-frame jitter. Swapping between the two in one playback reads as the
+    /// figure twitching, and it happened exactly at the clip edges — the first
+    /// frames of every loop. Holding the nearest pose keeps one body on screen
+    /// for the whole clip.
+    pub fn frame_clamped(&self, playhead: usize) -> Option<&[f32]> {
+        if self.frames.is_empty() {
+            return None;
+        }
+        let index = playhead
+            .saturating_sub(self.first_frame)
+            .min(self.frames.len() - 1);
+        self.frames.get(index).map(|verts| verts.as_slice())
     }}
 impl PersonView {
     pub fn frame(&self, index: usize) -> Option<&Arc<PersonFrame>> {
@@ -171,6 +188,9 @@ pub struct VeloMocap {
         pub floor: f32,
     pub capture_fps: f64,
         pub framed_after_capture: bool,
+    /// Whether the reconstruction owned the Movie Clip pane on the previous
+    /// frame, so the moment it stops can be detected once.
+    capture_live: bool,
     pub capture_started: Option<Instant>,
     pub playhead: usize,
     pub playing: bool,
@@ -180,7 +200,12 @@ pub struct VeloMocap {
     pub pending_import: Option<PathBuf>,
     pub detect_rx: Option<std::sync::mpsc::Receiver<Result<Vec<Candidate>, String>>>,
     pub play_speed: f32,
-    pub last_tick: Instant,
+    /// Anchor of the wall-clock transport: the frame playback started from and
+    /// when it started. `None` while paused.
+    play_anchor: Option<(usize, Instant)>,
+    /// Speed the anchor was taken with, so a speed change re-anchors instead of
+    /// jumping to where the old anchor predicts.
+    last_speed: f32,
     pub orbit: Orbit,
     pub layers: Layers,
     pub view_mode: usize,
@@ -281,6 +306,7 @@ impl VeloMocap {
             floor: 0.0,
             capture_fps: 0.0,
             framed_after_capture: false,
+            capture_live: false,
             capture_started: None,
             playhead: frame,
             playing: play,
@@ -290,7 +316,8 @@ impl VeloMocap {
             pending_import: None,
             detect_rx: None,
             play_speed: 1.0,
-            last_tick: Instant::now(),
+            play_anchor: None,
+            last_speed: 1.0,
             orbit: Orbit::default(),
             layers: Layers::default(),
             view_mode: 0,
@@ -805,17 +832,46 @@ impl VeloMocap {
             };
             finished = state.finished;
         }
-        if let Some(preview) = preview {
-            if preview.index != self.preview_frame {
-                let image =
-                    egui::ColorImage::from_rgb([preview.width, preview.height], &preview.rgb);
-                self.preview = Some(ctx.load_texture(
-                    "preview",
-                    image,
-                    egui::TextureOptions::LINEAR,
-                ));
-                self.preview_frame = preview.index;
+        // A capture preview is a *live* feed: use it only while the job is
+        // running, and let playback win when the transport is moving.
+        // `CaptureShared` keeps its last frame after the job ends, and that
+        // frame was republished on every paint where its index no longer
+        // matched `preview_frame` — which is every paint — so the Movie Clip
+        // pane alternated between the frozen reconstruction frame and the
+        // playing one. That is the twitching the video showed.
+        if running && !self.playing {
+            if let Some(preview) = preview {
+                if preview.index != self.preview_frame {
+                    let image =
+                        egui::ColorImage::from_rgb([preview.width, preview.height], &preview.rgb);
+                    let same_size = self
+                        .preview
+                        .as_ref()
+                        .map(|texture| texture.size() == [preview.width, preview.height])
+                        .unwrap_or(false);
+                    match &mut self.preview {
+                        Some(texture) if same_size => {
+                            texture.set(image, egui::TextureOptions::LINEAR)
+                        }
+                        _ => {
+                            self.preview = Some(ctx.load_texture(
+                                "preview",
+                                image,
+                                egui::TextureOptions::LINEAR,
+                            ))
+                        }
+                    }
+                    self.preview_frame = preview.index;
+                }
             }
+        }
+        // When the job stops, hand the pane back to the transport: the frame on
+        // screen is the reconstruction's, not the playhead's, so ask the stream
+        // for that frame again even if it is the one it was already asked for.
+        let was_live = self.capture_live;
+        self.capture_live = running;
+        if was_live && !running {
+            self.stream.invalidate();
         }
         if !flow.is_empty() {
             let fresh = self.flow.len() != flow.len()
@@ -970,23 +1026,48 @@ impl VeloMocap {
             self.selected = 0;
         }
     }
-    /// Keep the Movie Clip frame in step with the transport.
+    /// Show the newest decoded frame in the Movie Clip panel.
     ///
-    /// Playing runs a single streaming decode, and the frames it produces drive
-    /// the playhead — the video is the clock, so picture and timeline cannot
+    /// The decoder is a *preview*, not the transport: it never moves the
+    /// playhead. It used to — every decoded frame wrote `playhead` — which made
+    /// the animation stutter as soon as a frame arrived late or two arrived in
+    /// one paint, and made it come apart completely when the clip was shorter
+    /// than the video, because the playhead ran past the last baked frame (the
+    /// body disappeared) until ffmpeg looped back to zero. `mocap/playback.py`
+    /// picks the frame from elapsed media time for the same reason.
     fn poll_stream(&mut self, ctx: &egui::Context) {
         if let Some((generation, frame)) = self.stream.poll() {
             if generation == self.stream.generation() {
                 let image =
                     egui::ColorImage::from_rgb([frame.width, frame.height], &frame.rgb);
-                self.preview = Some(ctx.load_texture(
-                    "preview",
-                    image,
-                    egui::TextureOptions::LINEAR,
-                ));
+                // Reuse the texture when the size has not changed: `load_texture`
+                // allocates a fresh GPU texture and frees the previous one for
+                // every decoded frame, 30 times a second.
+                let same_size = self
+                    .preview
+                    .as_ref()
+                    .map(|texture| texture.size() == [frame.width, frame.height])
+                    .unwrap_or(false);
+                match &mut self.preview {
+                    Some(texture) if same_size => {
+                        texture.set(image, egui::TextureOptions::LINEAR)
+                    }
+                    _ => {
+                        self.preview = Some(ctx.load_texture(
+                            "preview",
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        ))
+                    }
+                }
                 self.preview_frame = frame.index;
-                if self.playing {
-                    self.playhead = frame.index;
+                // A picture *ahead* of the clock means the stream has run past
+                // the end of the baked clip while the transport wrapped: restart
+                // it where the playhead is. Being *behind* is just a slow decode,
+                // and restarting there would only restart ffmpeg again a few
+                // frames later, so it is left alone to catch up.
+                if self.playing && frame.index > self.playhead + 8 {
+                    self.play_from = Some(self.playhead);
                 }
             }
         }
@@ -1026,6 +1107,10 @@ impl VeloMocap {
     /// Move the playhead and restart the stream there (timeline clicks, slider).
     pub fn seek_to(&mut self, frame: usize) {
         self.playhead = frame;
+        // Re-anchor the transport at the new frame, otherwise the next tick
+        // would pull the playhead straight back to where the old anchor
+        // predicts.
+        self.play_anchor = Some((frame, Instant::now()));
         if self.playing {
             self.play_from = Some(frame);
         }
@@ -1103,7 +1188,6 @@ impl VeloMocap {
         };
         if space {
             self.playing = !self.playing;
-            self.last_tick = Instant::now();
         }
         if left {
             self.seek_to(self.playhead.saturating_sub(step));
@@ -1122,27 +1206,49 @@ impl VeloMocap {
             self.playing = false;
         }
     }
-        pub fn tick(&mut self, ctx: &egui::Context) {
+    /// Advance the transport on the wall clock.
+    ///
+    /// The playhead is chosen from elapsed media time, like `mocap/playback.py`
+    /// in the Qt build: `frame = (anchor + elapsed × fps × speed) % frames`.
+    /// Deriving it from the decoder instead (which is what `poll_stream` used to
+    /// do) tied the animation to ffmpeg's arrival jitter, so a late frame froze
+    /// the pose and a burst jumped it forward; when the baked clip was shorter
+    /// than the video the playhead even left the clip and the body vanished
+    /// until the stream looped. The picture is now only a preview of the clock.
+    pub fn tick(&mut self, ctx: &egui::Context) {
         if !self.playing {
+            self.play_anchor = None;
             return;
         }
-        // With a clip open the streaming decoder is the clock: `poll_stream`
-        // moves the playhead to the frame ffmpeg just produced, so the picture
-        // and the timeline cannot drift. Without a video there is nothing to
-        // stream and the playhead advances on the wall clock instead.
-        if self.video.is_none() {
-            let frames = self.frame_count();
-            if frames <= 1 {
-                return;
-            }
-            let step = 1.0 / (self.current_fps().max(1.0) as f32) / self.play_speed.max(0.05);
-            if self.last_tick.elapsed().as_secs_f32() >= step {
-                self.last_tick = Instant::now();
-                self.playhead = (self.playhead + 1) % frames;
+        let frames = self.frame_count().max(1);
+        // A speed change re-anchors, so playback continues from where the
+        // transport stands instead of jumping to the old anchor's prediction.
+        if (self.play_speed - self.last_speed).abs() > 1e-3 {
+            self.last_speed = self.play_speed;
+            self.play_anchor = Some((self.playhead, Instant::now()));
+            if self.video.is_some() {
+                self.play_from = Some(self.playhead);
             }
         }
+        let (anchor, started) = *self
+            .play_anchor
+            .get_or_insert_with(|| (self.playhead, Instant::now()));
+        let fps = self.current_fps().max(1e-6);
+        let speed = self.play_speed.max(0.05) as f64;
+        let elapsed = started.elapsed().as_secs_f64();
+        self.playhead = playback_frame(anchor, elapsed, fps, speed, frames);
         ctx.request_repaint_after(Duration::from_millis(16));
     }}
+/// The frame the transport shows `elapsed` seconds after starting at `anchor`.
+///
+/// A port of `mocap/playback.py::playback_frame`: the frame comes from elapsed
+/// media time, not from which picture the decoder happened to produce last.
+fn playback_frame(anchor: usize, elapsed: f64, fps: f64, speed: f64, frames: usize) -> usize {
+    let frames = frames.max(1);
+    let step = (elapsed.max(0.0) * fps.max(1e-6) * speed.max(0.05)).floor();
+    (anchor + step.max(0.0) as usize) % frames
+}
+
 fn chrono_like_clock() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1263,3 +1369,41 @@ impl eframe::App for VeloMocap {
         ui::draw(self, ctx);
         crate::models_ui::window(self, ctx);
     }}
+#[cfg(test)]
+mod tests {
+    use super::playback_frame;
+
+    /// One frame per 1/fps second, starting from the anchor.
+    #[test]
+    fn the_clock_counts_frames_from_elapsed_time() {
+        assert_eq!(playback_frame(0, 0.0, 30.0, 1.0, 90), 0);
+        assert_eq!(playback_frame(0, 1.0, 30.0, 1.0, 90), 30);
+        assert_eq!(playback_frame(12, 1.0, 30.0, 1.0, 90), 42);
+        // Half a frame still shows the frame we are on, not the next one.
+        assert_eq!(playback_frame(0, 0.016, 30.0, 1.0, 90), 0);
+        assert_eq!(playback_frame(0, 0.034, 30.0, 1.0, 90), 1);
+        // Speed scales the same elapsed time.
+        assert_eq!(playback_frame(0, 1.0, 30.0, 2.0, 90), 60);
+        assert_eq!(playback_frame(0, 1.0, 30.0, 0.5, 90), 15);
+    }
+
+    /// Playback wraps at the end and never leaves the clip, which is what keeps
+    /// a body on screen when the video is longer than the baked motion.
+    #[test]
+    fn the_clock_wraps_inside_the_clip() {
+        assert_eq!(playback_frame(0, 4.0, 30.0, 1.0, 90), 30);
+        assert_eq!(playback_frame(80, 1.0, 30.0, 1.0, 90), 20);
+        for step in 0..400 {
+            let frame = playback_frame(0, step as f64 * 0.033, 30.0, 1.0, 90);
+            assert!(frame < 90, "frame {frame} left the clip");
+        }
+    }
+
+    /// Degenerate inputs must not panic or divide by zero: no clip, no fps.
+    #[test]
+    fn the_clock_survives_empty_inputs() {
+        assert_eq!(playback_frame(0, 1.0, 0.0, 0.0, 0), 0);
+        assert_eq!(playback_frame(5, 0.0, 30.0, 1.0, 1), 0);
+        assert_eq!(playback_frame(5, f64::NAN, 30.0, 1.0, 10), 5);
+    }
+}

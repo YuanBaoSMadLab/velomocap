@@ -208,6 +208,21 @@ fn foot_lock(
     let mut shift = vec![[0.0f64; 3]; count];
     let mut weight = vec![0.0f32; count];
 
+    // Ground reference: `Flat` uses the configured floor, `MultiLevel` uses the
+    // lowest ankle height seen in the clip, which follows a ramp instead of
+    // pinning everything to one plane.
+    let mut ground = settings.floor;
+    if settings.mode == CorrectionMode::MultiLevel {
+        let mut lows = Vec::new();
+        for index in 0..count {
+            let skeleton = &clip.skeletons[index];
+            for (ankle, toe) in feet {
+                lows.push(joint(skeleton, ankle)[1].min(joint(skeleton, toe)[1]));
+            }
+        }
+        ground = median(&lows);
+    }
+
     for (ankle, toe) in feet {
         let mut contact = vec![false; count];
         for index in 0..count {
@@ -222,27 +237,22 @@ fn foot_lock(
                     fps,
                 )
             };
-            contact[index] =
-                low <= settings.floor + thresholds.contact_height && speed <= thresholds.contact_speed;
+            contact[index] = low <= ground + thresholds.contact_height
+                && speed <= thresholds.contact_speed;
         }
         for (begin, end) in contact_runs(&contact, thresholds.min_run) {
             let mut xs = Vec::new();
-            let mut ys = Vec::new();
             let mut zs = Vec::new();
             for index in begin..end {
                 let at = joint(&clip.skeletons[index], ankle);
                 xs.push(at[0]);
-                ys.push(at[1]);
                 zs.push(at[2]);
             }
-            let target = [
-                median(&xs),
-                match settings.mode {
-                    CorrectionMode::Flat => settings.floor,
-                    CorrectionMode::MultiLevel => median(&ys),
-                },
-                median(&zs),
-            ];
+            // Horizontal only: the vertical placement is solved when the clip is
+            // dropped onto its floor, and snapping Y on the contact frames only
+            // (leaving it alone in between) is what made the body bob up and
+            // down after a reconstruction.
+            let target = [median(&xs), 0.0, median(&zs)];
             report.foot_contacts += 1;
             for index in begin..end {
                 let at = joint(&clip.skeletons[index], ankle);
@@ -252,7 +262,7 @@ fn foot_lock(
                 } else {
                     (edge / thresholds.blend_frames as f32).clamp(0.0, 1.0)
                 };
-                for axis in 0..3 {
+                for axis in [0usize, 2] {
                     shift[index][axis] += (target[axis] - at[axis]) as f64 * blend as f64;
                 }
                 weight[index] += blend;

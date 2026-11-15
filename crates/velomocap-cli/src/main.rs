@@ -200,6 +200,12 @@ enum Command {
         /// Disable foot/hand contact correction.
         #[arg(long)]
         no_correction: bool,
+        /// Leave feet unlocked (hands still locked).
+        #[arg(long)]
+        no_foot: bool,
+        /// Leave hands unlocked (feet still locked).
+        #[arg(long)]
+        no_hand: bool,
         /// Lock preset: tight, normal or loose.
         #[arg(long, default_value = "normal")]
         lock_preset: String,
@@ -209,6 +215,12 @@ enum Command {
         /// Ground height for the contact lock, metres.
         #[arg(long, default_value_t = 0.0)]
         floor: f32,
+        /// Treat the camera as fixed instead of estimating it with VGGT.
+        #[arg(long)]
+        static_camera: bool,
+        /// Smooth the estimated camera rotation over time.
+        #[arg(long)]
+        refine_camera: bool,
         /// Vertical shift applied to the clip, metres.
         #[arg(long, default_value_t = 0.0)]
         pelvis: f32,
@@ -464,9 +476,13 @@ fn main() -> Result<()> {
             dump_joints,
             dump_rotations,
             no_correction,
+            no_foot,
+            no_hand,
             lock_preset,
             lock_mode,
             floor,
+            static_camera,
+            refine_camera,
             pelvis,
             limit,
             start,
@@ -497,9 +513,13 @@ fn main() -> Result<()> {
             dump_joints.as_deref(),
             dump_rotations.as_deref(),
             no_correction,
+            no_foot,
+            no_hand,
             &lock_preset,
             &lock_mode,
             floor,
+            static_camera,
+            refine_camera,
             pelvis,
             limit,
             start,
@@ -1085,9 +1105,13 @@ fn flow_report(
     dump_joints: Option<&std::path::Path>,
     dump_rotations: Option<&std::path::Path>,
     no_correction: bool,
+    no_foot: bool,
+    no_hand: bool,
     lock_preset: &str,
     lock_mode: &str,
     floor: f32,
+    static_camera: bool,
+    refine_camera: bool,
     pelvis: f32,
     limit: usize,
     start: usize,
@@ -1214,6 +1238,16 @@ fn flow_report(
             track
         }
     };
+    // Camera switches, matching the sidebar: a fixed camera reuses the first
+    // frame's extrinsics, and the refine switch smooths an estimated track.
+    let mut camera_track = camera_track;
+    if static_camera {
+        camera_track.freeze();
+        println!("camera: frozen to the first frame");
+    } else if refine_camera {
+        camera_track.smooth(1);
+        println!("camera: rotation smoothed");
+    }
 
     let body_path = resolve_model(body);
     let members = velomocap_body::npz::members(&body_path);
@@ -1284,8 +1318,8 @@ fn flow_report(
             "multi" | "multi-level" => velomocap_motion::correction::CorrectionMode::MultiLevel,
             _ => velomocap_motion::correction::CorrectionMode::Flat,
         },
-        foot: true,
-        hand: true,
+        foot: !no_foot,
+        hand: !no_hand,
         preset: match lock_preset {
             "tight" => velomocap_motion::correction::LockPreset::Tight,
             "loose" => velomocap_motion::correction::LockPreset::Loose,

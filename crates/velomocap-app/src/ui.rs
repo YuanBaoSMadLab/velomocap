@@ -750,7 +750,7 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                         // previews. Fall back to the per-frame MHR mesh while no
                         // clip has been generated for this person yet.
                         if let (Some(clip), Some(faces)) = (flow.get(slot), smplh_faces) {
-                            if let Some(verts) = clip.frame(app.playhead) {
+                            if let Some(verts) = clip.frame_clamped(app.playhead) {
                                 return Some(viewport::PersonDraw {
                                     name: &person.name,
                                     colour: person.colour,
@@ -995,7 +995,6 @@ fn transport(app: &mut VeloMocap, ui: &mut egui::Ui) {
         .clicked()
     {
         app.playing = !app.playing;
-        app.last_tick = std::time::Instant::now();
     }
     if button(ui, ">", 26.0) {
         app.seek_to((app.playhead + 1).min(frames.saturating_sub(1)));
@@ -1077,10 +1076,14 @@ fn frame_ruler(app: &mut VeloMocap, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(i18n::t("Frame")).size(11.0));
         let mut value = app.playhead.min(frames.saturating_sub(1)) as f64;
+        // egui sliders are `spacing.slider_width` wide whatever `add_sized` asks
+        // for, which left the seek bar as a 100 px stub in the corner of an
+        // otherwise empty row. Give it the whole row.
+        ui.spacing_mut().slider_width = (ui.available_width() - 46.0).max(120.0);
         let slider = egui::Slider::new(&mut value, 0.0..=(frames.saturating_sub(1)) as f64)
             .show_value(false)
             .trailing_fill(true);
-        let response = ui.add_sized([ui.available_width() - 46.0, 18.0], slider);
+        let response = ui.add(slider);
         if response.changed() {
             app.seek_to(value.round() as usize);
             app.playing = false;
@@ -1091,6 +1094,12 @@ fn frame_ruler(app: &mut VeloMocap, ui: &mut egui::Ui) {
                 .color(MUTED),
         );
     });
+}
+
+/// Frame under a horizontal position inside a track row.
+fn track_frame(position: f32, rect: egui::Rect, frames: usize) -> usize {
+    let fraction = ((position - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+    (fraction * frames.max(2).saturating_sub(1) as f32).round() as usize
 }
 
 fn tracks(app: &mut VeloMocap, ui: &mut egui::Ui) {
@@ -1121,7 +1130,20 @@ fn tracks(app: &mut VeloMocap, ui: &mut egui::Ui) {
                 egui::Label::new(egui::RichText::new(label).size(11.0).color(TEXT)),
             );
             let width = ui.available_width();
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 17.0), egui::Sense::hover());
+            // Clicking or dragging a track seeks to that frame: the rows are the
+            // most obvious place to scrub, and they used to be hover-only, so a
+            // click did nothing at all.
+            let (rect, response) = ui.allocate_exact_size(
+                egui::vec2(width, 17.0),
+                egui::Sense::click_and_drag(),
+            );
+            let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+            if response.clicked() || response.dragged() {
+                if let Some(position) = response.interact_pointer_pos() {
+                    app.seek_to(track_frame(position.x, rect, frames));
+                    app.playing = false;
+                }
+            }
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(0x24, 0x24, 0x24));
             match colour {
@@ -1703,4 +1725,22 @@ fn person_palette() -> [egui::Color32; 5] {
         egui::Color32::from_rgb(230, 140, 220),
         egui::Color32::from_rgb(240, 210, 120),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::track_frame;
+
+    /// Clicking a track row must land on the frame under the pointer, and must
+    /// clamp at both ends instead of running off the clip.
+    #[test]
+    fn clicking_a_track_maps_to_its_frame() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 0.0), egui::vec2(200.0, 17.0));
+        assert_eq!(track_frame(100.0, rect, 10), 0, "left edge is frame 0");
+        assert_eq!(track_frame(200.0, rect, 10), 5, "middle is the middle frame");
+        assert_eq!(track_frame(300.0, rect, 10), 9, "right edge is the last frame");
+        assert_eq!(track_frame(20.0, rect, 10), 0, "left of the row clamps");
+        assert_eq!(track_frame(900.0, rect, 10), 9, "right of the row clamps");
+        assert_eq!(track_frame(100.0, rect, 1), 0, "a single-frame clip stays at 0");
+    }
 }
