@@ -101,12 +101,12 @@ impl Default for CorrectionSettings {
             enabled: true,
             mode: CorrectionMode::Flat,
             foot: true,
-            hand: true,
+            hand: false,
             preset: LockPreset::Normal,
             floor: 0.0,
             pelvis_offset: 0.0,
             leg_ik: false,
-            smoothing: 1e-3,
+            smoothing: 0.0,
         }
     }
 }

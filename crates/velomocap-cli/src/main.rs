@@ -203,14 +203,16 @@ enum Command {
         /// Leave feet unlocked (hands still locked).
         #[arg(long)]
         no_foot: bool,
-        /// Leave hands unlocked (feet still locked).
+        /// Pin resting hands as well (off by default; the reference defaults to
+        /// foot locking only).
         #[arg(long)]
-        no_hand: bool,
-        /// Skip the contact IK on the legs (root correction only).
+        hand_lock: bool,
+        /// Run the contact IK on the legs (off by default, like the reference's
+        /// contact pass only when the source has stable stances).
         #[arg(long)]
-        no_leg_ik: bool,
+        leg_ik: bool,
         /// Temporal smoothing weight (0 = off, smaller is stronger).
-        #[arg(long, default_value_t = 1e-3)]
+        #[arg(long, default_value_t = 0.0)]
         smooth: f64,
         /// Lock preset: tight, normal or loose.
         #[arg(long, default_value = "normal")]
@@ -483,8 +485,8 @@ fn main() -> Result<()> {
             dump_rotations,
             no_correction,
             no_foot,
-            no_hand,
-            no_leg_ik,
+            hand_lock,
+            leg_ik,
             smooth,
             lock_preset,
             lock_mode,
@@ -522,8 +524,8 @@ fn main() -> Result<()> {
             dump_rotations.as_deref(),
             no_correction,
             no_foot,
-            no_hand,
-            no_leg_ik,
+            hand_lock,
+            leg_ik,
             smooth,
             &lock_preset,
             &lock_mode,
@@ -1116,8 +1118,8 @@ fn flow_report(
     dump_rotations: Option<&std::path::Path>,
     no_correction: bool,
     no_foot: bool,
-    no_hand: bool,
-    no_leg_ik: bool,
+    hand_lock: bool,
+    leg_ik: bool,
     smoothing: f64,
     lock_preset: &str,
     lock_mode: &str,
@@ -1331,7 +1333,7 @@ fn flow_report(
             _ => velomocap_motion::correction::CorrectionMode::Flat,
         },
         foot: !no_foot,
-        hand: !no_hand,
+        hand: hand_lock,
         preset: match lock_preset {
             "tight" => velomocap_motion::correction::LockPreset::Tight,
             "loose" => velomocap_motion::correction::LockPreset::Loose,
@@ -1339,7 +1341,7 @@ fn flow_report(
         },
         floor,
         pelvis_offset: pelvis,
-        leg_ik: !no_leg_ik,
+        leg_ik,
         smoothing,
     };
     let correction = velomocap_motion::correction::apply(&mut clip, &model, &settings)?;
