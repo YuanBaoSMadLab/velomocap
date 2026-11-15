@@ -68,31 +68,234 @@ impl Character {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)
             .with_context(|| format!("reading {}", path.display()))?;
-        let gltf = Gltf::parse(&bytes)
-            .with_context(|| format!("{} is not a readable glTF/GLB file", path.display()))?;
         let name = path
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| "character".to_string());
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        // A binary FBX is a container of its own; the glTF-family files (VRM is
+        // GLB) share the reader below.
+        if extension == "fbx" {
+            let document = velomocap_core::fbx_read::parse(&bytes)
+                .map_err(|error| anyhow::anyhow!(error))
+                .with_context(|| format!("{} is not a readable binary FBX", path.display()))?;
+            return Self::from_fbx(&document, name);
+        }
+        let gltf = Gltf::parse(&bytes)
+            .with_context(|| format!("{} is not a readable glTF/GLB file", path.display()))?;
         gltf.build(name)
+    }
+
+    /// Build a character from a parsed FBX: the skin deformer's clusters give the
+    /// bones and their bind matrices, the geometry gives the mesh.
+    fn from_fbx(
+        document: &velomocap_core::fbx_read::Document,
+        name: String,
+    ) -> Result<Self> {
+        use std::collections::HashMap;
+        let objects = document.child("Objects").context("the FBX has no Objects node")?;
+        // A model's name is `name\0\x01Class`.
+        let mut model_names: HashMap<i64, String> = HashMap::new();
+        for node in objects.children_named("Model") {
+            let Some(id) = node.i64_at(0) else {
+                continue;
+            };
+            let raw = node.str_at(1).unwrap_or("bone");
+            model_names.insert(id, raw.split('\0').next().unwrap_or(raw).to_string());
+        }
+
+        let mut deformer_by_id: HashMap<i64, &velomocap_core::fbx_read::Node> = HashMap::new();
+        let mut skin_id = None;
+        for node in objects.children_named("Deformer") {
+            let Some(id) = node.i64_at(0) else {
+                continue;
+            };
+            deformer_by_id.insert(id, node);
+            if node.str_at(2) == Some("Skin") {
+                skin_id = Some(id);
+            }
+        }
+        skin_id.context("the FBX has no skin deformer")?;
+
+        let mut connections: Vec<(String, i64, i64)> = Vec::new();
+        if let Some(node) = document.child("Connections") {
+            for link in node.children_named("C") {
+                let (Some(child), Some(parent)) = (link.i64_at(1), link.i64_at(2)) else {
+                    continue;
+                };
+                connections.push((link.str_at(0).unwrap_or("").to_string(), child, parent));
+            }
+        }
+
+        let mut geometry = None;
+        for node in objects.children_named("Geometry") {
+            let (Some(vertices), Some(polygons)) =
+                (node.child("Vertices"), node.child("PolygonVertexIndex"))
+            else {
+                continue;
+            };
+            let positions = vertices
+                .props
+                .first()
+                .map(|prop| prop.as_f64s().to_vec())
+                .unwrap_or_default();
+            let indices = polygons
+                .props
+                .first()
+                .map(|prop| prop.as_i32s().to_vec())
+                .unwrap_or_default();
+            if positions.len() >= 3 && !indices.is_empty() {
+                geometry = Some((positions, indices));
+                break;
+            }
+        }
+        let (positions, polygons) =
+            geometry.context("the FBX has no mesh geometry (Vertices / PolygonVertexIndex)")?;
+
+        // Each cluster is a bone: its linked Model names it, `TransformLink` is
+        // the bind world matrix, and Indexes/Weights say which vertices it moves.
+        let mut vertex_count = positions.len() / 3;
+        let mut per_vertex: Vec<Vec<(usize, f32)>> = vec![Vec::new(); vertex_count];
+        let mut bones: Vec<Bone> = Vec::new();
+        for node in objects.children_named("Deformer") {
+            if node.str_at(2) != Some("Cluster") {
+                continue;
+            }
+            let Some(id) = node.i64_at(0) else {
+                continue;
+            };
+            let Some(bone_id) = connections
+                .iter()
+                .find(|(kind, child, parent)| kind == "OO" && *child == id && model_names.contains_key(parent))
+                .map(|(_, _, parent)| *parent)
+            else {
+                continue;
+            };
+            let link = node
+                .child("TransformLink")
+                .and_then(|link| link.props.first())
+                .map(|prop| prop.as_f64s().to_vec())
+                .unwrap_or_default();
+            anyhow::ensure!(
+                link.len() == 16,
+                "cluster {} has no TransformLink matrix",
+                model_names.get(&bone_id).cloned().unwrap_or_default()
+            );
+            let mut matrix = [0.0f32; 16];
+            for (slot, value) in link.iter().enumerate() {
+                matrix[slot] = *value as f32;
+            }
+            // FBX matrices are column-major.
+            let bind_matrix = transpose4(&matrix);
+            let bone_name = model_names.get(&bone_id).cloned().unwrap_or_default();
+            let slot = bones.len();
+            bones.push(Bone {
+                canonical: velomocap_motion::retarget::canonicalize(&bone_name),
+                name: bone_name,
+                bind: translation_of(&bind_matrix),
+                bind_rot: rotation_of(&bind_matrix),
+                inverse_bind: invert(&bind_matrix),
+            });
+            let indexes = node
+                .child("Indexes")
+                .and_then(|indexes| indexes.props.first())
+                .map(|prop| prop.as_i32s().to_vec())
+                .unwrap_or_default();
+            let weights = node
+                .child("Weights")
+                .and_then(|weights| weights.props.first())
+                .map(|prop| prop.as_f64s().to_vec())
+                .unwrap_or_default();
+            for (index, weight) in indexes.iter().zip(weights.iter()) {
+                if let Some(list) = per_vertex.get_mut(*index as usize) {
+                    list.push((slot, *weight as f32));
+                }
+            }
+        }
+        anyhow::ensure!(!bones.is_empty(), "the skin has no clusters");
+
+        let mut rest: Vec<f32> = Vec::with_capacity(vertex_count * 3);
+        for value in &positions {
+            rest.push(*value as f32);
+        }
+        // Top four influences per vertex, normalised like a glTF skin.
+        let mut joints: Vec<[u16; 4]> = vec![[0; 4]; vertex_count];
+        let mut weights: Vec<[f32; 4]> = vec![[0.0; 4]; vertex_count];
+        for (vertex, list) in per_vertex.iter_mut().enumerate() {
+            list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            list.truncate(4);
+            let total: f32 = list.iter().map(|(_, weight)| *weight).sum();
+            if total <= 0.0 {
+                continue;
+            }
+            for (slot, (joint, weight)) in list.iter().enumerate() {
+                joints[vertex][slot] = *joint as u16;
+                weights[vertex][slot] = weight / total;
+            }
+        }
+        // Polygons: the last index of each is bitwise-not'ed; fan-triangulate.
+        let mut faces: Vec<[u32; 3]> = Vec::new();
+        let mut corners: Vec<u32> = Vec::new();
+        for index in &polygons {
+            if *index < 0 {
+                corners.push((!*index) as u32);
+                for corner in 1..corners.len().saturating_sub(1) {
+                    faces.push([corners[0], corners[corner], corners[corner + 1]]);
+                }
+                corners.clear();
+            } else {
+                corners.push(*index as u32);
+            }
+        }
+        anyhow::ensure!(!faces.is_empty(), "the FBX geometry has no polygons");
+        vertex_count = rest.len() / 3;
+        joints.truncate(vertex_count);
+        weights.truncate(vertex_count);
+        Ok(finalize(name, bones, rest, joints, weights, faces))
     }
 
     /// Pose the mesh with the clip's joint rotations.
     ///
-    /// `world` is the clip's per-bone world rotation (52 × 3×3), `rest` the
-    /// clip's rest rotation, both in the same order as [`Bone::canonical`].
+    /// `world` and `rest` are the clip's per-joint world rotations in **SMPL-H
+    /// joint order**, which is the order the clip stores them in; `names` is the
+    /// same order's bone names (`PreparedBvh::names`), which is what maps a
+    /// character bone's canonical index onto the joint that drives it.
     /// `translation` moves the character with the root.
-    pub fn pose(&self, world: &[[f32; 9]], rest: &[[f32; 9]], translation: [f32; 3]) -> Vec<f32> {
+    pub fn pose(
+        &self,
+        world: &[[f32; 9]],
+        rest: &[[f32; 9]],
+        names: &[String],
+        translation: [f32; 3],
+    ) -> Vec<f32> {
+        // A character's bones carry canonical indices (Hips, LeftUpLeg …), the
+        // clip's rotations are in SMPL-H joint order. Resolve once per pose.
+        let mut joint_of = [usize::MAX; 52];
+        for (joint, name) in names.iter().enumerate() {
+            if joint >= world.len() {
+                break;
+            }
+            if let Some(canonical) = velomocap_motion::retarget::canonicalize(name) {
+                if canonical < joint_of.len() && joint_of[canonical] == usize::MAX {
+                    joint_of[canonical] = joint;
+                }
+            }
+        }
         // Skin matrix per bone: rotate its bind orientation by the clip's own
         // world-space change, then undo the bind pose.
         let mut skin = vec![[0.0f32; 16]; self.bones.len()];
         for (index, bone) in self.bones.iter().enumerate() {
             let rotation = match bone.canonical {
-                Some(canonical) => {
-                    let delta = multiply(&world[canonical], &transpose(&rest[canonical]));
+                Some(canonical) if joint_of[canonical] != usize::MAX => {
+                    let joint = joint_of[canonical];
+                    let delta = multiply(&world[joint], &transpose(&rest[joint]));
                     multiply(&delta, &bone.bind_rot)
                 }
-                None => bone.bind_rot,
+                _ => bone.bind_rot,
             };
             // M = [R | translation + bind] * inverse_bind
             let at = bone.bind;
@@ -140,8 +343,63 @@ impl Character {
     }
 }
 
-fn transpose(m: &[f32; 9]) -> [f32; 9] {
-    [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]]
+/// Bring an imported character to human size and wrap it up.
+///
+/// Characters arrive at very different sizes — Mixamo's GLB is 2.2× life size
+/// (3.78 m tall), an Unreal mannequin is exactly 1.8 m, a Mixamo FBX is in
+/// centimetres — so the bind space is scaled, not the posed output: the root
+/// translation the clip supplies has to stay in metres either way.
+fn finalize(
+    name: String,
+    mut bones: Vec<Bone>,
+    mut rest: Vec<f32>,
+    joints: Vec<[u16; 4]>,
+    weights: Vec<[f32; 4]>,
+    faces: Vec<[u32; 3]>,
+) -> Character {
+    let mut height_min = f32::INFINITY;
+    let mut height_max = f32::NEG_INFINITY;
+    for vertex in rest.chunks_exact(3) {
+        height_min = height_min.min(vertex[1]);
+        height_max = height_max.max(vertex[1]);
+    }
+    let height = height_max - height_min;
+    let mut scale = if height > 0.02 { 1.75 / height } else { 1.0 };
+    if (scale - 1.0).abs() <= 0.15 {
+        scale = 1.0;
+    }
+    if scale != 1.0 {
+        for value in &mut rest {
+            *value *= scale;
+        }
+        for bone in &mut bones {
+            bone.bind = [
+                bone.bind[0] * scale,
+                bone.bind[1] * scale,
+                bone.bind[2] * scale,
+            ];
+            let m = &bone.bind_rot;
+            let bind_matrix = [
+                m[0], m[1], m[2], bone.bind[0],
+                m[3], m[4], m[5], bone.bind[1],
+                m[6], m[7], m[8], bone.bind[2],
+                0.0, 0.0, 0.0, 1.0,
+            ];
+            bone.inverse_bind = invert(&bind_matrix);
+        }
+    }
+    Character {
+        name,
+        bones,
+        rest,
+        joints,
+        weights,
+        faces,
+        scale,
+    }
+}
+
+fn transpose(m: &[f32; 9]) -> [f32; 9] {    [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]]
 }
 
 fn multiply(a: &[f32; 9], b: &[f32; 9]) -> [f32; 9] {
@@ -335,46 +593,7 @@ impl Gltf {
             joints.len() == rest.len() / 3 && weights.len() == rest.len() / 3,
             "the mesh attributes disagree on the vertex count"
         );
-        // Characters arrive at very different sizes: Mixamo's GLB is 2.2× life
-        // size (3.78 m tall), an Unreal mannequin is exactly 1.8 m. Scale the
-        // bind space, not the posed output, so the root translation the clip
-        // supplies is still in metres.
-        let mut height_min = f32::INFINITY;
-        let mut height_max = f32::NEG_INFINITY;
-        for vertex in rest.chunks_exact(3) {
-            height_min = height_min.min(vertex[1]);
-            height_max = height_max.max(vertex[1]);
-        }
-        let height = height_max - height_min;
-        let mut scale = if height > 0.2 { 1.75 / height } else { 1.0 };
-        if (scale - 1.0).abs() <= 0.15 {
-            scale = 1.0;
-        }
-        if scale != 1.0 {
-            for value in &mut rest {
-                *value *= scale;
-            }
-            for bone in &mut bones {
-                bone.bind = [bone.bind[0] * scale, bone.bind[1] * scale, bone.bind[2] * scale];
-                let m = &bone.bind_rot;
-                let bind_matrix = [
-                    m[0], m[1], m[2], bone.bind[0],
-                    m[3], m[4], m[5], bone.bind[1],
-                    m[6], m[7], m[8], bone.bind[2],
-                    0.0, 0.0, 0.0, 1.0,
-                ];
-                bone.inverse_bind = invert(&bind_matrix);
-            }
-        }
-        Ok(Character {
-            name,
-            bones,
-            rest,
-            joints,
-            weights,
-            faces,
-            scale,
-        })
+        Ok(finalize(name, bones, rest, joints, weights, faces))
     }
 
     fn view(&self, accessor: usize) -> Result<(&serde_json::Value, &[u8], usize, usize, usize)> {
@@ -759,6 +978,143 @@ mod tests {
         assert!(character.vertex_count() > 0);
     }
 
+    /// The FBX path: a skin with two clusters, a quad, and the connections that
+    /// tie a cluster to its bone. Everything below is what a Mixamo export has,
+    /// minus the hundreds of nodes around it.
+    fn fbx_sample() -> velomocap_core::fbx_read::Document {
+        use velomocap_core::fbx_read::{Document, Node, Prop};
+        let identity = Prop::F64s(vec![
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ]);
+        let cluster = |id: i64, indexes: Vec<i32>, weights: Vec<f64>| Node {
+            name: "Deformer".into(),
+            props: vec![
+                Prop::I64(id),
+                Prop::Str("Cluster".into()),
+                Prop::Str("Cluster".into()),
+            ],
+            children: vec![
+                Node {
+                    name: "Indexes".into(),
+                    props: vec![Prop::I32s(indexes)],
+                    children: vec![],
+                },
+                Node {
+                    name: "Weights".into(),
+                    props: vec![Prop::F64s(weights)],
+                    children: vec![],
+                },
+                Node {
+                    name: "TransformLink".into(),
+                    props: vec![identity.clone()],
+                    children: vec![],
+                },
+            ],
+        };
+        let objects = Node {
+            name: "Objects".into(),
+            props: vec![],
+            children: vec![
+                Node {
+                    name: "Model".into(),
+                    props: vec![
+                        Prop::I64(1),
+                        Prop::Str("Hips\0\u{1}Model".into()),
+                        Prop::Str("Null".into()),
+                    ],
+                    children: vec![],
+                },
+                Node {
+                    name: "Model".into(),
+                    props: vec![
+                        Prop::I64(2),
+                        Prop::Str("LeftUpLeg\0\u{1}Model".into()),
+                        Prop::Str("Null".into()),
+                    ],
+                    children: vec![],
+                },
+                Node {
+                    name: "Geometry".into(),
+                    props: vec![
+                        Prop::I64(10),
+                        Prop::Str("Body\0\u{1}Geometry".into()),
+                        Prop::Str("Mesh".into()),
+                    ],
+                    children: vec![
+                        Node {
+                            name: "Vertices".into(),
+                            props: vec![Prop::F64s(vec![
+                                0.0, 0.0, 0.0, 0.0, 1.75, 0.0, 0.5, 0.0, 0.0, 0.5, 1.75, 0.0,
+                            ])],
+                            children: vec![],
+                        },
+                        Node {
+                            name: "PolygonVertexIndex".into(),
+                            props: vec![Prop::I32s(vec![0, 1, 3, -3])],
+                            children: vec![],
+                        },
+                    ],
+                },
+                Node {
+                    name: "Deformer".into(),
+                    props: vec![
+                        Prop::I64(20),
+                        Prop::Str("Skin".into()),
+                        Prop::Str("Skin".into()),
+                    ],
+                    children: vec![],
+                },
+                cluster(21, vec![0, 1], vec![1.0, 1.0]),
+                cluster(22, vec![0, 2, 3], vec![1.0, 1.0, 1.0]),
+            ],
+        };
+        let link = |child: i64, parent: i64| Node {
+            name: "C".into(),
+            props: vec![
+                Prop::Str("OO".into()),
+                Prop::I64(child),
+                Prop::I64(parent),
+            ],
+            children: vec![],
+        };
+        let connections = Node {
+            name: "Connections".into(),
+            props: vec![],
+            children: vec![
+                link(21, 20),
+                link(21, 1),
+                link(22, 20),
+                link(22, 2),
+            ],
+        };
+        Document {
+            version: 7400,
+            nodes: vec![objects, connections],
+        }
+    }
+
+    #[test]
+    fn an_fbx_skin_imports_with_its_clusters() {
+        let character =
+            Character::from_fbx(&fbx_sample(), "fbx".into()).expect("from_fbx");
+        assert_eq!(character.bones.len(), 2);
+        assert_eq!(character.bones[0].name, "Hips");
+        assert_eq!(character.bones[0].canonical, Some(0));
+        assert_eq!(character.bones[1].name, "LeftUpLeg");
+        assert_eq!(
+            character.bones[1].canonical,
+            velomocap_motion::retarget::canonicalize("LeftUpLeg")
+        );
+        assert_eq!(character.vertex_count(), 4);
+        assert_eq!(character.faces.len(), 2, "the quad fans into two triangles");
+        // Vertex 0 is driven by both clusters, so its weights are normalised.
+        let weights = character.weights[0];
+        assert!((weights[0] - 0.5).abs() < 1e-5, "{weights:?}");
+        assert!((weights[1] - 0.5).abs() < 1e-5, "{weights:?}");
+        // Already 1.75 m tall, so nothing is scaled.
+        assert!((character.scale - 1.0).abs() < 1e-6);
+    }
+
     #[test]
     fn a_glb_skin_imports_with_its_bones_and_mesh() {
         let bytes = sample();
@@ -783,7 +1139,10 @@ mod tests {
         let character = Gltf::parse(&bytes).unwrap().build("sample".into()).unwrap();
         let world = vec![neutral(); 52];
         let rest = vec![neutral(); 52];
-        let posed = character.pose(&world, &rest, [0.0, 1.0, 0.0]);
+        // Only Hips (canonical 0) is named, and it is SMPL-H joint 0.
+        let mut names = vec![String::new(); 52];
+        names[0] = "Hips".to_string();
+        let posed = character.pose(&world, &rest, &names, [0.0, 1.0, 0.0]);
         // Vertex 0 is fully weighted to Hips, whose bind position is the origin.
         assert!((posed[1] - 1.0).abs() < 1e-5, "{posed:?}");
         // The translation is global: a vertex weighted to the other bone moves

@@ -774,7 +774,12 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                             ours.positions[1] - bind[1],
                             ours.positions[2] - bind[2],
                         ];
-                        Some(assigned.character.pose(&rotations, rest, translation))
+                        Some(assigned.character.pose(
+                            &rotations,
+                            rest,
+                            &clip.bvh.names,
+                            translation,
+                        ))
                     })
                     .collect();
                 let draws: Vec<viewport::PersonDraw<'_>> = people

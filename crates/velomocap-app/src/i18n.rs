@@ -85,7 +85,7 @@ pub fn t(english: &'static str) -> &'static str {
         "The motion stage is still running, or it produced no clip." => {
             "动作阶段还在运行，或者这段视频没有生成动作"
         }
-        "Import a VRM / glTF humanoid for this person" => "给这个人物导入 VRM / glTF 人物模型",
+        "Import a VRM / glTF humanoid for this person" => "给这个人物导入 VRM / glTF / FBX 人物模型",
         "Reconstruct all people" => "重建所有人物",
         "Detect every person, then run SAM 3D Body on each" => "先检测出每个人，再逐人运行 SAM 3D Body",
         "Cancel reconstruction" => "取消重建",
