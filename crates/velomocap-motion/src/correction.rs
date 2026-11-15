@@ -370,6 +370,7 @@ fn leg_ik(
         let shin = distance3(joint3(&rest, ankle), joint3(&rest, knee));
         let max_reach = thigh + shin;
 
+        let flight = flight_frames(clip, settings.floor);
         let mut contact = vec![false; count];
         for index in 0..count {
             let skeleton = &clip.skeletons[index];
@@ -383,15 +384,16 @@ fn leg_ik(
                     fps,
                 )
             };
-            contact[index] =
-                low <= settings.floor + thresholds.contact_height && speed <= thresholds.contact_speed;
+            contact[index] = !flight[index]
+                && low <= settings.floor + thresholds.contact_height
+                && speed <= thresholds.contact_speed;
         }
 
         for (begin, end) in contact_runs(&contact, thresholds.min_run) {
             let mut xs = Vec::new();
             let mut zs = Vec::new();
             for index in begin..end {
-                let at = joint(&clip.skeletons[index], ankle);
+                let at = support_point(clip, index, ankle, toe);
                 xs.push(at[0]);
                 zs.push(at[2]);
             }
@@ -399,9 +401,15 @@ fn leg_ik(
             let anchor_z = median(&zs) as f64;
             for index in begin..end {
                 let current = joint(&clip.skeletons[index], ankle);
+                let sole = support_point(clip, index, ankle, toe);
                 let hip_pos = joint(&clip.skeletons[index], hip);
-                // Horizontal pin only: the height is already solved.
-                let target = [anchor_x, current[1] as f64, anchor_z];
+                // Move the ankle so that the sole's support point lands back on
+                // the anchor; the ankle itself is free to slide over it.
+                let target = [
+                    current[0] as f64 + (anchor_x - sole[0] as f64),
+                    current[1] as f64,
+                    current[2] as f64 + (anchor_z - sole[2] as f64),
+                ];
                 let weight = reach_falloff(
                     target,
                     [
@@ -486,6 +494,88 @@ fn contact_runs(contact: &[bool], min_run: usize) -> Vec<(usize, usize)> {
     runs
 }
 
+/// The two material points of a sole: the toe joint and a heel estimated behind
+/// the ankle (SMPL-H has no heel joint, so the foot axis stands in for it).
+///
+/// Kimodo blends these with weights computed from **geometry only** - which of
+/// the two points is lower - so a rolling foot moves its contact point along the
+/// sole instead of sliding the whole foot.
+fn sole_points(clip: &FlowClip, frame: usize, ankle: usize, toe: usize) -> ([f32; 3], [f32; 3]) {
+    let skeleton = &clip.skeletons[frame];
+    let ankle_at = joint(skeleton, ankle);
+    let toe_at = joint(skeleton, toe);
+    // Heel: mirror of the toe offset about the ankle, damped so skin noise does
+    // not swing it.
+    let heel = [
+        ankle_at[0] + (ankle_at[0] - toe_at[0]) * 0.6,
+        ankle_at[1] + (ankle_at[1] - toe_at[1]) * 0.6,
+        ankle_at[2] + (ankle_at[2] - toe_at[2]) * 0.6,
+    ];
+    (toe_at, heel)
+}
+
+/// Kimodo's `support_weights`, returned as the **heel weight**: 0.5 when the
+/// foot is flat, 0 when the toe bears the weight, 1 at the heel. The 5 mm
+/// deadband keeps millimetre noise from being read as a weight transfer and the
+/// ramp saturates at 25 mm.
+fn support_weight(toe: [f32; 3], heel: [f32; 3]) -> f32 {
+    let delta = toe[1] - heel[1];
+    let x = ((delta.abs() - 0.005) / 0.02).clamp(0.0, 1.0);
+    let smooth = x * x * (3.0 - 2.0 * x);
+    0.5f32 + 0.5 * smooth * delta.signum()
+}
+
+/// The point of the sole that is actually bearing the weight.
+fn support_point(clip: &FlowClip, frame: usize, ankle: usize, toe: usize) -> [f32; 3] {
+    let (toe_at, heel) = sole_points(clip, frame, ankle, toe);
+    let weight = support_weight(toe_at, heel);
+    [
+        toe_at[0] * (1.0 - weight) + heel[0] * weight,
+        toe_at[1].min(heel[1]),
+        toe_at[2] * (1.0 - weight) + heel[2] * weight,
+    ]
+}
+
+/// Kimodo's `airborne_excursions`, simplified to the gate that matters here: a
+/// stretch where the lowest sole is well above the floor and there is lower
+/// ground on both sides is a jump, so it must not be pinned as a contact.
+fn flight_frames(clip: &FlowClip, floor: f32) -> Vec<bool> {
+    let count = clip.skeletons.len();
+    let mut flight = vec![false; count];
+    if count < 5 {
+        return flight;
+    }
+    let mut lowest = vec![f32::MAX; count];
+    for frame in 0..count {
+        for (ankle, toe) in [(LEFT_ANKLE, LEFT_FOOT), (RIGHT_ANKLE, RIGHT_FOOT)] {
+            let at = joint(&clip.skeletons[frame], ankle)[1].min(joint(&clip.skeletons[frame], toe)[1]);
+            lowest[frame] = lowest[frame].min(at);
+        }
+    }
+    let reach = ((clip.fps.max(1.0) * 4.0) as usize).clamp(2, count);
+    let mut index = 0;
+    while index < count {
+        if lowest[index] - floor <= 0.15 {
+            index += 1;
+            continue;
+        }
+        let begin = index;
+        while index < count && lowest[index] - floor > 0.15 {
+            index += 1;
+        }
+        let end = index;
+        // Needs lower ground (or the clip boundary) on both sides to be an arc.
+        let before = begin == 0 || (0..begin).any(|frame| lowest[frame] - floor <= 0.15);
+        let after = end == count || (end..count).any(|frame| lowest[frame] - floor <= 0.15);
+        if before && after && end - begin <= reach {
+            for hit in &mut flight[begin..end] {
+                *hit = true;
+            }
+        }
+    }
+    flight
+}
+
 fn foot_lock(
     clip: &mut FlowClip,
     settings: &CorrectionSettings,
@@ -517,6 +607,7 @@ fn foot_lock(
         ground = median(&lows);
     }
 
+    let flight = flight_frames(clip, ground);
     for (ankle, toe) in feet {
         let mut contact = vec![false; count];
         for index in 0..count {
@@ -531,15 +622,18 @@ fn foot_lock(
                     fps,
                 )
             };
-            contact[index] =
-                low <= ground + thresholds.contact_height && speed <= thresholds.contact_speed;
+            contact[index] = !flight[index]
+                && low <= ground + thresholds.contact_height
+                && speed <= thresholds.contact_speed;
         }
         bridge_gaps(&mut contact, thresholds.bridge_frames);
         for (begin, end) in contact_runs(&contact, thresholds.min_run) {
             let mut xs = Vec::new();
             let mut zs = Vec::new();
             for index in begin..end {
-                let at = joint(&clip.skeletons[index], ankle);
+                // Anchor on the sole's support point, not the ankle: a rolling
+                // foot then keeps its contact patch still while the ankle moves.
+                let at = support_point(clip, index, ankle, toe);
                 xs.push(at[0]);
                 zs.push(at[2]);
             }
@@ -553,7 +647,7 @@ fn foot_lock(
                 thresholds.strength * contact_confidence(clip, begin, end, thresholds.confidence);
             report.foot_contacts += 1;
             for index in begin..end {
-                let at = joint(&clip.skeletons[index], ankle);
+                let at = support_point(clip, index, ankle, toe);
                 let dx = (anchor[0] - at[0]) as f64 * hold as f64;
                 let dz = (anchor[1] - at[2]) as f64 * hold as f64;
                 // Two feet in contact at once average their demands.
@@ -1015,6 +1109,26 @@ mod tests {
             worst.1,
             worst.0
         );
+    }
+
+    /// `support_weights`: flat foot is 0.5, a rolled foot moves the weight to
+    /// whichever point is lower, and the 5 mm deadband keeps skin noise out.
+    #[test]
+    fn support_weight_rolls_towards_the_lower_point() {
+        let flat = support_weight([0.0, 0.05, 0.0], [0.0, 0.05, 0.0]);
+        assert!((flat - 0.5).abs() < 1e-6, "flat foot {flat}");
+
+        // Toe 30 mm lower than the heel: weight goes to the toe.
+        let toe_down = support_weight([0.0, 0.02, 0.0], [0.0, 0.05, 0.0]);
+        assert!(toe_down < 0.05, "toe down {toe_down}");
+
+        // Heel 30 mm lower: weight goes the other way.
+        let heel_down = support_weight([0.0, 0.05, 0.0], [0.0, 0.02, 0.0]);
+        assert!(heel_down > 0.95, "heel down {heel_down}");
+
+        // 3 mm difference is inside the deadband.
+        let noise = support_weight([0.0, 0.047, 0.0], [0.0, 0.05, 0.0]);
+        assert!((noise - 0.5).abs() < 1e-6, "noise {noise}");
     }
 
     /// `gap` in the reference presets: a one frame dropout inside a stance is
