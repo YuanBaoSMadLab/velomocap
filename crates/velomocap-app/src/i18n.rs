@@ -72,6 +72,19 @@ pub fn t(english: &'static str) -> &'static str {
         "Replace model…" => "替换模型…",
         "Use built-in body" => "恢复内置身体",
         "Click to open this person's model settings" => "点击打开这个人物的人物设置",
+        "Put all four lock tracks back on automatic" => "四条锁定轨全部恢复自动",
+        "No video open" => "还没有打开视频",
+        "File → Import video… to start; the viewport fills once a clip is open." => {
+            "文件 → 导入视频… 开始；打开片段后这里就会出现画面"
+        }
+        "No people yet" => "还没有人物",
+        "File → Reconstruct all people runs the detector and the body model." => {
+            "文件 → 重建所有人物：先检测人物，再跑身体模型"
+        }
+        "No motion yet" => "还没有动作",
+        "The motion stage is still running, or it produced no clip." => {
+            "动作阶段还在运行，或者这段视频没有生成动作"
+        }
         "Import a VRM / glTF humanoid for this person" => "给这个人物导入 VRM / glTF 人物模型",
         "Reconstruct all people" => "重建所有人物",
         "Detect every person, then run SAM 3D Body on each" => "先检测出每个人，再逐人运行 SAM 3D Body",

@@ -892,10 +892,22 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                     layers,
                     view: ViewMode::from_index(app.view_mode),
                     floor,
-                    empty_hint: (
-                        i18n::t("No motion loaded"),
-                        i18n::t("Reconstruct a clip to see every person as a body here."),
-                    ),
+                    empty_hint: if app.video.is_none() {
+                        (
+                            i18n::t("No video open"),
+                            i18n::t("File → Import video… to start; the viewport fills once a clip is open."),
+                        )
+                    } else if app.people.is_empty() {
+                        (
+                            i18n::t("No people yet"),
+                            i18n::t("File → Reconstruct all people runs the detector and the body model."),
+                        )
+                    } else {
+                        (
+                            i18n::t("No motion yet"),
+                            i18n::t("The motion stage is still running, or it produced no clip."),
+                        )
+                    },
                 };
                 if viewport::show(ui, rect, &scene, &mut app.orbit, &mut app.view) {
                     ctx.request_repaint();
@@ -930,33 +942,19 @@ fn mode_label(mode: ViewMode) -> &'static str {
 fn footer_checks(app: &mut VeloMocap, ui: &mut egui::Ui) {
     ui.spacing_mut().item_spacing.x = 8.0;
     ui.checkbox(&mut app.layers.grid, egui::RichText::new(i18n::t("Floor Grid")).size(11.0));
-    let mut correction_floor = false;
-    ui.add_enabled(
-        false,
-        egui::Checkbox::new(&mut correction_floor, egui::RichText::new(i18n::t("Correction Floor")).size(11.0)),
-    )
-    .on_disabled_hover_text(i18n::t("Motion correction is not part of this build"));
     ui.checkbox(
         &mut app.layers.motion_path,
         egui::RichText::new(i18n::t("Motion Path")).size(11.0),
     );
-    let mut locks = false;
-    ui.add_enabled(
-        false,
-        egui::Checkbox::new(&mut locks, egui::RichText::new(i18n::t("Lock")).size(11.0)),
-    )
-    .on_disabled_hover_text(i18n::t("Contact locks are not part of this build"));
     ui.checkbox(&mut app.layers.names, egui::RichText::new(i18n::t("Name")).size(11.0));
-    let mut cameras = false;
-    ui.add_enabled(
-        false,
-        egui::Checkbox::new(&mut cameras, egui::RichText::new(i18n::t("Camera")).size(11.0)),
-    )
-    .on_disabled_hover_text(i18n::t("Camera frustums are not part of this build"));
     ui.checkbox(
         &mut app.layers.follow,
         egui::RichText::new(i18n::t("Follow Actor")).size(11.0),
     );
+    // Three dead checkboxes used to sit here (correction floor, locks, camera
+    // frustums) with "not part of this build" on hover. Two of those features do
+    // exist — as the floor field in the sidebar and the lock rows under the
+    // timeline — so the controls read as broken rather than absent.
 }
 
 fn timeline(app: &mut VeloMocap, ctx: &egui::Context) {
@@ -1142,21 +1140,27 @@ fn clip_label(app: &mut VeloMocap, ui: &mut egui::Ui) {
                         .truncate(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_enabled(
-                        false,
-                        egui::Button::new(i18n::t("Reset Trim")).min_size(egui::vec2(72.0, 18.0)),
-                    );
+                    // "Reset Trim" was a permanently disabled button: trimming
+                    // does not exist in this build, so a control that never
+                    // works only reads as broken. The two that do exist are here.
+                    let has_locks = !app.locks.is_automatic();
+                    if ui
+                        .add_enabled(
+                            has_locks,
+                            egui::Button::new(i18n::t("Reset Locks"))
+                                .min_size(egui::vec2(76.0, 18.0)),
+                        )
+                        .on_hover_text(i18n::t("Put all four lock tracks back on automatic"))
+                        .clicked()
+                    {
+                        app.reset_locks(None);
+                    }
                     if ui
                         .add(egui::Button::new(i18n::t("Frame All")).min_size(egui::vec2(64.0, 18.0)))
                         .clicked()
                     {
                         app.orbit.framed = false;
                     }
-                    ui.add_enabled(
-                        false,
-                        egui::Button::new(i18n::t("Reset Locks")).min_size(egui::vec2(76.0, 18.0)),
-                    )
-                    .on_disabled_hover_text(i18n::t("Contact locks are not part of this build"));
                 });
             });
         });
@@ -2462,21 +2466,26 @@ fn guide_window(app: &mut VeloMocap, ctx: &egui::Context) {    if !app.show_guid
             ui.label(egui::RichText::new(if chinese { "流程" } else { "Workflow" }).strong());
             let workflow: &[&str] = if chinese {
                 &[
-                    "1. 文件 → 打开视频，或在命令行里直接给出片段。",
-                    "2. 文件 → 重建所有人物：YOLOv8 找出每个人，再对每人运行",
-                    "   SAM 3D Body 的 ONNX 链路。",
-                    "3. 重建过程中人体会实时出现在 3D 视口；每个人都是完整的",
-                    "   MHR 网格，而不只是骨骼。",
-                    "4. 拖动时间轴或按空格回放结果。",
+                    "1. 文件 → 导入视频…，把片段放到工作台。",
+                    "2. 文件 → 重建所有人物：YOLOv8 找出每个人，再对每人运行 SAM 3D Body。",
+                    "3. 拖动时间轴、或按空格回放；下面四条锁定轨可以手绘接触帧。",
+                    "4. 右侧「人物」列表点一行 → 替换模型…：导入 VRM / GLB 虚拟人物，",
+                    "   用它替换内置身体播放这段动作（选择会存到片段旁边）。",
+                    "5. 文件 → 导出动作…：选 BVH / FBX、骨架命名、rest 校正和文件名，",
+                    "   窗口里会列出这次写出的完整路径。",
                 ]
             } else {
                 &[
-                    "1. File → Open video, or pass a clip on the command line.",
-                    "2. File → Reconstruct all people detects every person with YOLOv8",
-                    "   and runs the SAM 3D Body ONNX chain on each of them.",
-                    "3. Bodies stream into the viewport while the run is going; each",
-                    "   person gets an MHR mesh, not just a skeleton.",
-                    "4. Scrub the timeline or press Space to play the result back.",
+                    "1. File → Import video… to open a clip.",
+                    "2. File → Reconstruct all people detects everyone with YOLOv8 and runs",
+                    "   the SAM 3D Body chain on each of them.",
+                    "3. Scrub the timeline or press Space; the four lock rows below can be",
+                    "   drawn by hand to fix contact timing.",
+                    "4. Click a row in the People list on the right → Replace model… to",
+                    "   import a VRM / GLB avatar and play this motion on it (the choice",
+                    "   is saved next to the clip).",
+                    "5. File → Export motion… picks BVH / FBX, the skeleton naming, the rest",
+                    "   correction and the file name, and lists the exact paths it writes.",
                 ]
             };
             for line in workflow {
