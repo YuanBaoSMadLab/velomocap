@@ -10,6 +10,7 @@ pub mod flow;
 pub mod ik;
 pub mod pipeline;
 pub mod sam;
+pub mod trajectory;
 
 pub use bvh_people::write_person_bvh;
 pub use cleanup::{stabilise, CleanupConfig, CleanupReport};

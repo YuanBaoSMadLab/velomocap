@@ -4,11 +4,12 @@
 //! and `hand_lock`): a planted foot must not slide and a resting hand must stay
 //! put. Without this pass the character skates over the floor.
 //!
-//! * Feet are pinned by translating the whole body - rigid, so the mesh, the
-//!   joints and the export cannot disagree afterwards.
-//! * Hands are pinned with a two-bone IK: a few CCD steps rotate the elbow and
-//!   the shoulder until the wrist sits on the target, then the chain is written
-//!   back as SMPL-H axis-angle rotations.
+//! * Feet are pinned through Kimodo's trajectory corrector (`k-1`): the contact
+//!   frames are pins, the rest is free, and the velocity/acceleration weights
+//!   keep the root from kinking where a contact run starts. Only X/Z move; the
+//!   vertical placement belongs to the floor solve.
+//! * Hands are pinned with a two-bone IK (the Kimodo solve on the SMPL-H chain),
+//!   then the chain is written back as axis-angle rotations.
 
 use anyhow::Result;
 
@@ -212,8 +213,9 @@ fn foot_lock(
         return;
     }
     let feet: [(usize, usize); 2] = [(LEFT_ANKLE, LEFT_FOOT), (RIGHT_ANKLE, RIGHT_FOOT)];
-    let mut shift = vec![[0.0f64; 3]; count];
-    let mut weight = vec![0.0f32; count];
+    let mut pinned = vec![false; count];
+    let mut target_x = vec![0.0f64; count];
+    let mut target_z = vec![0.0f64; count];
 
     // Ground reference: `Flat` uses the configured floor, `MultiLevel` uses the
     // lowest ankle height seen in the clip, which follows a ramp instead of
@@ -244,8 +246,8 @@ fn foot_lock(
                     fps,
                 )
             };
-            contact[index] = low <= ground + thresholds.contact_height
-                && speed <= thresholds.contact_speed;
+            contact[index] =
+                low <= ground + thresholds.contact_height && speed <= thresholds.contact_speed;
         }
         for (begin, end) in contact_runs(&contact, thresholds.min_run) {
             let mut xs = Vec::new();
@@ -256,47 +258,66 @@ fn foot_lock(
                 zs.push(at[2]);
             }
             // Horizontal only: the vertical placement is solved when the clip is
-            // dropped onto its floor, and snapping Y on the contact frames only
-            // (leaving it alone in between) is what made the body bob up and
-            // down after a reconstruction.
-            let target = [median(&xs), 0.0, median(&zs)];
+            // dropped onto its floor. Snapping Y on the contact frames only is
+            // what made the body bob up and down after a reconstruction.
+            let anchor = [median(&xs), median(&zs)];
             report.foot_contacts += 1;
             for index in begin..end {
                 let at = joint(&clip.skeletons[index], ankle);
-                let edge = (index - begin).min(end - 1 - index) as f32;
-                let blend = if thresholds.blend_frames == 0 {
-                    1.0
+                // Two feet in contact at once average their demands.
+                let share = if pinned[index] { 0.5 } else { 1.0 };
+                if pinned[index] {
+                    target_x[index] = 0.5 * (target_x[index] + (anchor[0] - at[0]) as f64);
+                    target_z[index] = 0.5 * (target_z[index] + (anchor[1] - at[2]) as f64);
                 } else {
-                    (edge / thresholds.blend_frames as f32).clamp(0.0, 1.0)
-                };
-                for axis in [0usize, 2] {
-                    shift[index][axis] += (target[axis] - at[axis]) as f64 * blend as f64;
+                    target_x[index] = (anchor[0] - at[0]) as f64 * share;
+                    target_z[index] = (anchor[1] - at[2]) as f64 * share;
                 }
-                weight[index] += blend;
+                pinned[index] = true;
             }
         }
     }
 
+    if !pinned.iter().any(|hit| *hit) {
+        return;
+    }
+
+    // Kimodo's trajectory corrector: the contact frames are pins (margin 0), the
+    // rest is free, and velocity/acceleration weights keep the root from
+    // jumping between them. This replaces the old per-frame blend, which could
+    // still kink the root where a contact run started.
+    let mut margins = vec![-1.0f64; count];
     for index in 0..count {
-        if weight[index] <= 0.0 {
-            continue;
+        if pinned[index] {
+            margins[index] = 0.0;
         }
-        let w = weight[index].max(1.0) as f64;
-        let mut delta = [
-            shift[index][0] / w,
-            shift[index][1] / w,
-            shift[index][2] / w,
-        ];
-        let length = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
-        let cap = thresholds.max_correction as f64;
+    }
+    if !margins.iter().any(|margin| *margin == 0.0) {
+        return;
+    }
+    let reference = vec![0.0f64; count];
+    let corrector = crate::trajectory::TrajectoryCorrector::new(
+        &margins,
+        1.0,
+        12.0,
+        40.0,
+        &[],
+        40,
+    );
+    let shift_x = corrector.interpolate(&target_x, &reference);
+    let shift_z = corrector.interpolate(&target_z, &reference);
+
+    let cap = thresholds.max_correction as f64;
+    for index in 0..count {
+        let mut delta = [shift_x[index], 0.0, shift_z[index]];
+        let length = (delta[0] * delta[0] + delta[2] * delta[2]).sqrt();
         if length > cap && length > 0.0 {
             let scale = cap / length;
-            for value in &mut delta {
-                *value *= scale;
-            }
+            delta[0] *= scale;
+            delta[2] *= scale;
         }
         report.max_shift = report.max_shift.max(length as f32);
-        for axis in 0..3 {
+        for axis in [0usize, 2] {
             clip.poses[index].translation[axis] += delta[axis] as f32;
         }
     }
