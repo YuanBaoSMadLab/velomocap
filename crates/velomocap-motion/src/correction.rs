@@ -20,13 +20,15 @@
 //! | `anatomical_ik.solve_legs`, `reach_lengths`, `minimum_reach_lengths` | `anatomical` |
 //! | `SoleGeometry` | `sole::SoleGeometry` (default) |
 //! | `source_reach_gap` + reach gain | `anatomical::source_reach_gap` in `hand_lock` |
+//! | `palm_offsets`, `samples`, `plan` (palm contacts) | `palm::PalmGeometry`, `palm::plan` |
+//! | `scipy.optimize.least_squares` (both planning passes) | `solver::minimise` |
 //!
 //! Known differences that are **not** ported:
 //!
 //! | Reference | Why |
 //! | --- | --- |
-//! | `contact_arm_plan.solve` (least-squares over collar depression, arm swivel and wrist trim, plus branch calibration) | a numeric optimiser, not a geometric rule; it only acts when a hand is in contact, which our fixture material never triggers |
-//! | `contact_pose_plan._optimise_window` (`scipy.optimize.least_squares`, 60 iterations, pose/velocity/acceleration/root sigmas) | same: a trajectory optimiser on top of the root plan we already solve with the ADMM corrector |
+//! | `contact_arm_plan.solve` (least-squares over collar depression, arm swivel and wrist trim, plus branch calibration) | branch calibration, the reach gain and the palm targets are ported (`anatomical::elbow_branch`, `palm`); the coupled collar/swivel/wrist-trim optimiser is not, because it only acts when a palm support exists, and the reference's own default leaves hand correction off |
+//! | `contact_pose_plan._optimise_window` (`scipy.optimize.least_squares`, 60 iterations, pose/velocity/acceleration/root sigmas) | the same objective is solved by `temporal::plan_series`; the window optimiser's extra collar/arm/swing coupling variables need a palm support to be meaningful |
 //! | `CorrectJointRotations` | no counterpart on purpose: it only moves a bone whose `fullBodyMask` is set, and the reference's own call passes a mask of zeros (`RGBMocap/mocap/correction.py` builds `c` from the contact array and passes `zero` for every body mask), so it is a no-op in that path |
 //!
 //! `DoEffectorIK` is implemented as the position pin in `hand_lock`; its optional
