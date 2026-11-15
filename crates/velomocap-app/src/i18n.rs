@@ -68,6 +68,14 @@ pub fn t(english: &'static str) -> &'static str {
         "Detect every person, then run SAM 3D Body on each" => "先检测出每个人，再逐人运行 SAM 3D Body",
         "Cancel reconstruction" => "取消重建",
         "Export BVH…" => "导出 BVH…",
+        "Skeleton naming" => "骨架命名",
+        "Write the bones with this rig's names" => "用该骨架的命名写出骨骼",
+        "Rest correction" => "rest 姿态校正",
+        "Turn the clip into the canonical T-pose bind, so a Mixamo-class rig plays it exactly" => {
+            "把动作换算到标准 T-pose 绑定下，Mixamo 这类骨架可直接播放"
+        }
+        "VeloMocap biped" => "VeloMocap 双足",
+        "DAZ Genesis" => "DAZ Genesis",
         "Reset" => "重置",
         "Stop" => "停止",
         "Estimated camera (VGGT)" => "估算相机（VGGT）",

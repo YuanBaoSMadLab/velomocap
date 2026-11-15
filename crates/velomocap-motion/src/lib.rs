@@ -12,6 +12,7 @@ pub mod flow;
 pub mod ik;
 pub mod palm;
 pub mod pipeline;
+pub mod retarget;
 pub mod sam;
 pub mod sole;
 pub mod solver;
@@ -22,7 +23,7 @@ pub use bvh_people::write_person_bvh;
 pub use cleanup::{stabilise, CleanupConfig, CleanupReport};
 pub use export::{binding_from_rest, write_bvh, BvhExport};
 pub use flow::{
-    feature_rows, generate as generate_flow, prepare_bvh, summarise as summarise_flow,
+    feature_rows, generate as generate_flow, prepare_bvh, prepare_bvh_for, summarise as summarise_flow,
     write_clip_bvh, write_prepared, write_prepared_fbx, FlowClip, FlowConfig, PreparedBvh, ANCHOR_FRAMES, FEATURE_DIM,
     INPUT_DIM, NARROWBAND, VTXT_DIM,
 };

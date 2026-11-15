@@ -585,7 +585,7 @@ pub fn write_prepared(path: &Path, prepared: &PreparedBvh) -> Result<BvhReport> 
 /// `LeftFinger0..4` with `""`/`1`/`2` segments. SMPL-H carries the same
 /// anatomy in its own order, so the same target names are derived from its
 /// joint names rather than from a Mixamo rig.
-fn biped_name(joint: usize) -> String {
+pub(crate) fn biped_name(joint: usize) -> String {
     // SMPL-H has 52 joints: the 22 body joints plus 15 per hand, so the name
     // list is the SMPL-X one without the jaw and the two eyes.
     let sourced: Vec<&str> = velomocap_body::JOINT_NAMES
@@ -711,6 +711,22 @@ pub fn prepare_bvh(clip: &FlowClip, body: &BodyModel, fps: f64) -> Result<Prepar
         local,
         fps,
     })
+}
+
+/// Build the export payload for a clip, named for `rig`.
+///
+/// The plain [`prepare_bvh`] is this with [`Rig::Biped`] and no rest correction,
+/// which is the payload every export used before the retarget chain existed.
+pub fn prepare_bvh_for(
+    clip: &FlowClip,
+    body: &BodyModel,
+    fps: f64,
+    rig: crate::retarget::Rig,
+    rest_correct: bool,
+) -> Result<PreparedBvh> {
+    let mut prepared = prepare_bvh(clip, body, fps)?;
+    crate::retarget::rewrite(&mut prepared, rig, rest_correct)?;
+    Ok(prepared)
 }
 
 /// Write a generated clip as FBX using the SMPL-H hierarchy.

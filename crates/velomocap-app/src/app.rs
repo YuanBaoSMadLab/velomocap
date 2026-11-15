@@ -220,6 +220,11 @@ pub struct VeloMocap {
     pub status: String,
     pub error: Option<String>,
     pub export_note: Option<String>,
+    /// Which vendor's bone names an export is written in.
+    pub export_rig: velomocap_motion::retarget::Rig,
+    /// Re-express the exported rotations in the canonical rest frames, so a rig
+    /// that binds in the canonical T-pose plays this clip exactly.
+    pub export_rest_correct: bool,
     pub console: Vec<String>,
     pub show_console: bool,
     pub show_help: bool,
@@ -345,6 +350,8 @@ impl VeloMocap {
             ort_path,
             cuda_ok,
             export_note: None,
+            export_rig: velomocap_motion::retarget::Rig::Biped,
+            export_rest_correct: false,
             console: Vec::new(),
             show_console: false,
             show_help: false,
@@ -737,6 +744,24 @@ impl VeloMocap {
             self.log("Cancellation requested.");
         }
     }
+    /// The clip's export payload: renamed into the selected rig, and
+    /// rest-corrected when asked. The default biped payload is the clip's own,
+    /// which is what every export wrote before the retarget chain existed.
+    fn export_payload(
+        &self,
+        bvh: &velomocap_motion::PreparedBvh,
+    ) -> Result<velomocap_motion::PreparedBvh, String> {
+        let mut prepared = bvh.clone();
+        if self.export_rig != velomocap_motion::retarget::Rig::Biped || self.export_rest_correct {
+            velomocap_motion::retarget::rewrite(
+                &mut prepared,
+                self.export_rig,
+                self.export_rest_correct,
+            )
+            .map_err(|error| format!("{error:#}"))?;
+        }
+        Ok(prepared)
+    }
                     pub fn export_fbx(&mut self) {
         let Some(video) = self.video.clone() else {
             self.error = Some("Open a video first.".into());
@@ -752,13 +777,21 @@ impl VeloMocap {
             return;
         };
         let path = video.with_extension("fbx");
-        match velomocap_motion::write_prepared_fbx(&path, &clip.bvh) {
+        let prepared = match self.export_payload(&clip.bvh) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.error = Some(error);
+                return;
+            }
+        };
+        match velomocap_motion::write_prepared_fbx(&path, &prepared) {
             Ok(report) => {
                 let note = format!(
-                    "{} · FlowHMR · {} bones · {} keys",
+                    "{} · FlowHMR · {} bones · {} keys · {}",
                     path.display(),
                     report.bones,
-                    report.key_count
+                    report.key_count,
+                    self.export_rig.label()
                 );
                 self.log(format!("FBX: {note}"));
                 self.export_note = Some(note);
@@ -779,7 +812,14 @@ impl VeloMocap {
             .cloned()
         {
             let path = video.with_extension("bvh");
-            match velomocap_motion::write_prepared(&path, &clip.bvh) {
+            let prepared = match self.export_payload(&clip.bvh) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.error = Some(error);
+                    return;
+                }
+            };
+            match velomocap_motion::write_prepared(&path, &prepared) {
                 Ok(report) => {
                     let first = report.orders.first().cloned().unwrap_or_default();
                     let order = if report.orders.iter().all(|entry| *entry == first) {
@@ -788,11 +828,12 @@ impl VeloMocap {
                         first
                     };
                     let note = format!(
-                        "{} · FlowHMR · {} frames · {} bones · order {}",
+                        "{} · FlowHMR · {} frames · {} bones · order {} · {}",
                         path.display(),
                         clip.bvh.frames(),
                         clip.bvh.parents.len(),
-                        order
+                        order,
+                        self.export_rig.label()
                     );
                     self.log(format!("BVH: {note}"));
                     self.export_note = Some(note);
@@ -824,6 +865,16 @@ impl VeloMocap {
             hits: person.hits(),
         };
         let path = video.with_extension("bvh");
+        // The MHR skeleton has no canonical bone names (its joints are
+        // `mhr000…`), so the skeleton-naming choice cannot apply to it: the
+        // per-frame MHR export is only reachable when there is no FlowHMR clip,
+        // and then it is the only payload available.
+        if self.export_rig != velomocap_motion::retarget::Rig::Biped {
+            self.log(format!(
+                "BVH: the MHR skeleton has no {} names, writing its own joints.",
+                self.export_rig.label()
+            ));
+        }
         match velomocap_motion::write_person_bvh(&path, &track, &mesh, self.current_fps()) {
             Ok(report) => {
                 let note = format!(

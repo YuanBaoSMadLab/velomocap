@@ -216,6 +216,32 @@ fn menu_bar(app: &mut VeloMocap, ctx: &egui::Context) {
                         app.cancel_capture();
                     }
                     ui.separator();
+                    // Which bone vocabulary the export is written in, and
+                    // whether its rotations are re-expressed in the canonical
+                    // rest frames. Picking a vendor also turns the correction on
+                    // for rigs that bind in the canonical T-pose, and off for the
+                    // ones that do not (Unreal's mannequin is an A-pose).
+                    ui.menu_button(i18n::t("Skeleton naming"), |ui| {
+                        for rig in velomocap_motion::retarget::Rig::ALL {
+                            if ui
+                                .selectable_label(app.export_rig == rig, i18n::t(rig.label()))
+                                .clicked()
+                            {
+                                app.export_rig = rig;
+                                app.export_rest_correct =
+                                    rig != velomocap_motion::retarget::Rig::Biped
+                                        && rig.binds_in_t_pose();
+                                ui.close();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(i18n::t("Write the bones with this rig's names"));
+                    ui.checkbox(&mut app.export_rest_correct, i18n::t("Rest correction"))
+                        .on_hover_text(i18n::t(
+                            "Turn the clip into the canonical T-pose bind, so a Mixamo-class rig plays it exactly",
+                        ));
+                    ui.separator();
                     // The FlowHMR clip is what the viewport shows, so the menu
                     // exports that when it exists and the per-frame MHR bodies
                     // otherwise.
