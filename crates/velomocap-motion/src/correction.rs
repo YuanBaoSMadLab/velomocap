@@ -860,6 +860,7 @@ fn leg_ik(
     ];
     let cap = thresholds.max_correction.min(0.05) as f64;
     let mut lifts = vec![0.0f32; count];
+    let mut drops = vec![0.0f32; count];
     for (foot_index, (hip, knee, ankle, toe)) in legs.into_iter().enumerate() {
         // Bone lengths from the rest pose: the reach limit for the falloff.
         let thigh = distance3(
@@ -925,6 +926,20 @@ fn leg_ik(
                     ) - max_reach * 0.999;
                     if shortfall > 0.0 {
                         lifts[index] = lifts[index].max(shortfall.min(0.12) as f32);
+                    }
+                    // The other side of the same bound: when the target sits
+                    // further below the hip than the leg can span, the reference
+                    // lowers the pelvis, capped at 25 cm.
+                    let dx = target[0] - hip_pos[0] as f64;
+                    let dz = target[2] - hip_pos[2] as f64;
+                    let horizontal = (dx * dx + dz * dz).sqrt();
+                    let vertical = hip_pos[1] as f64 - target[1];
+                    let limit = (max_reach * max_reach - horizontal * horizontal).max(0.0).sqrt();
+                    if horizontal < max_reach && vertical > 0.0 {
+                        let needed = (vertical - limit).clamp(0.0, 0.25);
+                        if needed > 0.0 {
+                            drops[index] = drops[index].max(needed as f32);
+                        }
                     }
                     continue;
                 }
@@ -994,6 +1009,21 @@ fn leg_ik(
         lifted = lifted.max(lifts[index]);
     }
     report.pelvis_lift = lifted;
+}
+
+/// The reference's reachable_pelvis_drop: how far the pelvis has to come down
+/// so a target below the hip is still within the leg's vertical span. Capped at
+/// 25 cm, and zero when the target is reachable or above the hip.
+fn pelvis_drop(hip: [f64; 3], target: [f64; 3], max_reach: f64) -> f64 {
+    let dx = target[0] - hip[0];
+    let dz = target[2] - hip[2];
+    let horizontal = (dx * dx + dz * dz).sqrt();
+    let vertical = hip[1] - target[1];
+    if horizontal >= max_reach || vertical <= 0.0 {
+        return 0.0;
+    }
+    let limit = (max_reach * max_reach - horizontal * horizontal).max(0.0).sqrt();
+    (vertical - limit).clamp(0.0, 0.25)
 }
 
 fn joint3(rest: &[f32], index: usize) -> [f64; 3] {
@@ -2148,6 +2178,21 @@ mod tests {
         assert!((noise - 0.5).abs() < 1e-6, "noise {noise}");
     }
 
+    /// Only a target below the hip, beyond the leg's vertical span, pulls it down.
+    #[test]
+    #[test]
+    fn pelvis_drop_is_bounded_and_directional() {
+        let hip = [0.0, 0.9, 0.0];
+        // Straight down, 1.2 m below a 0.9 m leg: 0.3 m needed, capped at 0.25.
+        let far = pelvis_drop(hip, [0.0, -0.3, 0.0], 0.9);
+        assert!((far - 0.25).abs() < 1e-6, "capped drop {far}");
+        // Inside the span: nothing to do.
+        let near = pelvis_drop(hip, [0.0, 0.5, 0.0], 0.9);
+        assert_eq!(near, 0.0, "reachable target moved the pelvis");
+        // Above the hip: the lift path handles it, not the drop.
+        let above = pelvis_drop(hip, [0.0, 1.4, 0.0], 0.9);
+        assert_eq!(above, 0.0, "target above the hip");
+    }
     /// The analytic two-bone solve must put the wrist on its target and must not
     /// disturb the rest of the body.
     #[test]
