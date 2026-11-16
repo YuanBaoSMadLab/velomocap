@@ -64,6 +64,10 @@ pub fn t(english: &'static str) -> &'static str {
         "Bone Overlay" => "骨骼叠加",
         "Bone overlay" => "骨骼叠加",
         "Characters" => "角色",
+        // PMX (MMD) avatars load and animate, but cloth and hair that MMD moves
+        // with rigid-body physics are not simulated yet, so the format is marked
+        // experimental rather than hidden.
+        "Experimental" => "实验性",
         "Drop to import" => "松开即导入",
         "as the motion clip" => "作为动捕视频",
         "as a character" => "作为角色模型",

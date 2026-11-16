@@ -516,7 +516,7 @@ impl Character {
             faces.len() % 3 == 0,
             "the PMX face list is not triangles"
         );
-        let faces: Vec<[u32; 3]> = faces
+        let mut faces: Vec<[u32; 3]> = faces
             .chunks_exact(3)
             .map(|face| [face[0], face[1], face[2]])
             .collect();
@@ -1059,14 +1059,6 @@ impl Character {
             }
         }
         let ground = self.ground_offset(&joint_of, rest_positions);
-        // Where each bone sits with the clip at its rest pose: its own bind
-        // orientation. The clip's rotation is a *deviation from its own rest*, so
-        // a character keeps its own rest pose as the baseline and every segment
-        // follows the clip's movement. Swinging the bind onto the clip's rest
-        // first (the old A-pose correction) turned out to be worse than useless:
-        // it adds an extra rotation on top of the clip's own, which is what bent
-        // MMD elbows and tore Unreal arms apart.
-        //
         // The bind matrix can carry scale (Unreal exports its skeleton in
         // centimetres), so only its unit rotation takes part in the pose.
         let units: Vec<[f32; 9]> = self
@@ -1074,7 +1066,25 @@ impl Character {
             .iter()
             .map(|bone| unit_rotation(&bone.bind_rot))
             .collect();
-        let aligned: Vec<[f32; 9]> = units.clone();
+        // Where each bone sits with the clip at its rest pose. A character bound
+        // in an A-pose has to bring its arms onto the clip's rest first, or every
+        // angle it plays comes out that much short — Manny's arms sat 52° below
+        // the clip's and crossed in front of the chest.
+        //
+        // The correction is a *local* rotation per bone, and it is walked down
+        // the hierarchy so a bone without one of its own still inherits the one
+        // its parent got: swinging the forearm but not the hand tore the wrist
+        // open the last time this was a flat per-bone rotation in world space.
+        let alignment = self.rest_alignment(&joint_of, &units, rest_positions);
+        let mut aligned = vec![identity(); self.bones.len()];
+        for &index in &self.order {
+            let bone = &self.bones[index];
+            let base = match bone.parent {
+                Some(parent) => multiply(&aligned[parent], &multiply(&transpose(&units[parent]), &units[index])),
+                None => units[index],
+            };
+            aligned[index] = multiply(&base, &alignment[index]);
+        }
         // Walk parents first: a bone's world rotation is its parent's times its
         // own rest-relative local rotation and the clip's deviation for that
         // joint, and its pivot follows its parent.
@@ -1308,6 +1318,108 @@ impl Character {
             pending = deferred;
         }
         sequence
+    }
+
+    /// The local rotation that takes each limb bone from its bind direction to
+    /// the clip's rest direction, so an A-posed character plays the clip's angles
+    /// rather than its own bind.
+    ///
+    /// The direction is the segment to the bone's longest direct child; the clip's
+    /// rest comes from the body model's neutral pose. Both directions are brought
+    /// into the bone's own frame before the rotation is measured, because that is
+    /// the frame the result is applied in, and only the limb segments where a
+    /// bind pose really differs are corrected — a clavicle's direction is a rig
+    /// convention (the clip's rises 18°, Mixamo's is level, Unreal's slopes down)
+    /// and correcting it only lifts the shoulder pad into a shrug.
+    fn rest_alignment(
+        &self,
+        joint_of: &[usize; 52],
+        units: &[[f32; 9]],
+        rest_positions: &[[f32; 3]],
+    ) -> Vec<[f32; 9]> {
+        let mut alignment = vec![identity(); self.bones.len()];
+        if std::env::var_os("VELOMOCAP_NO_ALIGN").is_some() {
+            return alignment;
+        }
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); self.bones.len()];
+        for (index, bone) in self.bones.iter().enumerate() {
+            if let Some(parent) = bone.parent {
+                children[parent].push(index);
+            }
+        }
+        for (slot, bone) in self.bones.iter().enumerate() {
+            let Some(canonical) = bone.canonical else {
+                continue;
+            };
+            if !matches!(canonical, 7 | 8 | 26 | 27 | 44 | 45 | 48 | 49) {
+                continue;
+            }
+            let mut child_slot = usize::MAX;
+            let mut length = 0.0f32;
+            for &candidate in &children[slot] {
+                if self.bones[candidate].canonical.is_none() {
+                    continue;
+                }
+                let offset = [
+                    self.bones[candidate].bind[0] - bone.bind[0],
+                    self.bones[candidate].bind[1] - bone.bind[1],
+                    self.bones[candidate].bind[2] - bone.bind[2],
+                ];
+                let reach =
+                    (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt();
+                if reach > length {
+                    length = reach;
+                    child_slot = candidate;
+                }
+            }
+            // Below a couple of centimetres the direction is not a segment.
+            if child_slot == usize::MAX || length < 0.02 {
+                continue;
+            }
+            let Some(child_canonical) = self.bones[child_slot].canonical else {
+                continue;
+            };
+            let (joint, child_joint) = (joint_of[canonical], joint_of[child_canonical]);
+            if joint == usize::MAX || child_joint == usize::MAX {
+                continue;
+            }
+            if joint >= rest_positions.len() || child_joint >= rest_positions.len() {
+                continue;
+            }
+            let Some(bind_dir) = unit([
+                self.bones[child_slot].bind[0] - bone.bind[0],
+                self.bones[child_slot].bind[1] - bone.bind[1],
+                self.bones[child_slot].bind[2] - bone.bind[2],
+            ]) else {
+                continue;
+            };
+            let Some(rest_dir) = unit([
+                rest_positions[child_joint][0] - rest_positions[joint][0],
+                rest_positions[child_joint][1] - rest_positions[joint][1],
+                rest_positions[child_joint][2] - rest_positions[joint][2],
+            ]) else {
+                continue;
+            };
+            let cosine = bind_dir[0] * rest_dir[0]
+                + bind_dir[1] * rest_dir[1]
+                + bind_dir[2] * rest_dir[2];
+            // Already the same direction: nothing to correct.
+            if cosine > 0.9995 {
+                continue;
+            }
+            // Past 75° this is a different rig convention, not a bind pose.
+            if cosine < 0.26 {
+                continue;
+            }
+            // Both directions in the bone's own frame, where the rotation lands.
+            let inverse = transpose(&units[slot]);
+            let from = turn(&inverse, bind_dir);
+            let to = turn(&inverse, rest_dir);
+            if let Some(rotation) = rotation_between(from, to) {
+                alignment[slot] = rotation;
+            }
+        }
+        alignment
     }
 
     /// Print the bones that own the lowest part of the bind mesh — the soles —
@@ -3402,12 +3514,12 @@ mod tests {
         assert!(posed[1].abs() < 1e-5, "{posed:?}");
     }
 
-    /// A character keeps its own rest pose and plays the clip's *angles*: the
-    /// clip's rotation is a deviation from the clip's own rest, so an A-posed arm
-    /// stays A-posed until the clip moves it. Swinging the bind onto the clip's
-    /// rest first added that angle twice, which is what bent real rigs apart.
+    /// A character bound in an A-pose must play the clip's angles: its own bind
+    /// arm is brought onto the clip's rest first, and the clip's rotation is
+    /// applied from there. The correction is local and inherited down the chain,
+    /// so a hand with no angle of its own still turns with the forearm.
     #[test]
-    fn an_a_pose_arm_keeps_its_bind_and_plays_the_clip_angle() {
+    fn an_a_pose_arm_is_brought_onto_the_clip_rest() {
         let down = std::f32::consts::FRAC_1_SQRT_2;
         let bones = vec![
             bound("LeftArm", 7, None, [0.0, 0.0, 0.0]),
@@ -3423,17 +3535,17 @@ mod tests {
         let mut names = vec![String::new(); 52];
         names[7] = "LeftArm".to_string();
         names[8] = "LeftForeArm".to_string();
-        // No clip movement: the arm stays where the model bound it.
+        // No clip movement: the A-posed arm sits where the clip's rest has it.
         let still = vec![neutral(); 52];
         let posed = character.pose(&still, &rest, &rest_positions, &names, [0.0; 3]);
-        assert!((posed[0] - down).abs() < 1e-5, "{posed:?}");
-        assert!((posed[1] + down).abs() < 1e-5, "{posed:?}");
-        // The clip turns a quarter turn about Z, so the A-posed arm turns too.
+        assert!((posed[0] - 1.0).abs() < 1e-5, "{posed:?}");
+        assert!(posed[1].abs() < 1e-5, "{posed:?}");
+        // The clip turns a quarter turn about Z, and the arm turns with it.
         let mut world = vec![neutral(); 52];
         world[7] = [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
         let posed = character.pose(&world, &rest, &rest_positions, &names, [0.0; 3]);
-        assert!((posed[0] - down).abs() < 1e-5, "{posed:?}");
-        assert!((posed[1] - down).abs() < 1e-5, "{posed:?}");
+        assert!(posed[0].abs() < 1e-5, "{posed:?}");
+        assert!((posed[1] - 1.0).abs() < 1e-5, "{posed:?}");
     }
 
     /// Legs longer than the clip's must not lift the character off the floor.

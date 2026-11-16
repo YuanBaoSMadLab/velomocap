@@ -565,6 +565,14 @@ fn characters_column(app: &mut VeloMocap, ui: &mut egui::Ui) {
                         );
                     }
                     for (index, name, format, matched, bones) in &cards {
+                        // PMX is experimental: the skeleton and 付与 work, but the
+                        // rigid-body physics that moves hair and cloth in MMD is
+                        // not simulated here yet.
+                        let tag = if format == "PMX" {
+                            format!("{} · ", i18n::t("Experimental"))
+                        } else {
+                            String::new()
+                        };
                         let selected = app.character_panel == Some(*index);
                         let worn_by = app
                             .people
@@ -579,9 +587,9 @@ fn characters_column(app: &mut VeloMocap, ui: &mut egui::Ui) {
                             .map(|person| person.name.clone());
                         let caption = match &worn_by {
                             Some(person) => {
-                                format!("{format} · {matched}/{bones} · {person}")
+                                format!("{}{format} · {matched}/{bones} · {person}", tag)
                             }
-                            None => format!("{format} · {matched}/{bones}"),
+                            None => format!("{}{format} · {matched}/{bones}", tag),
                         };
                         let row = egui::Frame::new()
                             .fill(if selected {
