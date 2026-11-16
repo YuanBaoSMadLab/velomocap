@@ -336,11 +336,12 @@ pub struct VeloMocap {
     pub console: Vec<String>,
     pub show_console: bool,
     pub show_help: bool,
-    pub show_models: bool,
     pub show_guide: bool,
     /// Settings that belong to the application rather than to one panel: how a
     /// project is written, and anything else that is not a per-clip choice.
     pub show_settings: bool,
+    /// The About window: project, repository and sponsor links.
+    pub show_about: bool,
     /// The export window: what to write, where, and under which name.
     pub show_export: bool,
     /// An imported character (VRM / glTF) that replaces the built-in body in the
@@ -387,11 +388,7 @@ pub struct VeloMocap {
     pub asset_names: Vec<String>,
     pub tools_ok: bool,
     pub ort_path: Option<PathBuf>,
-    pub cuda_ok: bool,
-    pub model_status: Vec<velomocap_models::GroupStatus>,
-    pub model_root: Option<PathBuf>,
-    pub model_core_ready: bool,
-    pub model_error: Option<String>,}
+    pub cuda_ok: bool,}
 impl VeloMocap {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         ui::configure(&cc.egui_ctx);
@@ -524,9 +521,9 @@ impl VeloMocap {
             console: Vec::new(),
             show_console: false,
             show_help: false,
-            show_models: false,
             show_guide: false,
             show_settings: false,
+            show_about: false,
             show_export: false,
             character_rest: None,
             character_rest_positions: None,
@@ -546,10 +543,6 @@ impl VeloMocap {
         asset_folder: String::new(),
         asset_status: String::new(),
         asset_names: Vec::new(),
-            model_status: Vec::new(),
-            model_root: None,
-            model_core_ready: false,
-            model_error: None,
         };
         if let Some(out) = render_probe.clone() {
             let model = app.smplh_model.display().to_string();
@@ -612,7 +605,6 @@ impl VeloMocap {
             }
             std::process::exit(0);
         }
-        crate::models_ui::refresh(&mut app, false);
         app.log("VeloMocap native core ready.");
         match device_memory {
             Some(total) => app.log(format!(
@@ -1757,6 +1749,13 @@ impl VeloMocap {
             30.0
         }
     }
+
+    /// The one model a run cannot do without: the SMPL-H body. The download is
+    /// not part of the portable package, so a fresh install may well be missing
+    /// it, and the status bar says so with the link to get it.
+    pub fn key_model_missing(&self) -> bool {
+        !self.smplh_model.is_file()
+    }
         pub fn trail(&self, person: usize) -> Vec<[f32; 3]> {
         let Some(person) = self.people.get(person) else {
             return Vec::new();
@@ -2038,9 +2037,6 @@ impl VeloMocap {
         self.selected_lock = None;
     }
 
-    pub fn refresh_models(&mut self, verify_hash: bool) {
-        crate::models_ui::refresh(self, verify_hash);
-    }
         pub fn poll_capture(&mut self, ctx: &egui::Context) {
         let Some(job) = &self.capture else { return };
         let running = job.is_running();
@@ -2763,7 +2759,6 @@ impl eframe::App for VeloMocap {
         self.shortcuts(ctx);
         self.tick(ctx);
         ui::draw(self, ctx);
-        crate::models_ui::window(self, ctx);
     }}
 #[cfg(test)]
 mod tests {

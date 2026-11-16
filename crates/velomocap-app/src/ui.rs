@@ -10,21 +10,31 @@ use crate::app::{LockDrag, LockGrab, VeloMocap};
 use crate::i18n;
 use crate::viewport::{self, Scene, ViewMode};
 
-// Palette: a dark slate workspace with one cool accent. The panel order is the
-// Qt build's — same information in the same places — but the skin is its own:
-// deeper gutters, raised headers, rounded corners, and a brighter accent than
-// the flat steel grey the reference shipped.
-const WINDOW_BG: egui::Color32 = egui::Color32::from_rgb(0x13, 0x15, 0x19);
-const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(0x1c, 0x1f, 0x25);
-const HEADER_BG: egui::Color32 = egui::Color32::from_rgb(0x24, 0x28, 0x30);
-const BORDER: egui::Color32 = egui::Color32::from_rgb(0x0c, 0x0e, 0x11);
-const MENU_BG: egui::Color32 = egui::Color32::from_rgb(0x17, 0x1a, 0x1f);
-const TEXT: egui::Color32 = egui::Color32::from_rgb(0xe2, 0xe6, 0xed);
-const MUTED: egui::Color32 = egui::Color32::from_rgb(0x8a, 0x93, 0xa2);
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x3d, 0x7d, 0xff);
-const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(0x2a, 0x59, 0xc4);
-const ERR: egui::Color32 = egui::Color32::from_rgb(0xff, 0x7a, 0x76);
-const OK: egui::Color32 = egui::Color32::from_rgb(0x5f, 0xd0, 0x9c);
+// Palette: light, quiet, and close to the other tools on this desktop — white
+// panels on a soft grey canvas, hairline borders, one blue accent, no
+// gradients. The panel order is still the Qt build's, so nothing that works is
+// rearranged; only the skin is its own.
+const WINDOW_BG: egui::Color32 = egui::Color32::from_rgb(0xf0, 0xf2, 0xf5);
+const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(0xff, 0xff, 0xff);
+const HEADER_BG: egui::Color32 = egui::Color32::from_rgb(0xf7, 0xf8, 0xfa);
+const BORDER: egui::Color32 = egui::Color32::from_rgb(0xe3, 0xe6, 0xeb);
+const MENU_BG: egui::Color32 = egui::Color32::from_rgb(0xff, 0xff, 0xff);
+const TEXT: egui::Color32 = egui::Color32::from_rgb(0x1f, 0x23, 0x28);
+const MUTED: egui::Color32 = egui::Color32::from_rgb(0x6b, 0x72, 0x80);
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2f, 0x6b, 0xe6);
+const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(0x1d, 0x4e, 0xd8);
+const ERR: egui::Color32 = egui::Color32::from_rgb(0xd9, 0x2d, 0x20);
+const OK: egui::Color32 = egui::Color32::from_rgb(0x0f, 0x9d, 0x58);
+/// Cards and list rows: a shade under white, so a white panel does not read as
+/// one flat sheet.
+const CARD_BG: egui::Color32 = egui::Color32::from_rgb(0xf8, 0xf9, 0xfb);
+/// The row that is selected.
+const SELECT_BG: egui::Color32 = egui::Color32::from_rgb(0xe8, 0xf0, 0xfe);
+
+/// Where a missing model comes from, and where the project lives.
+const MODEL_DOWNLOAD_URL: &str = "https://github.com/YuanBaoSMadLab/velomocap/releases";
+const REPOSITORY_URL: &str = "https://github.com/YuanBaoSMadLab/velomocap";
+const SPONSOR_URL: &str = "https://afdian.com/a/YuanBaoSMadLab";
 
 const HEADER_HEIGHT: f32 = 26.0;
 const FOOTER_HEIGHT: f32 = 24.0;
@@ -35,40 +45,45 @@ const CLIP_PANEL_WIDTH: f32 = 460.0;
 
 pub fn configure(ctx: &egui::Context) {
     install_cjk_font(ctx);
-    let mut visuals = egui::Visuals::dark();
+    let mut visuals = egui::Visuals::light();
     visuals.panel_fill = PANEL_BG;
     visuals.window_fill = PANEL_BG;
-    visuals.extreme_bg_color = egui::Color32::from_rgb(0x11, 0x13, 0x17);
-    visuals.faint_bg_color = egui::Color32::from_rgb(0x26, 0x2b, 0x33);
+    visuals.extreme_bg_color = egui::Color32::WHITE;
+    visuals.faint_bg_color = egui::Color32::from_rgb(0xf4, 0xf6, 0xf9);
     visuals.override_text_color = Some(TEXT);
-    visuals.selection.bg_fill = ACCENT;
-    visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
+    visuals.selection.bg_fill = SELECT_BG;
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, ACCENT);
     visuals.window_stroke = egui::Stroke::new(1.0_f32, BORDER);
     visuals.widgets.noninteractive.bg_fill = PANEL_BG;
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
-    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(0x2a, 0x2f, 0x38);
-    visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(0x26, 0x2b, 0x33);
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x34, 0x3a, 0x45));
-    visuals.widgets.inactive.corner_radius = 4.into();
-    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x36, 0x3d, 0x49);
-    visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(0x2f, 0x35, 0x3f);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x4a, 0x53, 0x62));
-    visuals.widgets.hovered.corner_radius = 4.into();
-    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0x25, 0x2b, 0x35);
-    visuals.widgets.active.weak_bg_fill = ACCENT_DIM;
+    visuals.widgets.inactive.bg_fill = egui::Color32::WHITE;
+    visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(0xf3, 0xf5, 0xf8);
+    visuals.widgets.inactive.bg_stroke =
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0xd6, 0xdb, 0xe3));
+    visuals.widgets.inactive.corner_radius = 6.into();
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0xf1, 0xf4, 0xf9);
+    visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(0xec, 0xf0, 0xf6);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT_DIM);
+    visuals.widgets.hovered.corner_radius = 6.into();
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0xe4, 0xec, 0xfb);
+    visuals.widgets.active.weak_bg_fill = SELECT_BG;
     visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT);
-    visuals.widgets.active.corner_radius = 4.into();
-    visuals.widgets.open.bg_fill = egui::Color32::from_rgb(0x2a, 0x2f, 0x38);
-    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x34, 0x3a, 0x45));
-    visuals.window_corner_radius = 6.into();
-    visuals.menu_corner_radius = 6.into();
+    visuals.widgets.active.corner_radius = 6.into();
+    visuals.widgets.open.bg_fill = egui::Color32::from_rgb(0xf3, 0xf5, 0xf8);
+    visuals.window_corner_radius = 10.into();
+    visuals.menu_corner_radius = 8.into();
     visuals.popup_shadow = egui::epaint::Shadow {
-        offset: [0, 6],
-        blur: 18,
+        offset: [0, 4],
+        blur: 12,
         spread: 0,
-        color: egui::Color32::from_black_alpha(160),
+        color: egui::Color32::from_black_alpha(28),
     };
-    visuals.window_shadow = visuals.popup_shadow;
+    visuals.window_shadow = egui::epaint::Shadow {
+        offset: [0, 8],
+        blur: 24,
+        spread: 0,
+        color: egui::Color32::from_black_alpha(36),
+    };
     ctx.set_visuals(visuals);
 
     let mut style = (*ctx.style()).clone();
@@ -133,6 +148,7 @@ pub fn draw(app: &mut VeloMocap, ctx: &egui::Context) {
     about_window(app, ctx);
     guide_window(app, ctx);
     settings_window(app, ctx);
+    about_app_window(app, ctx);
     export_window(app, ctx);
     person_window(app, ctx);
     clear_scene_prompt(app, ctx);
@@ -375,6 +391,14 @@ fn menu_bar(app: &mut VeloMocap, ctx: &egui::Context) {
                         ui.close();
                         app.show_console = true;
                     }
+                    ui.separator();
+                    if ui
+                        .button(i18n::zh_en("关于 VeloMocap", "About VeloMocap"))
+                        .clicked()
+                    {
+                        ui.close();
+                        app.show_about = true;
+                    }
                 });
             });
         });
@@ -566,7 +590,7 @@ fn characters_column(app: &mut VeloMocap, ui: &mut egui::Ui) {
     // button under the status bar.
     let list_height = (ui.available_height() - 36.0).max(80.0);
     egui::Frame::new()
-        .fill(egui::Color32::from_rgb(0x24, 0x24, 0x24))
+        .fill(CARD_BG)
         .stroke(egui::Stroke::new(1.0_f32, BORDER))
         .inner_margin(egui::Margin::same(3))
         .show(ui, |ui| {
@@ -634,7 +658,7 @@ fn characters_column(app: &mut VeloMocap, ui: &mut egui::Ui) {
                             };
                             let row = egui::Frame::new()
                                 .fill(if selected {
-                                    egui::Color32::from_rgb(0x2b, 0x36, 0x44)
+                                    SELECT_BG
                                 } else {
                                     egui::Color32::TRANSPARENT
                                 })
@@ -726,7 +750,7 @@ fn stream_column(app: &mut VeloMocap, ui: &mut egui::Ui) {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| i18n::t("No clip loaded").to_string());
     egui::Frame::new()
-        .fill(egui::Color32::from_rgb(0x24, 0x24, 0x24))
+        .fill(CARD_BG)
         .stroke(egui::Stroke::new(1.0_f32, BORDER))
         .inner_margin(egui::Margin::symmetric(6, 5))
         .show(ui, |ui| {
@@ -783,7 +807,7 @@ fn people_list(app: &mut VeloMocap, ui: &mut egui::Ui) {
     // half-hidden behind the status bar.
     let list_height = (ui.available_height() - 34.0).max(60.0);
     egui::Frame::new()
-        .fill(egui::Color32::from_rgb(0x24, 0x24, 0x24))
+        .fill(CARD_BG)
         .stroke(egui::Stroke::new(1.0_f32, BORDER))
         .inner_margin(egui::Margin::same(3))
         .show(ui, |ui| {
@@ -939,7 +963,7 @@ fn people_list(app: &mut VeloMocap, ui: &mut egui::Ui) {
 
 fn video_view(app: &mut VeloMocap, ui: &mut egui::Ui, rect: egui::Rect) {
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(0x24, 0x24, 0x24));
+    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(0xf1, 0xf3, 0xf6));
 
     let Some(texture) = &app.preview else {
         painter.text(
@@ -947,7 +971,7 @@ fn video_view(app: &mut VeloMocap, ui: &mut egui::Ui, rect: egui::Rect) {
             egui::Align2::CENTER_CENTER,
             i18n::t("Open a video to begin"),
             egui::FontId::proportional(13.0),
-            egui::Color32::from_gray(190),
+            egui::Color32::from_gray(90),
         );
         painter.text(
             rect.center() + egui::vec2(0.0, 12.0),
@@ -1636,7 +1660,7 @@ fn tracks(app: &mut VeloMocap, ui: &mut egui::Ui) {
                 }
             }
             let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(0x24, 0x24, 0x24));
+            painter.rect_filled(rect, 2.0, CARD_BG);
             match colour {
                 Some(colour) => {
                     if present.is_empty() {
@@ -1883,7 +1907,7 @@ fn lock_rows(app: &mut VeloMocap, ui: &mut egui::Ui, frames: usize) {
 
             // Draw the track.
             let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(0x1c, 0x1c, 0x1c));
+            painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(0xe9, 0xed, 0xf2));
             // The detector's own runs, dimmed: an automatic track then shows
             // *what* it follows instead of only the word "automatic", and a
             // hand-drawn track shows what the drawing is replacing. Without
@@ -1968,7 +1992,7 @@ fn lock_rows(app: &mut VeloMocap, ui: &mut egui::Ui, frames: usize) {
                     * (app.playhead.min(frames - 1) as f32 / (frames.max(2) - 1) as f32);
             painter.line_segment(
                 [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0xe8, 0xe8, 0xe8)),
+                egui::Stroke::new(1.0_f32, ACCENT),
             );
 
             // The reference's context menu, item for item.
@@ -2071,14 +2095,7 @@ fn sidebar(app: &mut VeloMocap, ctx: &egui::Context) {
         .frame(egui::Frame::new().fill(WINDOW_BG).inner_margin(egui::Margin::same(6)))
         .show(ctx, |ui| {
             panel(ui, |ui| {
-                header(ui, i18n::t("AI Model"), |ui| {
-                    if ui
-                        .add(egui::Button::new(i18n::t("? Model Guide")).min_size(egui::vec2(96.0, 18.0)))
-                        .clicked()
-                    {
-                        app.show_guide = true;
-                    }
-                });
+                header(ui, i18n::t("AI Model"), |ui| {});
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -2096,7 +2113,7 @@ fn sidebar(app: &mut VeloMocap, ctx: &egui::Context) {
 fn group<R>(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let mut frame = egui::Frame::new()
         .fill(PANEL_BG)
-        .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x20, 0x20, 0x20)))
+        .stroke(egui::Stroke::new(1.0_f32, BORDER))
         .inner_margin(egui::Margin::symmetric(7, 6));
     frame.outer_margin = egui::Margin::symmetric(0, 5);
     frame.show(ui, |ui| {
@@ -2105,7 +2122,7 @@ fn group<R>(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui) -> 
             egui::RichText::new(title)
                 .size(11.5)
                 .strong()
-                .color(egui::Color32::from_rgb(0xc5, 0xc5, 0xc5)),
+                .color(TEXT),
         );
         ui.add_space(3.0);
         body(ui)
@@ -2602,7 +2619,7 @@ fn resources_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
             let (label, colour) = if app.cuda_ok {
                 (i18n::t("provider found"), OK)
             } else {
-                (i18n::t("CPU only"), egui::Color32::from_rgb(0xe8, 0xa8, 0x60))
+                (i18n::t("CPU only"), egui::Color32::from_rgb(0xb4, 0x53, 0x09))
             };
             ui.label(egui::RichText::new(label).size(10.0).color(colour));
         });
@@ -2680,20 +2697,6 @@ fn resources_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
             };
             ui.label(egui::RichText::new(mark).size(10.5).color(colour));
         });
-        if ui
-            .add(egui::Button::new(i18n::t("Model Manager")).min_size(egui::vec2(ui.available_width(), 20.0)))
-            .clicked()
-        {
-            app.show_models = true;
-            app.refresh_models(false);
-        }
-        if !app.model_core_ready {
-            ui.label(
-                egui::RichText::new(i18n::t("Some required model files are missing."))
-                    .size(10.0)
-                    .color(egui::Color32::from_rgb(0xe8, 0xa8, 0x60)),
-            );
-        }
     });
 }
 
@@ -2735,6 +2738,36 @@ fn status_bar(app: &mut VeloMocap, ctx: &egui::Context) {
                         .clicked()
                     {
                         app.show_console = !app.show_console;
+                    }
+                    // The portable package ships without the body model, so a
+                    // fresh install cannot reconstruct anything. Say it here, once,
+                    // with the way to fix it — rather than failing inside a run.
+                    if app.key_model_missing() {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(i18n::zh_en("获取模型", "Get the model"))
+                                        .size(10.5)
+                                        .color(ACCENT),
+                                )
+                                .min_size(egui::vec2(78.0, 18.0)),
+                            )
+                            .on_hover_text(i18n::zh_en(
+                                "打开模型下载页（GitHub Releases）",
+                                "Open the model download page (GitHub Releases)",
+                            ))
+                            .clicked()
+                        {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(MODEL_DOWNLOAD_URL));
+                        }
+                        ui.label(
+                            egui::RichText::new(i18n::zh_en(
+                                "关键模型（SMPL-H）未下载",
+                                "Key model (SMPL-H) not downloaded",
+                            ))
+                            .size(10.5)
+                            .color(ERR),
+                        );
                     }
                     let mut chips: Vec<String> = Vec::new();
                     chips.push(match &app.project_path {
@@ -2800,6 +2833,103 @@ fn console_window(app: &mut VeloMocap, ctx: &egui::Context) {
                 });
         });
     app.show_console = open;
+}
+
+/// The About window: who makes it, where the source is, how to support it.
+fn about_app_window(app: &mut VeloMocap, ctx: &egui::Context) {
+    if !app.show_about {
+        return;
+    }
+    let mut open = app.show_about;
+    egui::Window::new(i18n::zh_en("关于 VeloMocap", "About VeloMocap"))
+        .open(&mut open)
+        .default_width(460.0)
+        .min_width(380.0)
+        .resizable(true)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new("VeloMocap").size(18.0).strong().color(TEXT));
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} {} · {}",
+                    i18n::t("Version"),
+                    env!("CARGO_PKG_VERSION"),
+                    i18n::zh_en("原生 Rust + C++，无 Python 运行时", "native Rust + C++, no Python at runtime"),
+                ))
+                .size(10.5)
+                .color(MUTED),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(i18n::zh_en(
+                    "由 github/YuanBaoSMadLab 开源。",
+                    "Open source by github/YuanBaoSMadLab.",
+                ))
+                .size(11.5)
+                .color(TEXT),
+            );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(i18n::zh_en("仓库", "Repository")).size(10.5).color(MUTED));
+                ui.hyperlink_to(
+                    egui::RichText::new(REPOSITORY_URL).size(10.5),
+                    REPOSITORY_URL,
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(i18n::zh_en("赞助", "Sponsor")).size(10.5).color(MUTED));
+                ui.hyperlink_to(egui::RichText::new(SPONSOR_URL).size(10.5), SPONSOR_URL);
+            });
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(i18n::zh_en(
+                    "如果你喜欢这个软件，就去点个小星星 ⭐ ——这对项目真的有用。",
+                    "If you like it, leave a star ⭐ — it genuinely helps the project.",
+                ))
+                .size(11.0)
+                .color(TEXT),
+            );
+            ui.add_space(8.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui
+                    .button(i18n::zh_en("打开仓库", "Open repository"))
+                    .clicked()
+                {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(REPOSITORY_URL));
+                }
+                if ui
+                    .button(i18n::zh_en("去点星", "Star it"))
+                    .clicked()
+                {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(REPOSITORY_URL));
+                }
+                if ui
+                    .button(i18n::zh_en("赞助", "Sponsor"))
+                    .clicked()
+                {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(SPONSOR_URL));
+                }
+                if ui.button(i18n::t("Close")).clicked() {
+                    app.show_about = false;
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "core {} · kernels {} · {}",
+                    velomocap_core::VERSION,
+                    velomocap_core::backend(),
+                    app.ort_path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "ONNX Runtime missing".into())
+                ))
+                .size(9.5)
+                .color(MUTED),
+            );
+        });
+    app.show_about = open && app.show_about;
 }
 
 fn about_window(app: &mut VeloMocap, ctx: &egui::Context) {
@@ -2902,8 +3032,10 @@ fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
     let mut open = app.show_export;
     egui::Window::new(i18n::t("Export character assets"))
         .open(&mut open)
-        .default_width(640.0)
-        .min_width(540.0)
+        .default_width(800.0)
+        .default_height(560.0)
+        .min_width(640.0)
+        .min_height(420.0)
         .resizable(true)
         .show(ctx, |ui| {
             section_label(ui, i18n::zh_en("格式", "FORMAT"));
