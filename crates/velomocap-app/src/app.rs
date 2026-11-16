@@ -361,6 +361,8 @@ pub struct VeloMocap {
     pub characters: Vec<LibraryCharacter>,
     /// The shared library has been read from disk once.
     pub library_loaded: bool,
+    /// The models shipped beside the executable have been added.
+    pub builtins_loaded: bool,
     /// The library entry whose detail panel is open.
     pub character_panel: Option<usize>,
     /// Which page the movie-clip column shows: 0 people, 1 characters, 2 stream.
@@ -527,6 +529,7 @@ impl VeloMocap {
             person_panel: None,
             characters: Vec::new(),
         library_loaded: false,
+        builtins_loaded: false,
             character_panel: None,
             left_tab: 0,
             drop_hint: None,
@@ -785,18 +788,19 @@ impl VeloMocap {
         };
     }
 
-    pub fn assign_character(&mut self, person: usize, path: PathBuf) {
-        if let Some(index) = self.add_character(path) {
-            self.use_character(person, index);
-        }
-    }
-
+    /// Put a person back on the built-in body.
     pub fn clear_character(&mut self, person: usize) {
         if let Some(view) = self.people.get_mut(person) {
             view.character = None;
         }
         self.save_characters();
         self.orbit.framed = false;
+    }
+
+    pub fn assign_character(&mut self, person: usize, path: PathBuf) {
+        if let Some(index) = self.add_character(path) {
+            self.use_character(person, index);
+        }
     }
 
     fn characters_path(&self) -> Option<PathBuf> {
@@ -840,6 +844,37 @@ impl VeloMocap {
         if let Err(error) = written {
             self.log(format!("characters: {error}"));
         }
+    }
+
+    /// Models shipped beside the executable, so the two Unreal avatars are on
+    /// the shelf without anyone having to find the files.
+    pub fn load_builtin_characters(&mut self) {
+        if self.builtins_loaded {
+            return;
+        }
+        self.builtins_loaded = true;
+        let Some(folder) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|parent| parent.join("models").join("characters")))
+        else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            return;
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect();
+        paths.sort();
+        for path in paths {
+            let known = self.characters.iter().any(|entry| entry.path == path);
+            if !known {
+                self.add_character(path);
+            }
+        }
+        self.character_panel = None;
     }
 
     /// Read the library once, so every project starts with the same shelf.
@@ -2808,6 +2843,7 @@ struct CliArgs {
 impl eframe::App for VeloMocap {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.load_library();
+        self.load_builtin_characters();
         self.poll(ctx);
         self.poll_detection(ctx);
         self.poll_capture(ctx);

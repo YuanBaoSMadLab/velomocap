@@ -2175,6 +2175,23 @@ fn character_group(app: &mut VeloMocap, ui: &mut egui::Ui) {    let Some(index) 
 fn people_group(app: &mut VeloMocap, ui: &mut egui::Ui) {    if app.people.is_empty() {
         return;
     }
+    // What the dropdown can put on a person: the built-in body, or any model in
+    // the shared library.
+    let library: Vec<(usize, String)> = app
+        .characters
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            (
+                index,
+                entry
+                    .path
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| entry.path.display().to_string()),
+            )
+        })
+        .collect();
     group(ui, i18n::t("People"), |ui| {
         for index in 0..app.people.len() {
             let name = app.people[index].name.clone();
@@ -2204,6 +2221,41 @@ fn people_group(app: &mut VeloMocap, ui: &mut egui::Ui) {    if app.people.is_em
                 app.selected = index;
                 app.person_panel = Some(index);
                 app.orbit.framed = false;
+            }
+            // The model this person wears, changeable right here.
+            let chosen = assigned.clone().unwrap_or_else(|| i18n::t("Built-in").to_string());
+            let mut pick: Option<Option<usize>> = None;
+            ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                egui::ComboBox::from_id_salt(("person-model", index))
+                    .selected_text(egui::RichText::new(chosen).size(10.5))
+                    .width(ui.available_width() - 4.0)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(assigned.is_none(), i18n::t("Built-in"))
+                            .clicked()
+                        {
+                            pick = Some(None);
+                        }
+                        for (slot, label) in &library {
+                            let here = app.people[index]
+                                .character
+                                .as_ref()
+                                .map(|assigned| assigned.path == app.characters[*slot].path)
+                                .unwrap_or(false);
+                            if ui.selectable_label(here, label).clicked() {
+                                pick = Some(Some(*slot));
+                            }
+                        }
+                    });
+            });
+            match pick {
+                Some(Some(slot)) => {
+                    app.selected = index;
+                    app.use_character(index, slot);
+                }
+                Some(None) => app.clear_character(index),
+                None => {}
             }
         }
     });
