@@ -11,25 +11,26 @@ use crate::i18n;
 use crate::viewport::{self, Scene, ViewMode};
 
 // Palette: light, quiet, and close to the other tools on this desktop — white
-// panels on a soft grey canvas, hairline borders, one blue accent, no
-// gradients. The panel order is still the Qt build's, so nothing that works is
-// rearranged; only the skin is its own.
-const WINDOW_BG: egui::Color32 = egui::Color32::from_rgb(0xf0, 0xf2, 0xf5);
-const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(0xff, 0xff, 0xff);
-const HEADER_BG: egui::Color32 = egui::Color32::from_rgb(0xf7, 0xf8, 0xfa);
-const BORDER: egui::Color32 = egui::Color32::from_rgb(0xe3, 0xe6, 0xeb);
-const MENU_BG: egui::Color32 = egui::Color32::from_rgb(0xff, 0xff, 0xff);
-const TEXT: egui::Color32 = egui::Color32::from_rgb(0x1f, 0x23, 0x28);
-const MUTED: egui::Color32 = egui::Color32::from_rgb(0x6b, 0x72, 0x80);
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2f, 0x6b, 0xe6);
-const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(0x1d, 0x4e, 0xd8);
-const ERR: egui::Color32 = egui::Color32::from_rgb(0xd9, 0x2d, 0x20);
-const OK: egui::Color32 = egui::Color32::from_rgb(0x0f, 0x9d, 0x58);
-/// Cards and list rows: a shade under white, so a white panel does not read as
-/// one flat sheet.
-const CARD_BG: egui::Color32 = egui::Color32::from_rgb(0xf8, 0xf9, 0xfb);
-/// The row that is selected.
-const SELECT_BG: egui::Color32 = egui::Color32::from_rgb(0xe8, 0xf0, 0xfe);
+// Palette: the neutral dark grey the other tools on this desktop use — a near
+// black canvas, panels a shade above it, one hairline between them, quiet grey
+// text and one blue accent. The panel order is still the Qt build's, so nothing
+// that works is rearranged; only the skin is its own.
+const WINDOW_BG: egui::Color32 = egui::Color32::from_rgb(0x17, 0x17, 0x18);
+const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(0x1e, 0x1e, 0x20);
+const HEADER_BG: egui::Color32 = egui::Color32::from_rgb(0x24, 0x24, 0x26);
+const BORDER: egui::Color32 = egui::Color32::from_rgb(0x31, 0x31, 0x34);
+const MENU_BG: egui::Color32 = egui::Color32::from_rgb(0x1b, 0x1b, 0x1d);
+const TEXT: egui::Color32 = egui::Color32::from_rgb(0xe4, 0xe4, 0xe6);
+const MUTED: egui::Color32 = egui::Color32::from_rgb(0x9a, 0x9a, 0x9f);
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x4c, 0x8d, 0xff);
+const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(0x2f, 0x62, 0xc4);
+const ERR: egui::Color32 = egui::Color32::from_rgb(0xf2, 0x6d, 0x6a);
+const OK: egui::Color32 = egui::Color32::from_rgb(0x5f, 0xc9, 0x92);
+/// Cards and list rows: a shade above the panel, the way the other tools lay a
+/// card on a page.
+const CARD_BG: egui::Color32 = egui::Color32::from_rgb(0x26, 0x26, 0x28);
+/// The row that is selected: the neutral highlight, not the accent.
+const SELECT_BG: egui::Color32 = egui::Color32::from_rgb(0x35, 0x35, 0x38);
 
 /// Where a missing model comes from, and where the project lives.
 const MODEL_DOWNLOAD_URL: &str = "https://github.com/YuanBaoSMadLab/velomocap/releases";
@@ -45,44 +46,44 @@ const CLIP_PANEL_WIDTH: f32 = 460.0;
 
 pub fn configure(ctx: &egui::Context) {
     install_cjk_font(ctx);
-    let mut visuals = egui::Visuals::light();
+    let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = PANEL_BG;
     visuals.window_fill = PANEL_BG;
-    visuals.extreme_bg_color = egui::Color32::WHITE;
-    visuals.faint_bg_color = egui::Color32::from_rgb(0xf4, 0xf6, 0xf9);
+    visuals.extreme_bg_color = egui::Color32::from_rgb(0x13, 0x13, 0x15);
+    visuals.faint_bg_color = egui::Color32::from_rgb(0x28, 0x28, 0x2b);
     visuals.override_text_color = Some(TEXT);
     visuals.selection.bg_fill = SELECT_BG;
     visuals.selection.stroke = egui::Stroke::new(1.0_f32, ACCENT);
     visuals.window_stroke = egui::Stroke::new(1.0_f32, BORDER);
     visuals.widgets.noninteractive.bg_fill = PANEL_BG;
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
-    visuals.widgets.inactive.bg_fill = egui::Color32::WHITE;
-    visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(0xf3, 0xf5, 0xf8);
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(0x2a, 0x2a, 0x2d);
+    visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(0x26, 0x26, 0x29);
     visuals.widgets.inactive.bg_stroke =
-        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0xd6, 0xdb, 0xe3));
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x36, 0x36, 0x3a));
     visuals.widgets.inactive.corner_radius = 6.into();
-    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0xf1, 0xf4, 0xf9);
-    visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(0xec, 0xf0, 0xf6);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT_DIM);
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x34, 0x34, 0x38);
+    visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(0x30, 0x30, 0x34);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x48, 0x48, 0x4d));
     visuals.widgets.hovered.corner_radius = 6.into();
-    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0xe4, 0xec, 0xfb);
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0x3a, 0x3a, 0x3f);
     visuals.widgets.active.weak_bg_fill = SELECT_BG;
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT);
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT_DIM);
     visuals.widgets.active.corner_radius = 6.into();
-    visuals.widgets.open.bg_fill = egui::Color32::from_rgb(0xf3, 0xf5, 0xf8);
+    visuals.widgets.open.bg_fill = egui::Color32::from_rgb(0x2a, 0x2a, 0x2d);
     visuals.window_corner_radius = 10.into();
     visuals.menu_corner_radius = 8.into();
     visuals.popup_shadow = egui::epaint::Shadow {
-        offset: [0, 4],
-        blur: 12,
+        offset: [0, 6],
+        blur: 16,
         spread: 0,
-        color: egui::Color32::from_black_alpha(28),
+        color: egui::Color32::from_black_alpha(140),
     };
     visuals.window_shadow = egui::epaint::Shadow {
-        offset: [0, 8],
-        blur: 24,
+        offset: [0, 10],
+        blur: 28,
         spread: 0,
-        color: egui::Color32::from_black_alpha(36),
+        color: egui::Color32::from_black_alpha(170),
     };
     ctx.set_visuals(visuals);
 
@@ -477,13 +478,13 @@ fn movie_clip(app: &mut VeloMocap, ctx: &egui::Context) {
                     });
                     let body = ui.available_rect_before_wrap();
                     if body.height() > 40.0 {
-                        let split = body.left() + 162.0;
+                        let split = body.left() + 168.0;
                         let people = egui::Rect::from_min_max(
                             body.min,
                             egui::pos2(split, body.bottom()),
                         );
                         let video = egui::Rect::from_min_max(
-                            egui::pos2(split + 4.0, body.min.y),
+                            egui::pos2(split + 14.0, body.min.y),
                             body.max,
                         );
                         people_column(app, ui, people);
@@ -963,7 +964,7 @@ fn people_list(app: &mut VeloMocap, ui: &mut egui::Ui) {
 
 fn video_view(app: &mut VeloMocap, ui: &mut egui::Ui, rect: egui::Rect) {
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(0xf1, 0xf3, 0xf6));
+    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(0x11, 0x11, 0x13));
 
     let Some(texture) = &app.preview else {
         painter.text(
@@ -971,7 +972,7 @@ fn video_view(app: &mut VeloMocap, ui: &mut egui::Ui, rect: egui::Rect) {
             egui::Align2::CENTER_CENTER,
             i18n::t("Open a video to begin"),
             egui::FontId::proportional(13.0),
-            egui::Color32::from_gray(90),
+            egui::Color32::from_gray(205),
         );
         painter.text(
             rect.center() + egui::vec2(0.0, 12.0),
@@ -1907,7 +1908,7 @@ fn lock_rows(app: &mut VeloMocap, ui: &mut egui::Ui, frames: usize) {
 
             // Draw the track.
             let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(0xe9, 0xed, 0xf2));
+            painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(0x2a, 0x2a, 0x2d));
             // The detector's own runs, dimmed: an automatic track then shows
             // *what* it follows instead of only the word "automatic", and a
             // hand-drawn track shows what the drawing is replacing. Without
@@ -2619,7 +2620,7 @@ fn resources_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
             let (label, colour) = if app.cuda_ok {
                 (i18n::t("provider found"), OK)
             } else {
-                (i18n::t("CPU only"), egui::Color32::from_rgb(0xb4, 0x53, 0x09))
+                (i18n::t("CPU only"), egui::Color32::from_rgb(0xe8, 0xa8, 0x60))
             };
             ui.label(egui::RichText::new(label).size(10.0).color(colour));
         });

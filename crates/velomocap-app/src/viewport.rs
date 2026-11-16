@@ -124,15 +124,15 @@ pub const PERSON_COLOURS: [egui::Color32; 6] = [
 ];
 
 /// Sky-to-floor gradient of the Qt viewport.
-const SKY_TOP: [u8; 3] = [246, 248, 251];
-const SKY_BOTTOM: [u8; 3] = [228, 232, 238];
-const GRID_MINOR: [u8; 3] = [206, 211, 218];
-const GRID_MAJOR: [u8; 3] = [176, 183, 192];
-const AXIS_X: [u8; 3] = [198, 88, 88];
-const AXIS_Z: [u8; 3] = [88, 120, 200];
-const BONE: [u8; 3] = [38, 48, 64];
-const TRAIL: [u8; 3] = [45, 110, 220];
-const HINT: egui::Color32 = egui::Color32::from_rgb(110, 117, 128);
+const SKY_TOP: [u8; 3] = [38, 40, 44];
+const SKY_BOTTOM: [u8; 3] = [24, 25, 28];
+const GRID_MINOR: [u8; 3] = [52, 54, 58];
+const GRID_MAJOR: [u8; 3] = [68, 71, 76];
+const AXIS_X: [u8; 3] = [150, 74, 74];
+const AXIS_Z: [u8; 3] = [74, 96, 150];
+const BONE: [u8; 3] = [235, 240, 246];
+const TRAIL: [u8; 3] = [120, 170, 235];
+const HINT: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
 
 /// Cached texture and canvas, so a repaint only re-rasterises.
 #[derive(Default)]
@@ -497,8 +497,8 @@ fn draw_grid(canvas: &mut Canvas, camera: &Camera, target: [f32; 3], floor: f32)
         [centre_x + half, floor, centre_z + half],
         [centre_x - half, floor, centre_z + half],
     ];
-    canvas.triangle_flat(camera, [plane[0], plane[1], plane[2]], [232, 236, 241], false);
-    canvas.triangle_flat(camera, [plane[0], plane[2], plane[3]], [232, 236, 241], false);
+    canvas.triangle_flat(camera, [plane[0], plane[1], plane[2]], [30, 32, 36], false);
+    canvas.triangle_flat(camera, [plane[0], plane[2], plane[3]], [30, 32, 36], false);
     // The lines sit exactly on the plane they just painted, so drop the depth
     // they wrote; the bodies that follow still occlude themselves correctly.
     canvas.begin_overlay();
@@ -587,7 +587,7 @@ fn painted_labels(
             ViewMode::Bottom => "Bottom",
         }),
         egui::FontId::proportional(12.0),
-        egui::Color32::from_gray(70),
+        egui::Color32::from_gray(205),
     );
 
     if scene.people.is_empty() {
@@ -596,7 +596,7 @@ fn painted_labels(
             egui::Align2::CENTER_CENTER,
             scene.empty_hint.0,
             egui::FontId::proportional(14.0),
-            egui::Color32::from_gray(90),
+            egui::Color32::from_gray(190),
         );
         painter.text(
             rect.center() + egui::vec2(0.0, 16.0),
@@ -664,7 +664,7 @@ fn painted_labels(
     painter.circle_filled(
         centre,
         radius + 6.0,
-        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 210),
+        egui::Color32::from_rgba_unmultiplied(28, 29, 31, 180),
     );
     let (sin_yaw, cos_yaw) = orbit.yaw.sin_cos();
     let (sin_pitch, cos_pitch) = orbit.pitch.sin_cos();
