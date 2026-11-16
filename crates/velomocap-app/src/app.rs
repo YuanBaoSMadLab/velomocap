@@ -2671,12 +2671,17 @@ impl VeloMocap {
             ctx.request_repaint_after(Duration::from_millis(30));
             return;
         }
+        // A scrub decodes smaller so each seek comes back sooner; once the
+        // playhead is sitting on the frame that is on screen, the same frame is
+        // asked for again at full size for a crisp still. The width is part of the
+        // request identity, so the second ask is not deduplicated away.
+        let scrubbing = !self.playing && self.preview_frame != self.playhead;
         self.stream.request(
             &video,
             frame,
             self.playing,
             self.play_speed,
-            480,
+            if scrubbing { 360 } else { 480 },
             self.current_fps(),
         );
         ctx.request_repaint_after(Duration::from_millis(if self.playing { 16 } else { 60 }));

@@ -1182,33 +1182,59 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                                 });
                             }
                         }
-                        // Prefer the FlowHMR body: it is the temporally coherent
-                        // motion the export uses, and the one the original
-                        // previews. Fall back to the per-frame MHR mesh while no
-                        // clip has been generated for this person yet.
+                        // Prefer the FlowHMR body **inside the clip's own frame
+                        // range**: it is the temporally coherent motion the export
+                        // uses. A clip can cover only part of a long capture, and
+                        // holding its last pose for the rest of the take is what
+                        // read as "the animation stops halfway": outside the range
+                        // the per-frame reconstructed body takes over, and only
+                        // when that frame is missing too does the clip hold.
                         if let (Some(clip), Some(faces)) = (flow.get(slot), smplh_faces) {
-                            if let Some(verts) = clip.frame_clamped(app.playhead) {
-                                return Some(viewport::PersonDraw {
-                                    name: &person.name,
-                                    colour: person.colour,
-                                    verts,
-                                    keypoints: &[],
-                                    faces,
-                                    uv: None,
-                                    textures: &[],
-                                    face_texture: &[],
-                                    selected: slot == selected,
-                                });
+                            let inside = app.playhead >= clip.first_frame
+                                && app.playhead < clip.first_frame + clip.frames.len();
+                            if inside {
+                                if let Some(verts) =
+                                    clip.frame(app.playhead).filter(|verts| !verts.is_empty())
+                                {
+                                    return Some(viewport::PersonDraw {
+                                        name: &person.name,
+                                        colour: person.colour,
+                                        verts,
+                                        keypoints: &[],
+                                        faces,
+                                        uv: None,
+                                        textures: &[],
+                                        face_texture: &[],
+                                        selected: slot == selected,
+                                    });
+                                }
                             }
                         }
-                        person
-                            .frame(app.playhead)
-                            .map(|frame| viewport::PersonDraw {
+                        if let Some(frame) = person.frame(app.playhead) {
+                            return Some(viewport::PersonDraw {
                                 name: &person.name,
                                 colour: person.colour,
                                 verts: &frame.verts,
                                 keypoints: &frame.keypoints,
                                 faces: mhr_faces,
+                                uv: None,
+                                textures: &[],
+                                face_texture: &[],
+                                selected: slot == selected,
+                            });
+                        }
+                        // Neither: hold the clip's nearest pose so the person does
+                        // not vanish at the very edges of the capture.
+                        let (Some(clip), Some(faces)) = (flow.get(slot), smplh_faces) else {
+                            return None;
+                        };
+                        clip.frame_clamped(app.playhead)
+                            .map(|verts| viewport::PersonDraw {
+                                name: &person.name,
+                                colour: person.colour,
+                                verts,
+                                keypoints: &[],
+                                faces,
                                 uv: None,
                                 textures: &[],
                                 face_texture: &[],

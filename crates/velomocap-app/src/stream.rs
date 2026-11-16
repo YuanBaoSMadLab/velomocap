@@ -57,6 +57,10 @@ struct Asked {
     /// pacing a 25 fps clip at 30 fps would drift until the picture and the
     /// transport separated.
     fps: u16,
+    /// Decode width. A scrub asks for a smaller one so the seek comes back
+    /// sooner; the still frame at the destination is asked for again at the full
+    /// width, which only happens because the width is part of the identity.
+    scale: usize,
 }
 
 pub struct VideoStream {
@@ -137,6 +141,7 @@ impl VideoStream {
             playing,
             speed: (speed.max(0.05) * 100.0).round() as u16,
             fps: (fps.max(0.0) * 100.0).round() as u16,
+            scale,
         };
         if self.asked == Some(asked) {
             return;
@@ -189,13 +194,15 @@ impl VideoStream {
         }
         self.seen = version;
         let slot = self.shared.lock().ok().and_then(|slot| slot.clone())?;
-        // Only frames that are already on screen are dropped: a frame decoded for
-        // a request the pointer has moved past is still the newest picture there
-        // is, and showing it is what makes a drag show something at all.
-        if slot.1 <= self.shown {
+        // Only a frame from a *strictly older* request is dropped. A playback run
+        // publishes every frame with the serial of the command that started it, so
+        // "different from the last one shown" dropped everything after the first
+        // frame and the pane froze the moment playback began. While scrubbing, a
+        // frame older than the newest request is still the newest picture there is.
+        if slot.1 < self.shown {
             return None;
         }
-        self.shown = slot.1;
+        self.shown = self.shown.max(slot.1);
         Some((slot.0, slot.2))
     }
 }
@@ -509,9 +516,36 @@ mod tests {
         );
     }
 
-    /// One seek, one frame: a paused seek has to land and clear the debt, which
-    /// is the state the UI's "one seek in flight" gate reads.
+    /// A playback run publishes every frame with the serial of the command that
+    /// started it. Dropping "not the newest serial" therefore dropped every frame
+    /// after the first, and the preview pane froze as soon as playback began.
     #[test]
+    fn a_playback_run_keeps_painting_frames() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/media/test-clip.mp4");
+        if !path.is_file() || velomocap_video::Tools::discover().is_err() {
+            eprintln!("skipping: no sample clip or no ffmpeg");
+            return;
+        }
+        let mut stream = VideoStream::spawn();
+        stream.request(&path, 0, true, 1.0, 240, 30.0);
+        let started = Instant::now();
+        let mut painted = 0usize;
+        while started.elapsed() < Duration::from_secs(2) {
+            if stream.poll().is_some() {
+                painted += 1;
+            } else {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        eprintln!("playback painted {painted} frames in two seconds");
+        assert!(
+            painted >= 5,
+            "a playback run painted only {painted} frame(s): the pane is frozen"
+        );
+    }
+
+    /// One seek, one frame: a paused seek has to land and clear the debt, which
+    /// is the state the UI's "one seek in flight" gate reads.    #[test]
     fn a_paused_seek_paints_and_clears_the_outstanding_request() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/media/test-clip.mp4");
         if !path.is_file() || velomocap_video::Tools::discover().is_err() {
