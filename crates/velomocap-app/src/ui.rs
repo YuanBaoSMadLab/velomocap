@@ -2792,8 +2792,9 @@ fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
     let mut open = app.show_export;
     egui::Window::new(i18n::t("Export motion"))
         .open(&mut open)
-        .default_width(440.0)
-        .resizable(false)
+        .default_width(620.0)
+        .min_width(520.0)
+        .resizable(true)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(i18n::t("Format")).size(11.0).color(MUTED));
@@ -2929,16 +2930,28 @@ fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
                 if app.asset_selected.len() <= index {
                     app.asset_selected.resize(index + 1, true);
                 }
-                let mut chosen = app.asset_selected[index];
-                if ui
-                    .checkbox(
-                        &mut chosen,
-                        egui::RichText::new(format!("{} · {}", app.people[index].name, name)).size(11.0),
-                    )
-                    .changed()
-                {
-                    app.asset_selected[index] = chosen;
+                if app.asset_names.len() <= index {
+                    app.asset_names.resize(index + 1, String::new());
                 }
+                ui.horizontal(|ui| {
+                    let mut chosen = app.asset_selected[index];
+                    if ui
+                        .checkbox(&mut chosen, egui::RichText::new(&app.people[index].name).size(11.0))
+                        .changed()
+                    {
+                        app.asset_selected[index] = chosen;
+                    }
+                    ui.label(egui::RichText::new("·").size(10.0).color(MUTED));
+                    // The file name is editable here, like a DCC export dialog:
+                    // the model keeps its own name until the user types another.
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.asset_names[index])
+                            .hint_text(&name)
+                            .desired_width(220.0)
+                            .font(egui::TextStyle::Small),
+                    );
+                    ui.label(egui::RichText::new(i18n::zh_en(".glb", ".glb")).size(10.0).color(MUTED));
+                });
                 shown += 1;
             }
             if shown == 0 {

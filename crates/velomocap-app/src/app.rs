@@ -388,6 +388,9 @@ pub struct VeloMocap {
     pub asset_folder: String,
     /// What the last asset export did, for the panel.
     pub asset_status: String,
+    /// Per person, an optional file name for the exported model; empty means the
+    /// model's own name.
+    pub asset_names: Vec<String>,
     pub tools_ok: bool,
     pub ort_path: Option<PathBuf>,
     pub cuda_ok: bool,
@@ -556,6 +559,7 @@ impl VeloMocap {
         asset_selected: Vec::new(),
         asset_folder: String::new(),
         asset_status: String::new(),
+        asset_names: Vec::new(),
             export_everyone: false,
             model_status: Vec::new(),
             model_root: None,
@@ -897,10 +901,19 @@ impl VeloMocap {
             })
             .collect();
         for (index, path) in wanted {
-            let stem = path
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_else(|| format!("person{}", index + 1));
+            // A name typed in the panel wins; otherwise the model keeps its own.
+            let typed = self
+                .asset_names
+                .get(index)
+                .map(|name| name.trim().to_string())
+                .unwrap_or_default();
+            let stem = if typed.is_empty() {
+                path.file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("person{}", index + 1))
+            } else {
+                typed
+            };
             let out = folder.join(format!("{stem}.glb"));
             let result = crate::probe::export_animation(
                 &model,
