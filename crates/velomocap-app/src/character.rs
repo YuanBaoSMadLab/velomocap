@@ -1044,8 +1044,8 @@ impl Character {
         // A character's bones carry canonical indices (Hips, LeftUpLeg …), the
         // clip's rotations are in its own joint order. Resolve once per pose.
         //
-        // The clip names its joints in the *biped* vocabulary the BVH export
-        // uses, where `LeftShoulder` is the upper arm and `LeftCollar` is the
+        // The clip names its joints in the *biped* vocabulary the solver writes,
+        // where `LeftShoulder` is the upper arm and `LeftCollar` is the
         // clavicle — the opposite of Mixamo's meaning for the same words. So the
         // export-name table is what resolves them; `canonicalize` is only right
         // for the character's own file names.

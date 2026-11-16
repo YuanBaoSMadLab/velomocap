@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 use crate::math::{self, mat3, mul3, tmul3, transpose3};
 
 /// FBX key-time ticks per second.
-const TICKS: f64 = 46_186_158_000.0;
+pub const TICKS: f64 = 46_186_158_000.0;
 
 /// Full transform applied to the root motion before writing.
 pub const IDENTITY4: [f64; 16] = [
@@ -28,8 +28,9 @@ pub const IDENTITY4: [f64; 16] = [
     0.0, 0.0, 0.0, 1.0,
 ];
 
+/// One FBX property. The binary encoding of a node is its list of these.
 #[derive(Clone, Debug)]
-enum Prop {
+pub enum Prop {
     Str(String),
     I32(i32),
     I64(i64),
@@ -40,15 +41,20 @@ enum Prop {
     F64Array(Vec<f64>),
 }
 
+/// One FBX element: a name, its properties and its children.
+///
+/// Public because the skinned-asset writer builds the same container: the
+/// element encoding (13-byte records, zlib arrays, the end markers) is the part
+/// that is easy to get wrong and hard to notice, so there is one copy of it.
 #[derive(Clone, Debug)]
-struct Node {
-    name: String,
-    props: Vec<Prop>,
-    children: Vec<Node>,
+pub struct Node {
+    pub name: String,
+    pub props: Vec<Prop>,
+    pub children: Vec<Node>,
 }
 
 impl Node {
-    fn new(name: &str) -> Self {
+    pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
             props: Vec::new(),
@@ -56,7 +62,7 @@ impl Node {
         }
     }
 
-    fn with(name: &str, props: Vec<Prop>) -> Self {
+    pub fn with(name: &str, props: Vec<Prop>) -> Self {
         Self {
             name: name.to_string(),
             props,
@@ -64,14 +70,14 @@ impl Node {
         }
     }
 
-    fn child(mut self, node: Node) -> Self {
+    pub fn child(mut self, node: Node) -> Self {
         self.children.push(node);
         self
     }
 }
 
 /// One `P` property node as produced by `fbx_writer.prop`.
-fn property(name: &str, kind: &str, flags: &str, values: Vec<Prop>) -> Node {
+pub fn property(name: &str, kind: &str, flags: &str, values: Vec<Prop>) -> Node {
     let subtype = match kind {
         "int" => "Integer",
         "double" => "Number",
@@ -87,19 +93,19 @@ fn property(name: &str, kind: &str, flags: &str, values: Vec<Prop>) -> Node {
     Node::with("P", props)
 }
 
-fn property_int(name: &str, kind: &str, value: i32) -> Node {
+pub fn property_int(name: &str, kind: &str, value: i32) -> Node {
     property(name, kind, "", vec![Prop::I32(value)])
 }
 
-fn property_kint(name: &str, value: i64) -> Node {
+pub fn property_kint(name: &str, value: i64) -> Node {
     property(name, "KTime", "", vec![Prop::I64(value)])
 }
 
-fn property_double(name: &str, value: f64) -> Node {
+pub fn property_double(name: &str, value: f64) -> Node {
     property(name, "double", "", vec![Prop::F64(value)])
 }
 
-fn property_vec(name: &str, kind: &str, flags: &str, values: [f64; 3]) -> Node {
+pub fn property_vec(name: &str, kind: &str, flags: &str, values: [f64; 3]) -> Node {
     property(
         name,
         kind,
@@ -108,7 +114,7 @@ fn property_vec(name: &str, kind: &str, flags: &str, values: [f64; 3]) -> Node {
     )
 }
 
-fn properties(nodes: Vec<Node>) -> Node {
+pub fn properties(nodes: Vec<Node>) -> Node {
     Node {
         name: "Properties70".to_string(),
         props: Vec::new(),
@@ -120,6 +126,24 @@ fn compress(data: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(1));
     encoder.write_all(data)?;
     Ok(encoder.finish()?)
+}
+
+/// The 27-byte signature every binary FBX opens with.
+pub fn begin(out: &mut Vec<u8>) {
+    out.extend_from_slice(b"Kaydara FBX Binary  \0\x1a\0");
+    out.extend_from_slice(&7400u32.to_le_bytes());
+}
+
+/// The footer a 7.4 file closes with: a null record, the file id, an alignment
+/// pad, the version and the trailing id block.
+pub fn finish(out: &mut Vec<u8>) {
+    out.extend_from_slice(&[0u8; 13]);
+    out.extend_from_slice(&hex("fabcab09d0c8d466b176fb831cf7267e"));
+    let pad = (16 - (out.len() % 16)) % 16;
+    out.extend(std::iter::repeat_n(0u8, pad));
+    out.extend_from_slice(&7400u32.to_le_bytes());
+    out.extend_from_slice(&[0u8; 120]);
+    out.extend_from_slice(&hex("f85a8c6adef5d97eece90ce3758f290b"));
 }
 
 fn write_property(out: &mut Vec<u8>, prop: &Prop) -> Result<()> {
@@ -194,7 +218,7 @@ fn write_property(out: &mut Vec<u8>, prop: &Prop) -> Result<()> {
     Ok(())
 }
 
-fn write_element(out: &mut Vec<u8>, node: &Node) -> Result<()> {
+pub fn write_element(out: &mut Vec<u8>, node: &Node) -> Result<()> {
     let start = out.len();
     out.extend_from_slice(&[0u8; 13]);
     out.extend_from_slice(node.name.as_bytes());
@@ -560,8 +584,7 @@ pub fn write(path: &Path, input: &FbxInput<'_>) -> Result<FbxReport> {
 
     // ---------------------------------------------------------------- file --
     let mut out: Vec<u8> = Vec::with_capacity(1 << 20);
-    out.extend_from_slice(b"Kaydara FBX Binary  \0\x1a\0");
-    out.extend_from_slice(&7400u32.to_le_bytes());
+    begin(&mut out);
 
     write_element(
         &mut out,
@@ -781,16 +804,8 @@ pub fn write(path: &Path, input: &FbxInput<'_>) -> Result<FbxReport> {
         &Node::new("Takes").child(Node::with("Current", vec![Prop::Str("Motion".to_string())])),
     )?;
 
-    out.extend_from_slice(&[0u8; 13]);
-    out.extend_from_slice(&hex("fabcab09d0c8d466b176fb831cf7267e"));
-    let pad = (16 - (out.len() % 16)) % 16;
-    out.extend_from_slice(&vec![0u8; pad]);
-    out.extend_from_slice(&7400u32.to_le_bytes());
-    out.extend_from_slice(&[0u8; 120]);
-    out.extend_from_slice(&hex("f85a8c6adef5d97eece90ce3758f290b"));
-
+    finish(&mut out);
     std::fs::write(path, &out)?;
-
     Ok(FbxReport {
         key_count,
         stop_tick: stop,
@@ -895,7 +910,7 @@ fn rot3(frames: &[f64], base: usize) -> [f64; 9] {
     ]
 }
 
-fn transpose_flatten(matrix: &[f64; 16]) -> Vec<f64> {    let mut out = Vec::with_capacity(16);
+pub fn transpose_flatten(matrix: &[f64; 16]) -> Vec<f64> {    let mut out = Vec::with_capacity(16);
     for r in 0..4 {
         for c in 0..4 {
             out.push(matrix[c * 4 + r]);
@@ -986,7 +1001,7 @@ fn validate(input: &FbxInput<'_>) -> Result<()> {
 }
 
 impl Node {
-    fn children(mut self, nodes: Vec<Node>) -> Self {
+    pub fn children(mut self, nodes: Vec<Node>) -> Self {
         self.children.extend(nodes);
         self
     }

@@ -214,13 +214,15 @@ pub fn render_pose(
     rasterize(&character, &verts, out)
 }
 
-/// Write a character and the take it is playing as one animated `.glb`.
+/// Write a character and the take it is playing as one animated asset: `.glb`
+/// or `.fbx`, picked by the extension.
 pub fn export_animation(
     model: &str,
     character_path: &str,
     project_path: &str,
     out: &str,
     options: crate::asset::Options,
+    fps: f32,
 ) -> anyhow::Result<()> {
     let character = crate::character::Character::load(std::path::Path::new(character_path))?;
     let project = crate::project::Project::load(std::path::Path::new(project_path))?;
@@ -296,7 +298,17 @@ pub fn export_animation(
         frames.len(),
         joints
     );
-    crate::asset::write_glb(&character, &frames, options, std::path::Path::new(out))
+    let path = std::path::Path::new(out);
+    let fbx = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("fbx"))
+        .unwrap_or(false);
+    if fbx {
+        crate::asset_fbx::write_fbx(&character, &frames, options, fps, path)
+    } else {
+        crate::asset::write_glb(&character, &frames, options, fps, path)
+    }
 }
 fn rasterize(
     character: &crate::character::Character,

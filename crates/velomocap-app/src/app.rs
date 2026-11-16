@@ -8,29 +8,29 @@ use crate::capture::{self, CaptureJob, CaptureStage};
 use crate::i18n;
 use crate::ui;
 use crate::viewport::{Layers, Orbit, ViewportCache, PERSON_COLOURS};
-/// Which file(s) the export window writes.
+/// Which container(s) a character asset export writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExportFormat {
-    Bvh,
+pub enum AssetFormat {
+    Glb,
     Fbx,
     Both,
 }
 
-impl ExportFormat {
+impl AssetFormat {
     pub fn label(self) -> &'static str {
         match self {
-            ExportFormat::Bvh => "BVH",
-            ExportFormat::Fbx => "FBX",
-            ExportFormat::Both => i18n::t("BVH + FBX"),
+            AssetFormat::Glb => "GLB",
+            AssetFormat::Fbx => "FBX",
+            AssetFormat::Both => "GLB + FBX",
         }
     }
 
-    pub fn bvh(self) -> bool {
-        matches!(self, ExportFormat::Bvh | ExportFormat::Both)
+    pub fn glb(self) -> bool {
+        matches!(self, AssetFormat::Glb | AssetFormat::Both)
     }
 
     pub fn fbx(self) -> bool {
-        matches!(self, ExportFormat::Fbx | ExportFormat::Both)
+        matches!(self, AssetFormat::Fbx | AssetFormat::Both)
     }
 }
 
@@ -256,9 +256,6 @@ pub struct VeloMocap {
     pub estimate_camera: bool,
     /// Sidebar: smooth the estimated camera rotation.
     pub refine_camera: bool,
-        pub export_on_finish: bool,
-        pub export_fbx_on_finish: bool,
-    pub exported: bool,
     pub scale_width: usize,
         pub max_frames: usize,
     pub capture: Option<CaptureJob>,
@@ -311,11 +308,6 @@ pub struct VeloMocap {
     pub status: String,
     pub error: Option<String>,
     pub export_note: Option<String>,
-    /// Which vendor's bone names an export is written in.
-    pub export_rig: velomocap_motion::retarget::Rig,
-    /// Re-express the exported rotations in the canonical rest frames, so a rig
-    /// that binds in the canonical T-pose plays this clip exactly.
-    pub export_rest_correct: bool,
     /// Hand-drawn contact timing for the selected clip: four sparse tracks of
     /// frame intervals (left foot, right foot, left hand, right hand).
     pub locks: velomocap_motion::ContactTracks,
@@ -339,10 +331,7 @@ pub struct VeloMocap {
     pub show_help: bool,
     pub show_models: bool,
     pub show_guide: bool,
-    /// The export window: format, skeleton naming, rest correction, file name.
-    /// These used to be a rig submenu plus two items in the File menu, which
-    /// made the naming look like a document property rather than a choice made
-    /// when a file is written.
+    /// The export window: what to write, where, and under which name.
     pub show_export: bool,
     /// An imported character (VRM / glTF) that replaces the built-in body in the
     /// viewport, the reference's "Import Character". The rest rotations turn a
@@ -371,11 +360,7 @@ pub struct VeloMocap {
     pub drop_hint: Option<String>,
     /// The saved character map has been applied to the current people.
     pub characters_loaded: bool,
-    pub export_format: ExportFormat,
-    /// Suffix for the written files; empty means the clip's own name.
-    pub export_name: String,
-    /// One file per person instead of the selected one.
-    pub export_everyone: bool,
+    pub export_format: AssetFormat,
     /// What a character asset export writes: mesh with skin weights, materials
     /// with their textures, and the animation. All on by default, which is what
     /// a game engine needs to import the model and play the take.
@@ -407,8 +392,6 @@ impl VeloMocap {
             max_frames,
             play,
             frame,
-            export,
-            export_fbx,
             detect_only,
             select,
             play_check,
@@ -469,9 +452,6 @@ impl VeloMocap {
             correction: velomocap_motion::correction::CorrectionSettings::default(),
             estimate_camera: false,
             refine_camera: true,
-            export_on_finish: export,
-            export_fbx_on_finish: export_fbx,
-            exported: false,
             scale_width: 960,
             max_frames,
             capture: None,
@@ -523,8 +503,6 @@ impl VeloMocap {
             ort_path,
             cuda_ok,
             export_note: None,
-            export_rig: velomocap_motion::retarget::Rig::Biped,
-            export_rest_correct: false,
             locks: velomocap_motion::ContactTracks::automatic(),
             selected_lock: None,
             lock_undo: Vec::new(),
@@ -551,8 +529,7 @@ impl VeloMocap {
             left_tab: 0,
             drop_hint: None,
             characters_loaded: false,
-            export_format: ExportFormat::Bvh,
-            export_name: String::new(),
+            export_format: AssetFormat::Glb,
         asset_skin: true,
         asset_materials: true,
         asset_animation: true,
@@ -560,7 +537,6 @@ impl VeloMocap {
         asset_folder: String::new(),
         asset_status: String::new(),
         asset_names: Vec::new(),
-            export_everyone: false,
             model_status: Vec::new(),
             model_root: None,
             model_core_ready: false,
@@ -581,6 +557,7 @@ impl VeloMocap {
                 &project,
                 &out,
                 crate::asset::Options::default(),
+                app.current_fps() as f32,
             ) {
                 eprintln!("export-animated failed: {error:#}");
                 std::process::exit(1);
@@ -591,12 +568,18 @@ impl VeloMocap {
             match crate::character::Character::load(std::path::Path::new(&file)) {
                 Ok(character) => {
                     let options = crate::asset::Options::default();
-                    if let Err(error) = crate::asset::write_glb(
-                        &character,
-                        &[],
-                        options,
-                        std::path::Path::new(&out),
-                    ) {
+                    let path = std::path::Path::new(&out);
+                    let fbx = path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .map(|extension| extension.eq_ignore_ascii_case("fbx"))
+                        .unwrap_or(false);
+                    let result = if fbx {
+                        crate::asset_fbx::write_fbx(&character, &[], options, 30.0, path)
+                    } else {
+                        crate::asset::write_glb(&character, &[], options, 30.0, path)
+                    };
+                    if let Err(error) = result {
                         eprintln!("export-asset failed: {error:#}");
                         std::process::exit(1);
                     }
@@ -666,20 +649,7 @@ impl VeloMocap {
                 );
                 std::process::exit(if saved { 0 } else { 1 });
             }
-            if export || export_fbx {
-                app.export_bvh();
-                if export_fbx {
-                    app.export_fbx();
-                }
-                match &app.export_note {
-                    Some(note) => eprintln!("export: {note}"),
-                    None => eprintln!(
-                        "export: failed — {}",
-                        app.error.clone().unwrap_or_else(|| "unknown".into())
-                    ),
-                }
-                std::process::exit(if app.error.is_some() { 1 } else { 0 });
-            }
+
         } else if let Some(path) = app.video.clone() {
             app.load_video(path);
                         app.playing = play;
@@ -853,10 +823,9 @@ impl VeloMocap {
         };
     }
 
-    /// Write every selected person's model as its own animated `.glb`: mesh with
-    /// skin weights, materials with their textures, and the take the viewport is
-    /// playing. This is the export that puts a usable asset in a game engine, as
-    /// opposed to the skeleton-only BVH/FBX motion export next to it.
+    /// Write every ticked person's model as its own animated asset (`.glb`,
+    /// `.fbx`, or both): mesh with skin weights, materials with their textures,
+    /// and the take the viewport is playing.
     pub fn export_asset_models(&mut self) {
         let Some(project) = self.project_path.clone() else {
             self.asset_status = i18n::zh_en(
@@ -884,6 +853,14 @@ impl VeloMocap {
             animation: self.asset_animation,
         };
         let model = self.smplh_model.display().to_string();
+        let fps = self.current_fps() as f32;
+        let mut extensions: Vec<&str> = Vec::new();
+        if self.export_format.glb() {
+            extensions.push("glb");
+        }
+        if self.export_format.fbx() {
+            extensions.push("fbx");
+        }
         let mut written = 0usize;
         let mut failures: Vec<String> = Vec::new();
         // Collect the paths first: the loop must not hold the people list while
@@ -914,17 +891,20 @@ impl VeloMocap {
             } else {
                 typed
             };
-            let out = folder.join(format!("{stem}.glb"));
-            let result = crate::probe::export_animation(
-                &model,
-                &path.display().to_string(),
-                &project.display().to_string(),
-                &out.display().to_string(),
-                options,
-            );
-            match result {
-                Ok(()) => written += 1,
-                Err(error) => failures.push(format!("{stem}: {error:#}")),
+            for extension in &extensions {
+                let out = folder.join(format!("{stem}.{extension}"));
+                let result = crate::probe::export_animation(
+                    &model,
+                    &path.display().to_string(),
+                    &project.display().to_string(),
+                    &out.display().to_string(),
+                    options,
+                    fps,
+                );
+                match result {
+                    Ok(()) => written += 1,
+                    Err(error) => failures.push(format!("{stem}.{extension}: {error:#}")),
+                }
             }
         }
         for failure in failures {
@@ -937,6 +917,21 @@ impl VeloMocap {
             folder.display()
         );
     }
+
+    /// Pick the folder the assets land in. A path field is fine for a path the
+    /// user has in the clipboard; a DCC export dialog browses.
+    pub fn browse_asset_folder(&mut self) {
+        let mut dialog = rfd::FileDialog::new();
+        if !self.asset_folder.trim().is_empty() {
+            dialog = dialog.set_directory(self.asset_folder.trim());
+        } else if let Some(parent) = self.project_path.as_ref().and_then(|path| path.parent()) {
+            dialog = dialog.set_directory(parent);
+        }
+        if let Some(folder) = dialog.pick_folder() {
+            self.asset_folder = folder.display().to_string();
+        }
+    }
+
 
     /// Put a person back on the built-in body.
     pub fn clear_character(&mut self, person: usize) {
@@ -1388,7 +1383,6 @@ impl VeloMocap {
                         if let Some(job) = self.capture.take() {
             job.cancel();
         }
-        self.exported = false;
         self.capture_started = None;
         self.candidates.clear();
         self.detecting = false;
@@ -1562,7 +1556,6 @@ impl VeloMocap {
         self.play_from = None;
         self.playing = false;
         self.play_anchor = None;
-        self.exported = false;
         self.export_note = None;
         self.error = None;
         self.preview = None;
@@ -1692,17 +1685,15 @@ impl VeloMocap {
         }
         self.scale_width = settings.scale_width;
         self.max_frames = settings.max_frames;
-        self.export_format = match settings.export_format.as_str() {
-            "bvh" => ExportFormat::Bvh,
-            "fbx" => ExportFormat::Fbx,
-            _ => ExportFormat::Both,
+        self.export_format = match settings.asset_format.as_str() {
+            "glb" => AssetFormat::Glb,
+            "fbx" => AssetFormat::Fbx,
+            _ => AssetFormat::Both,
         };
-        if let Some(rig) = velomocap_motion::retarget::Rig::from_slug(&settings.export_rig) {
-            self.export_rig = rig;
-        }
-        self.export_rest_correct = settings.export_rest_correct;
-        self.export_everyone = settings.export_everyone;
-        self.export_name = settings.export_name.clone();
+        self.asset_skin = settings.asset_skin;
+        self.asset_materials = settings.asset_materials;
+        self.asset_animation = settings.asset_animation;
+        self.asset_folder = settings.asset_folder.clone();
         self.storage_precision = settings.storage_precision;
         self.storage_compression = settings.storage_compression;
 
@@ -2047,232 +2038,6 @@ impl VeloMocap {
         self.selected_lock = None;
     }
 
-    /// The clip's export payload: renamed into the selected rig, and
-    /// rest-corrected when asked. The default biped payload is the clip's own,
-    /// which is what every export wrote before the retarget chain existed.
-    ///
-    /// `rest_correct` is a property of the *format*: a BVH carries no bind pose,
-    /// so the correction is what makes a canonical-rest rig play it, while an
-    /// FBX states its own bind (ours, from the SMPL-H rest) and correcting its
-    /// channels against someone else's rest would contradict that bind.
-    fn export_payload(
-        &self,
-        bvh: &velomocap_motion::PreparedBvh,
-        rest_correct: bool,
-    ) -> Result<velomocap_motion::PreparedBvh, String> {
-        let mut prepared = bvh.clone();
-        if self.export_rig != velomocap_motion::retarget::Rig::Biped || rest_correct {
-            velomocap_motion::retarget::rewrite(&mut prepared, self.export_rig, rest_correct)
-                .map_err(|error| format!("{error:#}"))?;
-        }
-        Ok(prepared)
-    }
-    /// Where an export goes: beside the clip, named after it unless the export
-    /// window gave a name. "Everyone" adds `-p1`, `-p2`, … so the files do not
-    /// overwrite each other (they all used to be `<clip>.bvh`).
-    pub fn export_path(&self, ext: &str, index: usize) -> Option<PathBuf> {
-        let video = self.video.as_ref()?;
-        let mut name = self.export_name.trim().to_string();
-        // Typing "walk.bvh" must not produce "walk.bvh.bvh".
-        for extension in [".bvh", ".fbx"] {
-            if name.to_ascii_lowercase().ends_with(extension) {
-                name.truncate(name.len() - extension.len());
-            }
-        }
-        let stem = if name.is_empty() {
-            video.file_stem()?.to_string_lossy().into_owned()
-        } else {
-            name
-        };
-        let suffix = if self.export_everyone {
-            format!("-p{}", index + 1)
-        } else {
-            String::new()
-        };
-        Some(video.with_file_name(format!("{stem}{suffix}.{ext}")))
-    }
-
-    /// Write what the export window selected, then close it.
-    pub fn export_now(&mut self) {
-        let count = if self.flow.is_empty() {
-            self.people.len()
-        } else {
-            self.flow.len()
-        };
-        let previous = self.selected;
-        let indices: Vec<usize> = if self.export_everyone && count > 1 {
-            (0..count).collect()
-        } else {
-            vec![previous.min(count.saturating_sub(1))]
-        };
-        for index in indices {
-            self.selected = index;
-            if self.export_format.bvh() {
-                self.export_bvh();
-            }
-            if self.export_format.fbx() {
-                self.export_fbx();
-            }
-        }
-        self.selected = previous;
-        self.show_export = false;
-    }
-
-    pub fn export_fbx(&mut self) {
-        if self.video.is_none() {
-            self.error = Some("Open a video first.".into());
-            return;
-        }
-        let Some(clip) = self
-            .flow
-            .get(self.selected)
-            .or_else(|| self.flow.first())
-            .cloned()
-        else {
-            self.error = Some("Generate motion (FlowHMR) before exporting FBX.".into());
-            return;
-        };
-        let Some(path) = self.export_path("fbx", self.selected) else {
-            self.error = Some("Open a video first.".into());
-            return;
-        };
-        // MMD's standard bones are Japanese, and the FBX writer keeps bone names
-        // ASCII (its importers are not reliable about anything else). Say which
-        // export does work instead of failing inside the writer.
-        if !self.export_rig.ascii_names() {
-            self.error = Some(format!(
-                "{} names are not ASCII: the FBX writer needs ASCII bone names. Export BVH instead.",
-                self.export_rig.label()
-            ));
-            return;
-        }
-        if self.export_rest_correct {
-            self.log(
-                "FBX: the file carries its own bind pose, so the rest correction is applied to BVH exports only.",
-            );
-        }
-        let prepared = match self.export_payload(&clip.bvh, false) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                self.error = Some(error);
-                return;
-            }
-        };
-        match velomocap_motion::write_prepared_fbx(&path, &prepared) {
-            Ok(report) => {
-                let note = format!(
-                    "{} · FlowHMR · {} bones · {} keys · {}",
-                    path.display(),
-                    report.bones,
-                    report.key_count,
-                    self.export_rig.label()
-                );
-                self.log(format!("FBX: {note}"));
-                self.export_note = Some(note);
-                self.status = format!("Wrote {}", path.display());
-            }
-            Err(error) => self.error = Some(format!("{error:#}")),
-        }
-    }
-        pub fn export_bvh(&mut self) {
-        if self.video.is_none() {
-            self.error = Some("Open a video first.".into());
-            return;
-        }
-        if let Some(clip) = self
-            .flow
-            .get(self.selected)
-            .or_else(|| self.flow.first())
-            .cloned()
-        {
-            let Some(path) = self.export_path("bvh", self.selected) else {
-                self.error = Some("Open a video first.".into());
-                return;
-            };
-            let prepared = match self.export_payload(&clip.bvh, self.export_rest_correct) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    self.error = Some(error);
-                    return;
-                }
-            };
-            match velomocap_motion::write_prepared(&path, &prepared) {
-                Ok(report) => {
-                    let first = report.orders.first().cloned().unwrap_or_default();
-                    let order = if report.orders.iter().all(|entry| *entry == first) {
-                        format!("uniform {first}")
-                    } else {
-                        first
-                    };
-                    let note = format!(
-                        "{} · FlowHMR · {} frames · {} bones · order {} · {}",
-                        path.display(),
-                        clip.bvh.frames(),
-                        clip.bvh.parents.len(),
-                        order,
-                        self.export_rig.label()
-                    );
-                    self.log(format!("BVH: {note}"));
-                    self.export_note = Some(note);
-                    self.status = format!("Wrote {}", path.display());
-                }
-                Err(error) => self.error = Some(format!("{error:#}")),
-            }
-            return;
-        }
-        let Some(mesh) = self.mesh.clone() else {
-            self.error = Some("Reconstruct a clip before exporting.".into());
-            return;
-        };
-        let Some(person) = self
-            .people
-            .get(self.selected)
-            .or_else(|| self.people.first())
-            .cloned()
-        else {
-            self.error = Some("No people to export.".into());
-            return;
-        };
-        let track = velomocap_motion::PersonTrack {
-            id: person.id,
-            name: person.name.clone(),
-            frames: person.frames.clone(),
-            first_frame: 0,
-            last_frame: person.frames.len().saturating_sub(1),
-            hits: person.hits(),
-        };
-        let path = match self.export_path("bvh", self.selected) {
-            Some(path) => path,
-            None => {
-                self.error = Some("Open a video first.".into());
-                return;
-            }
-        };
-        // The MHR skeleton has no canonical bone names (its joints are
-        // `mhr000…`), so the skeleton-naming choice cannot apply to it: the
-        // per-frame MHR export is only reachable when there is no FlowHMR clip,
-        // and then it is the only payload available.
-        if self.export_rig != velomocap_motion::retarget::Rig::Biped {
-            self.log(format!(
-                "BVH: the MHR skeleton has no {} names, writing its own joints.",
-                self.export_rig.label()
-            ));
-        }
-        match velomocap_motion::write_person_bvh(&path, &track, &mesh, self.current_fps()) {
-            Ok(report) => {
-                let note = format!(
-                    "{} · {} bones · order {}",
-                    path.display(),
-                    mesh.parents.len(),
-                    report.orders.first().cloned().unwrap_or_default()
-                );
-                self.log(format!("BVH: {note}"));
-                self.export_note = Some(note);
-                self.status = format!("Wrote {}", path.display());
-            }
-            Err(error) => self.error = Some(format!("{error:#}")),
-        }
-    }
     pub fn refresh_models(&mut self, verify_hash: bool) {
         crate::models_ui::refresh(self, verify_hash);
     }
@@ -2429,20 +2194,6 @@ impl VeloMocap {
             self.video_size = video_size;
         }
                         self.sync_people(&snapshot);
-        if finished && self.export_on_finish && !self.exported {
-            self.exported = true;
-            self.export_bvh();
-            if self.export_fbx_on_finish {
-                self.export_fbx();
-            }
-            match &self.export_note {
-                Some(note) => eprintln!("export: {note}"),
-                None => eprintln!(
-                    "export: failed — {}",
-                    self.error.clone().unwrap_or_else(|| "unknown".into())
-                ),
-            }
-        }
         if finished && self.save_after_capture.is_some() {
             let path = self.save_after_capture.take().unwrap();
             self.save_project(path.clone());
@@ -2854,8 +2605,6 @@ fn cli_args() -> CliArgs {
     let mut max_frames = 0usize;
     let mut play = false;
     let mut frame = 0usize;
-    let mut export = false;
-    let mut export_fbx = false;
     let mut save_project = None;
     let mut open_project = None;
     let mut storage_precision = None;
@@ -2884,7 +2633,6 @@ fn cli_args() -> CliArgs {
                 }
             }
             "--cpu" => std::env::set_var("VELOMOCAP_FORCE_CPU", "1"),
-            "--export-bvh" => export = true,
             "--detect-only" => detect_only = true,
             "--render-probe" => {
                 render_probe = args.next();
@@ -2928,7 +2676,6 @@ fn cli_args() -> CliArgs {
                     select = value.parse().ok();
                 }
             }
-            "--export-fbx" => export_fbx = true,
             // Headless project round-tripping: save after a capture, or open a
             // saved workspace and leave without touching the GUI.
             "--save-project" => {
@@ -2973,8 +2720,6 @@ fn cli_args() -> CliArgs {
         max_frames,
         play,
         frame,
-        export,
-        export_fbx,
         detect_only,
         select,
         play_check,
@@ -2994,8 +2739,6 @@ struct CliArgs {
     max_frames: usize,
     play: bool,
     frame: usize,
-    export: bool,
-    export_fbx: bool,
     detect_only: bool,
     select: Option<usize>,
     play_check: Option<usize>,

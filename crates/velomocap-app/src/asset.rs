@@ -1,19 +1,21 @@
 //! Write a character back out as a glTF binary (.glb): mesh, skin, materials and
 //! the animation the viewport is playing.
 //!
-//! This is the export path the reference does not have: it writes BVH and FBX
-//! *motion* only, so the model a user picked has to be re-skinned by hand in
-//! Blender before it can go into a game. Here the model that is on screen is the
-//! model that lands in the file — positions, normals, texture coordinates, skin
-//! weights, the skeleton it hangs from and one animation track per bone.
+//! This is the export path the reference does not have: the model a user picked
+//! is the model that lands in the file — positions, normals, texture
+//! coordinates, skin weights, the skeleton it hangs from and one animation track
+//! per bone. Without it an avatar would have to be re-skinned by hand in Blender
+//! before it could go into a game.
 //!
-//! glTF was chosen first because a single `.glb` carries its textures inside it:
-//! no sidecar folder to lose, and Unity, Unreal, Blender and Godot all read it.
+//! glTF is the single-file container: one `.glb` carries its textures inside it,
+//! so there is no sidecar folder to lose, and Unity, Unreal, Blender and Godot
+//! all read it. [`crate::asset_fbx`] writes the same character as an FBX for the
+//! tools that ask for one by name.
 
 use anyhow::{Context, Result};
 use std::path::Path;
 
-use crate::character::Character;
+use crate::character::{Character, Texture};
 
 /// One frame of the clip, already posed onto this character.
 pub struct Frame {
@@ -43,59 +45,26 @@ impl Default for Options {
     }
 }
 
-fn align4(len: usize) -> usize {
-    (4 - len % 4) % 4
+/// A texture as a PNG, which is what both containers store.
+pub(crate) fn png_bytes(texture: &Texture) -> Result<Vec<u8>> {
+    let mut png = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut png);
+    image::ImageEncoder::write_image(
+        encoder,
+        &texture.rgba,
+        texture.width as u32,
+        texture.height as u32,
+        image::ExtendedColorType::Rgba8,
+    )
+    .context("encoding a texture")?;
+    Ok(png)
 }
 
-/// A growable binary buffer that remembers where each block starts.
-#[derive(Default)]
-struct Bin {
-    bytes: Vec<u8>,
-    views: Vec<serde_json::Value>,
-}
-
-impl Bin {
-    fn push(&mut self, data: &[u8], target: Option<&str>) -> usize {
-        let padding = align4(self.bytes.len());
-        self.bytes.extend(std::iter::repeat_n(0u8, padding));
-        let offset = self.bytes.len();
-        self.bytes.extend_from_slice(data);
-        let mut view = serde_json::json!({
-            "buffer": 0,
-            "byteOffset": offset,
-            "byteLength": data.len(),
-        });
-        if let Some(target) = target {
-            view["target"] = serde_json::json!(target);
-        }
-        self.views.push(view);
-        self.views.len() - 1
-    }
-
-    fn floats(&mut self, values: &[f32], target: Option<&str>) -> usize {
-        let mut bytes = Vec::with_capacity(values.len() * 4);
-        for value in values {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        self.push(&bytes, target)
-    }
-}
-
-/// Write `character` as a `.glb`, animated by `frames`.
-pub fn write_glb(
-    character: &Character,
-    frames: &[Frame],
-    options: Options,
-    out: &Path,
-) -> Result<()> {
-    let bones = &character.bones;
-    anyhow::ensure!(!character.faces.is_empty(), "the model has no faces");
-
-    let mut bin = Bin::default();
-    let mut accessors: Vec<serde_json::Value> = Vec::new();
-
-    // --- geometry ---------------------------------------------------------
-    // Normals are not stored by the readers, and a lit game engine needs them.
+/// Area-weighted normals for the bind pose, one per vertex.
+///
+/// Neither reader stores normals, and a lit game engine needs them: an unlit
+/// import looks flat and a recomputed one disagrees with the viewport.
+pub(crate) fn vertex_normals(character: &Character) -> Vec<f32> {
     let count = character.vertex_count();
     let mut normals = vec![0.0f32; count * 3];
     for face in &character.faces {
@@ -118,6 +87,69 @@ pub fn write_glb(
             }
         }
     }
+    normals
+}
+
+fn align4(len: usize) -> usize {
+    (4 - len % 4) % 4
+}
+
+/// glTF buffer-view targets, as the spec numbers them. A string here is not
+/// valid glTF and a strict parser rejects the whole file.
+const ARRAY_BUFFER: u32 = 34_962;
+const ELEMENT_ARRAY_BUFFER: u32 = 34_963;
+
+/// A growable binary buffer that remembers where each block starts.
+#[derive(Default)]
+struct Bin {
+    bytes: Vec<u8>,
+    views: Vec<serde_json::Value>,
+}
+
+impl Bin {
+    fn push(&mut self, data: &[u8], target: Option<u32>) -> usize {
+        let padding = align4(self.bytes.len());
+        self.bytes.extend(std::iter::repeat_n(0u8, padding));
+        let offset = self.bytes.len();
+        self.bytes.extend_from_slice(data);
+        let mut view = serde_json::json!({
+            "buffer": 0,
+            "byteOffset": offset,
+            "byteLength": data.len(),
+        });
+        if let Some(target) = target {
+            view["target"] = serde_json::json!(target);
+        }
+        self.views.push(view);
+        self.views.len() - 1
+    }
+
+    fn floats(&mut self, values: &[f32], target: Option<u32>) -> usize {
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        self.push(&bytes, target)
+    }
+}
+
+/// Write `character` as a `.glb`, animated by `frames`.
+pub fn write_glb(
+    character: &Character,
+    frames: &[Frame],
+    options: Options,
+    fps: f32,
+    out: &Path,
+) -> Result<()> {
+    let bones = &character.bones;
+    anyhow::ensure!(!character.faces.is_empty(), "the model has no faces");
+
+    let mut bin = Bin::default();
+    let mut accessors: Vec<serde_json::Value> = Vec::new();
+
+    // --- geometry ---------------------------------------------------------
+    let count = character.vertex_count();
+    let base_normals = vertex_normals(character);
 
     // --- materials and textures ------------------------------------------
     let mut materials: Vec<serde_json::Value> = Vec::new();
@@ -125,18 +157,7 @@ pub fn write_glb(
     let mut images: Vec<serde_json::Value> = Vec::new();
     if options.materials {
         for (slot, texture) in character.textures.iter().enumerate() {
-            let mut png = Vec::new();
-            {
-                let encoder = image::codecs::png::PngEncoder::new(&mut png);
-                image::ImageEncoder::write_image(
-                    encoder,
-                    &texture.rgba,
-                    texture.width as u32,
-                    texture.height as u32,
-                    image::ExtendedColorType::Rgba8,
-                )
-                .context("encoding a texture")?;
-            }
+            let png = png_bytes(texture)?;
             let view = bin.push(&png, None);
             images.push(serde_json::json!({
                 "bufferView": view,
@@ -159,7 +180,6 @@ pub fn write_glb(
     // One primitive per material, each carrying only the vertices it uses: a
     // single shared vertex array would be written once per primitive, and a
     // six-material avatar came out six times the size.
-    let base_normals = normals;
     let mut primitives: Vec<serde_json::Value> = Vec::new();
     let mut slots: Vec<u16> = character
         .face_texture
@@ -229,7 +249,7 @@ pub fn write_glb(
                 indices.push(remap[*index as usize]);
             }
         }
-        let position_accessor = push_accessor(&mut bin, &mut accessors, positions, "VEC3", 5126, Some("ARRAY_BUFFER"));
+        let position_accessor = push_accessor(&mut bin, &mut accessors, positions, "VEC3", 5126, Some(ARRAY_BUFFER));
         // A POSITION accessor must carry its bounds; the spec requires them and a
         // strict parser uses them to size the import.
         {
@@ -255,13 +275,13 @@ pub fn write_glb(
             accessors[position_accessor]["min"] = serde_json::json!(low);
             accessors[position_accessor]["max"] = serde_json::json!(high);
         }
-        let normal_accessor = push_accessor(&mut bin, &mut accessors, vertex_normals, "VEC3", 5126, Some("ARRAY_BUFFER"));
+        let normal_accessor = push_accessor(&mut bin, &mut accessors, vertex_normals, "VEC3", 5126, Some(ARRAY_BUFFER));
         let mut attributes = serde_json::json!({
             "POSITION": position_accessor,
             "NORMAL": normal_accessor,
         });
         if character.uv.len() == count {
-            let uv_accessor = push_accessor(&mut bin, &mut accessors, uvs, "VEC2", 5126, Some("ARRAY_BUFFER"));
+            let uv_accessor = push_accessor(&mut bin, &mut accessors, uvs, "VEC2", 5126, Some(ARRAY_BUFFER));
             attributes["TEXCOORD_0"] = serde_json::json!(uv_accessor);
         }
         if options.skin {
@@ -271,7 +291,7 @@ pub fn write_glb(
             for joint in &joints {
                 joint_bytes.extend_from_slice(&(*joint as u16).to_le_bytes());
             }
-            let joint_view = bin.push(&joint_bytes, Some("ARRAY_BUFFER"));
+            let joint_view = bin.push(&joint_bytes, Some(ARRAY_BUFFER));
             accessors.push(serde_json::json!({
                 "bufferView": joint_view,
                 "componentType": 5123,
@@ -279,7 +299,7 @@ pub fn write_glb(
                 "type": "VEC4",
             }));
             let joints_accessor = accessors.len() - 1;
-            let weights_accessor = push_accessor(&mut bin, &mut accessors, weights, "VEC4", 5126, Some("ARRAY_BUFFER"));
+            let weights_accessor = push_accessor(&mut bin, &mut accessors, weights, "VEC4", 5126, Some(ARRAY_BUFFER));
             attributes["JOINTS_0"] = serde_json::json!(joints_accessor);
             attributes["WEIGHTS_0"] = serde_json::json!(weights_accessor);
         }
@@ -289,7 +309,7 @@ pub fn write_glb(
         for index in &indices {
             index_bytes.extend_from_slice(&index.to_le_bytes());
         }
-        let index_view = bin.push(&index_bytes, Some("ELEMENT_ARRAY_BUFFER"));
+        let index_view = bin.push(&index_bytes, Some(ELEMENT_ARRAY_BUFFER));
         accessors.push(serde_json::json!({
             "bufferView": index_view,
             "componentType": 5125,
@@ -386,7 +406,9 @@ pub fn write_glb(
     if options.animation && frames.len() > 1 {
         let mut samplers: Vec<serde_json::Value> = Vec::new();
         let mut channels: Vec<serde_json::Value> = Vec::new();
-        let times: Vec<f32> = (0..frames.len()).map(|frame| frame as f32 / 30.0).collect();
+        let times: Vec<f32> = (0..frames.len())
+            .map(|frame| frame as f32 / fps.max(1e-6))
+            .collect();
         let time_accessor = push_accessor(&mut bin, &mut accessors, times.clone(), "SCALAR", 5126, None);
         // An animation input accessor must carry its bounds, like POSITION.
         accessors[time_accessor]["min"] = serde_json::json!([0.0]);
@@ -490,7 +512,7 @@ fn push_accessor(
     values: Vec<f32>,
     kind: &str,
     component: u32,
-    target: Option<&str>,
+    target: Option<u32>,
 ) -> usize {
     let view = bin.floats(&values, target);
     let per_item = match kind {
@@ -531,11 +553,11 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 const IDENTITY: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
 
 /// The uniform scale a bind rotation carries, taken from its first column.
-fn column_length(m: &[f32; 9]) -> f32 {
+pub(crate) fn column_length(m: &[f32; 9]) -> f32 {
     (m[0] * m[0] + m[3] * m[3] + m[6] * m[6]).sqrt().max(1e-6)
 }
 
-fn multiply(a: &[f32; 9], b: &[f32; 9]) -> [f32; 9] {
+pub(crate) fn multiply(a: &[f32; 9], b: &[f32; 9]) -> [f32; 9] {
     let mut out = [0.0f32; 9];
     for row in 0..3 {
         for column in 0..3 {
@@ -547,7 +569,7 @@ fn multiply(a: &[f32; 9], b: &[f32; 9]) -> [f32; 9] {
     out
 }
 
-fn transpose(m: &[f32; 9]) -> [f32; 9] {
+pub(crate) fn transpose(m: &[f32; 9]) -> [f32; 9] {
     [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]]
 }
 
@@ -560,7 +582,7 @@ fn turn(m: &[f32; 9], v: [f32; 3]) -> [f32; 3] {
 }
 
 /// Row-major `bind_rot | bind` as a 4×4.
-fn bind_matrix(index: usize, character: &Character) -> [f32; 16] {
+pub(crate) fn bind_matrix(index: usize, character: &Character) -> [f32; 16] {
     let bone = &character.bones[index];
     let m = bone.bind_rot;
     [
@@ -572,12 +594,12 @@ fn bind_matrix(index: usize, character: &Character) -> [f32; 16] {
 }
 
 /// The child's bind matrix expressed in its parent's bind frame.
-fn multiply_local(parent: usize, child: usize, character: &Character) -> [f32; 16] {
+pub(crate) fn multiply_local(parent: usize, child: usize, character: &Character) -> [f32; 16] {
     let inverse = character.bones[parent].inverse_bind;
     multiply4(&inverse, &bind_matrix(child, character))
 }
 
-fn multiply4(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
+pub(crate) fn multiply4(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
     let mut out = [0.0f32; 16];
     for row in 0..4 {
         for column in 0..4 {

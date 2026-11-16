@@ -294,6 +294,12 @@ pub struct CandidateState {
     pub selected: bool,
 }
 
+/// The default for the flags a project written before they existed does not
+/// have: the asset export writes everything.
+fn yes() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct SettingsState {
     pub correction: velomocap_motion::correction::CorrectionSettings,
@@ -305,13 +311,18 @@ pub struct SettingsState {
     pub memory_mode: String,
     pub scale_width: usize,
     pub max_frames: usize,
-    /// `bvh`, `fbx` or `both`.
-    pub export_format: String,
-    /// The rig's slug, as `Rig::from_slug` reads it.
-    pub export_rig: String,
-    pub export_rest_correct: bool,
-    pub export_everyone: bool,
-    pub export_name: String,
+    /// What the character asset export writes: `glb`, `fbx` or `both`.
+    #[serde(default)]
+    pub asset_format: String,
+    #[serde(default = "yes")]
+    pub asset_skin: bool,
+    #[serde(default = "yes")]
+    pub asset_materials: bool,
+    #[serde(default = "yes")]
+    pub asset_animation: bool,
+    /// Where the assets land; empty means beside the project.
+    #[serde(default)]
+    pub asset_folder: String,
     /// How the next save writes geometry. High by default: fine enough to be
     /// invisible, coarse enough to compress.
     #[serde(default)]
@@ -471,16 +482,16 @@ impl Project {
                 memory_mode: memory_mode_slug(app.memory_mode).to_string(),
                 scale_width: app.scale_width,
                 max_frames: app.max_frames,
-                export_format: match app.export_format {
-                    crate::app::ExportFormat::Bvh => "bvh",
-                    crate::app::ExportFormat::Fbx => "fbx",
-                    crate::app::ExportFormat::Both => "both",
+                asset_format: match app.export_format {
+                    crate::app::AssetFormat::Glb => "glb",
+                    crate::app::AssetFormat::Fbx => "fbx",
+                    crate::app::AssetFormat::Both => "both",
                 }
                 .to_string(),
-                export_rig: app.export_rig.slug().to_string(),
-                export_rest_correct: app.export_rest_correct,
-                export_everyone: app.export_everyone,
-                export_name: app.export_name.clone(),
+                asset_skin: app.asset_skin,
+                asset_materials: app.asset_materials,
+                asset_animation: app.asset_animation,
+                asset_folder: app.asset_folder.clone(),
                 storage_precision: app.storage_precision,
                 storage_compression: app.storage_compression,
             },
@@ -839,11 +850,11 @@ mod tests {
                 memory_mode: "hybrid".to_string(),
                 scale_width: 640,
                 max_frames: 0,
-                export_format: "both".to_string(),
-                export_rig: "mixamo".to_string(),
-                export_rest_correct: true,
-                export_everyone: false,
-                export_name: String::new(),
+                asset_format: "both".to_string(),
+                asset_skin: true,
+                asset_materials: true,
+                asset_animation: true,
+                asset_folder: String::new(),
                 storage_precision: Precision::High,
                 storage_compression: Compression::Fast,
             },

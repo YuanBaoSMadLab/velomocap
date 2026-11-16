@@ -6,7 +6,7 @@
 
 use eframe::egui;
 
-use crate::app::{ExportFormat, LockDrag, LockGrab, VeloMocap};
+use crate::app::{AssetFormat, LockDrag, LockGrab, VeloMocap};
 use crate::i18n;
 use crate::capture::CaptureStage;
 use crate::viewport::{self, Scene, ViewMode};
@@ -296,16 +296,15 @@ fn menu_bar(app: &mut VeloMocap, ctx: &egui::Context) {
                         app.import_character_dialog(Some(app.selected));
                     }
                     ui.separator();
-                    // Everything a written file needs — its format, the bone
-                    // vocabulary, the rest correction and the name — lives in
-                    // one export window. As a menu submenu the naming read like
-                    // a property of the document rather than a choice made when
-                    // a file is written.
-                    let can_export = app.video.is_some();
+                    // Everything a written file needs — its format, the parts to
+                    // include, the names and the folder — lives in one export
+                    // window, like a DCC's export dialog. It opens even with
+                    // nothing to export: the window says what is missing, which
+                    // a greyed-out menu item cannot.
                     if ui
-                        .add_enabled(can_export, egui::Button::new(i18n::t("Export motion…")))
+                        .button(i18n::t("Export character assets…"))
                         .on_hover_text(i18n::t(
-                            "Format, skeleton naming, rest correction and file name",
+                            "Mesh, skeleton, materials and animation as .glb or .fbx",
                         ))
                         .clicked()
                     {
@@ -2779,182 +2778,127 @@ fn about_window(app: &mut VeloMocap, ctx: &egui::Context) {
     app.show_help = open;
 }
 
-/// The export window: format, skeleton naming, rest correction, file name.
+/// The export window: what to write, where, and under which name.
 ///
-/// The naming and the rest-correction toggle used to be in the File menu, which
-/// made them look like properties of the open document. They are choices about
-/// the file being written, so they live with the write: one window that shows
-/// exactly which files a click will produce.
+/// Shaped like a DCC's export dialog on purpose: the container and the parts at
+/// the top, one row per character with its own file name, the folder with a
+/// browse button, and one button that writes everything that is ticked.
 fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
     if !app.show_export {
         return;
     }
     let mut open = app.show_export;
-    egui::Window::new(i18n::t("Export motion"))
+    egui::Window::new(i18n::t("Export character assets"))
         .open(&mut open)
-        .default_width(620.0)
-        .min_width(520.0)
+        .default_width(660.0)
+        .min_width(560.0)
         .resizable(true)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(i18n::t("Format")).size(11.0).color(MUTED));
-                for format in [ExportFormat::Bvh, ExportFormat::Fbx, ExportFormat::Both] {
+                for format in [AssetFormat::Glb, AssetFormat::Fbx, AssetFormat::Both] {
                     ui.selectable_value(&mut app.export_format, format, format.label());
                 }
             });
-            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(i18n::t("Skeleton naming")).size(11.0).color(MUTED));
-                egui::ComboBox::from_id_salt("export-rig")
-                    .selected_text(i18n::t(app.export_rig.label()))
-                    .width(206.0)
-                    .show_ui(ui, |ui| {
-                        for rig in velomocap_motion::retarget::Rig::ALL {
-                            if ui
-                                .selectable_label(app.export_rig == rig, i18n::t(rig.label()))
-                                .clicked()
-                            {
-                                app.export_rig = rig;
-                                // Rigs that bind in the canonical T-pose want
-                                // the correction; the ones that do not (Unreal's
-                                // mannequin is an A-pose) do not.
-                                app.export_rest_correct =
-                                    rig != velomocap_motion::retarget::Rig::Biped
-                                        && rig.binds_in_t_pose();
-                            }
-                        }
-                    });
-            })
-            .response
-            .on_hover_text(i18n::t("Write the bones with this rig's names"));
-            ui.add_enabled(
-                app.export_format.bvh(),
-                egui::Checkbox::new(
-                    &mut app.export_rest_correct,
-                    egui::RichText::new(i18n::t("Rest correction")).size(11.0),
-                ),
-            )
-            .on_disabled_hover_text(i18n::t(
-                "An FBX carries its own bind pose, so the correction applies to BVH exports",
-            ))
-            .on_hover_text(i18n::t(
-                "Turn the clip into the canonical T-pose bind, so a Mixamo-class rig plays it exactly",
-            ));
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(i18n::t("File name")).size(11.0).color(MUTED));
-                let hint = app
-                    .video
-                    .as_ref()
-                    .and_then(|video| video.file_stem())
-                    .map(|stem| stem.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                ui.add(
-                    egui::TextEdit::singleline(&mut app.export_name)
-                        .hint_text(hint)
-                        .desired_width(240.0),
-                );
-            });
-            let count = if app.flow.is_empty() {
-                app.people.len()
-            } else {
-                app.flow.len()
-            };
-            if count > 1 {
                 ui.checkbox(
-                    &mut app.export_everyone,
-                    egui::RichText::new(i18n::zh_en(
-                        &format!("全部 {count} 人各写一份"),
-                        &format!("One file per person ({count})"),
-                    ))
-                    .size(11.0),
+                    &mut app.asset_skin,
+                    i18n::zh_en("网格与蒙皮", "Mesh and skin"),
                 );
-            }
-            ui.add_space(4.0);
-            // Show the exact paths, so a multi-person export cannot silently
-            // overwrite the previous person's file.
-            let indices: Vec<usize> = if app.export_everyone && count > 1 {
-                (0..count).collect()
-            } else {
-                vec![app.selected.min(count.saturating_sub(1))]
-            };
-            for index in indices {
-                for (enabled, ext) in [
-                    (app.export_format.bvh(), "bvh"),
-                    (app.export_format.fbx(), "fbx"),
-                ] {
-                    if !enabled {
-                        continue;
-                    }
-                    let path = app
-                        .export_path(ext, index)
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| i18n::t("Open a video first").to_string());
-                    ui.label(egui::RichText::new(path).size(10.0).color(MUTED));
-                }
-            }
-            if app.export_format.fbx() && !app.export_rig.ascii_names() {
-                ui.label(
-                    egui::RichText::new(i18n::t(
-                        "This rig's bone names are not ASCII: the FBX writer cannot hold them, write BVH instead",
-                    ))
-                    .size(10.0)
-                    .color(ERR),
+                ui.checkbox(
+                    &mut app.asset_materials,
+                    i18n::zh_en("材质与贴图", "Materials"),
                 );
-            }
-            ui.add_space(8.0);
-            ui.separator();
-            // Character assets: the model itself, not just its skeleton. One
-            // file per person, carrying mesh, skin weights, materials and the
-            // take, which is what a game engine imports.
-            ui.label(
-                egui::RichText::new(i18n::zh_en("角色资产（网格 + 骨骼 + 动画）", "Character asset (mesh + skeleton + animation)"))
-                    .size(11.5)
-                    .strong(),
-            );
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut app.asset_skin, i18n::zh_en("网格与蒙皮", "Mesh and skin"));
-                ui.checkbox(&mut app.asset_materials, i18n::zh_en("材质与贴图", "Materials"));
                 ui.checkbox(&mut app.asset_animation, i18n::zh_en("动画", "Animation"));
             });
-            let mut shown = 0usize;
-            for index in 0..app.people.len() {
-                let Some(assigned) = app.people[index].character.as_ref() else {
-                    continue;
-                };
-                let name = assigned
-                    .path
-                    .file_stem()
-                    .map(|stem| stem.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                if app.asset_selected.len() <= index {
+            if app.export_format.fbx() && app.asset_materials {
+                ui.label(
+                    egui::RichText::new(i18n::zh_en(
+                        "FBX 的贴图写在 <文件名>_textures/ 里：这个容器装不下图片",
+                        "An FBX keeps its textures in <name>_textures/: the container cannot hold images",
+                    ))
+                    .size(10.0)
+                    .color(MUTED),
+                );
+            }
+            ui.add_space(6.0);
+            ui.separator();
+            let rows: Vec<(usize, String, String)> = app
+                .people
+                .iter()
+                .enumerate()
+                .filter_map(|(index, person)| {
+                    let assigned = person.character.as_ref()?;
+                    let stem = assigned
+                        .path
+                        .file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    Some((index, person.name.clone(), stem))
+                })
+                .collect();
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(i18n::zh_en("角色", "Characters"))
+                        .size(11.0)
+                        .color(MUTED),
+                );
+                if rows.len() > 1 {
+                    let every = rows.iter().all(|(index, _, _)| {
+                        app.asset_selected.get(*index).copied().unwrap_or(true)
+                    });
+                    let mut all = every;
+                    if ui
+                        .checkbox(&mut all, i18n::zh_en("全选", "All"))
+                        .changed()
+                    {
+                        for (index, _, _) in &rows {
+                            if app.asset_selected.len() <= *index {
+                                app.asset_selected.resize(index + 1, true);
+                            }
+                            app.asset_selected[*index] = all;
+                        }
+                    }
+                }
+            });
+            for (index, person, stem) in &rows {
+                if app.asset_selected.len() <= *index {
                     app.asset_selected.resize(index + 1, true);
                 }
-                if app.asset_names.len() <= index {
+                if app.asset_names.len() <= *index {
                     app.asset_names.resize(index + 1, String::new());
                 }
                 ui.horizontal(|ui| {
-                    let mut chosen = app.asset_selected[index];
+                    let mut chosen = app.asset_selected[*index];
                     if ui
-                        .checkbox(&mut chosen, egui::RichText::new(&app.people[index].name).size(11.0))
+                        .checkbox(&mut chosen, egui::RichText::new(person).size(11.0))
                         .changed()
                     {
-                        app.asset_selected[index] = chosen;
+                        app.asset_selected[*index] = chosen;
                     }
-                    ui.label(egui::RichText::new("·").size(10.0).color(MUTED));
                     // The file name is editable here, like a DCC export dialog:
                     // the model keeps its own name until the user types another.
                     ui.add(
-                        egui::TextEdit::singleline(&mut app.asset_names[index])
-                            .hint_text(&name)
-                            .desired_width(220.0)
+                        egui::TextEdit::singleline(&mut app.asset_names[*index])
+                            .hint_text(stem)
+                            .desired_width(200.0)
                             .font(egui::TextStyle::Small),
                     );
-                    ui.label(egui::RichText::new(i18n::zh_en(".glb", ".glb")).size(10.0).color(MUTED));
+                    let mut suffixes: Vec<&str> = Vec::new();
+                    if app.export_format.glb() {
+                        suffixes.push(".glb");
+                    }
+                    if app.export_format.fbx() {
+                        suffixes.push(".fbx");
+                    }
+                    ui.label(
+                        egui::RichText::new(suffixes.join(" / "))
+                            .size(10.0)
+                            .color(MUTED),
+                    );
                 });
-                shown += 1;
             }
-            if shown == 0 {
+            if rows.is_empty() {
                 ui.label(
                     egui::RichText::new(i18n::zh_en(
                         "还没有人物使用导入的模型",
@@ -2964,34 +2908,56 @@ fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
                     .color(MUTED),
                 );
             }
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(i18n::zh_en("输出目录", "Output folder")).size(10.5));
-                let hint = i18n::zh_en("留空＝工程所在目录", "empty = beside the project");
+                let width = (ui.available_width() - 84.0).max(120.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut app.asset_folder)
-                        .hint_text(hint)
-                        .desired_width(ui.available_width() - 8.0),
+                        .hint_text(i18n::zh_en("留空＝工程所在目录", "empty = beside the project"))
+                        .desired_width(width),
                 );
+                if ui
+                    .button(i18n::zh_en("浏览…", "Browse…"))
+                    .on_hover_text(i18n::zh_en("选择输出文件夹", "Pick the output folder"))
+                    .clicked()
+                {
+                    app.browse_asset_folder();
+                }
             });
             if !app.asset_status.is_empty() {
                 ui.label(egui::RichText::new(&app.asset_status).size(10.0).color(OK));
             }
+            if let Some(note) = &app.export_note {
+                ui.label(egui::RichText::new(note).size(10.0).color(MUTED));
+            }
+            ui.add_space(6.0);
+            ui.separator();
             ui.horizontal(|ui| {
-                let can = shown > 0 && app.project_path.is_some();
+                let can = !rows.is_empty() && app.project_path.is_some();
                 if ui
                     .add_enabled(
                         can,
-                        egui::Button::new(i18n::zh_en("导出角色资产 (.glb)", "Export character assets (.glb)")),
+                        egui::Button::new(i18n::zh_en("导出", "Export"))
+                            .min_size(egui::vec2(96.0, 24.0)),
                     )
-                    .on_hover_text(i18n::zh_en(
-                        "每个勾选的角色导出一个 .glb：网格、蒙皮、材质和内嵌贴图、动画",
-                        "One .glb per ticked character: mesh, skin, materials with embedded textures, animation",
-                    ))
                     .clicked()
                 {
                     app.export_asset_models();
                 }
-                if app.project_path.is_none() {
+                if ui.button(i18n::t("Close")).clicked() {
+                    app.show_export = false;
+                }
+                if rows.is_empty() {
+                    ui.label(
+                        egui::RichText::new(i18n::zh_en(
+                            "先在「人物」里给一行指定模型",
+                            "Assign a model to a person first",
+                        ))
+                        .size(10.0)
+                        .color(MUTED),
+                    );
+                } else if app.project_path.is_none() {
                     ui.label(
                         egui::RichText::new(i18n::zh_en("先保存工程", "Save the project first"))
                             .size(10.0)
@@ -2999,29 +2965,8 @@ fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
                     );
                 }
             });
-            ui.add_space(6.0);
-            // The last file written, so a click always leaves a visible result.
-            if let Some(note) = &app.export_note {
-                ui.label(egui::RichText::new(note).size(10.0).color(OK));
-            }
-            ui.horizontal(|ui| {
-                // A disabled button that explains nothing reads as a dead
-                // button; the export reports its own reason instead.
-                let can = app.video.is_some();
-                if ui
-                    .add_enabled(can, egui::Button::new(i18n::t("Export")))
-                    .clicked()
-                {
-                    app.export_now();
-                }
-                if ui.button(i18n::t("Cancel")).clicked() {
-                    app.show_export = false;
-                }
-            });
         });
-    // `export_now` closes the window itself, so keep it closed even though the
-    // local `open` is still true.
-    app.show_export = open && app.show_export;
+    app.show_export = open;
 }
 
 fn guide_window(app: &mut VeloMocap, ctx: &egui::Context) {    if !app.show_guide {
@@ -3042,8 +2987,8 @@ fn guide_window(app: &mut VeloMocap, ctx: &egui::Context) {    if !app.show_guid
                     "3. 拖动时间轴、或按空格回放；下面四条锁定轨可以手绘接触帧。",
                     "4. 右侧「人物」列表点一行 → 替换模型…：导入 VRM / GLB 虚拟人物，",
                     "   用它替换内置身体播放这段动作（选择会存到片段旁边）。",
-                    "5. 文件 → 导出动作…：选 BVH / FBX、骨架命名、rest 校正和文件名，",
-                    "   窗口里会列出这次写出的完整路径。",
+                    "5. 文件 → 导出角色资产…：选 GLB / FBX、勾网格/材质/动画、给每个角色起名，",
+                    "   然后一键写出；FBX 的贴图放在旁边的 <文件名>_textures/ 里。",
                 ]
             } else {
                 &[
@@ -3055,8 +3000,9 @@ fn guide_window(app: &mut VeloMocap, ctx: &egui::Context) {    if !app.show_guid
                     "4. Click a row in the People list on the right → Replace model… to",
                     "   import a VRM / GLB avatar and play this motion on it (the choice",
                     "   is saved next to the clip).",
-                    "5. File → Export motion… picks BVH / FBX, the skeleton naming, the rest",
-                    "   correction and the file name, and lists the exact paths it writes.",
+                    "5. File → Export character assets… picks GLB / FBX and the parts to",
+                    "   include, names each character, and writes them; an FBX keeps its",
+                    "   textures in <name>_textures/ beside it.",
                 ]
             };
             for line in workflow {
