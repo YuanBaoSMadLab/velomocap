@@ -20,6 +20,28 @@ use crate::viewport::{Layers, Orbit, ViewportCache, PERSON_COLOURS};
     /// avatar, and the path is saved beside the clip.
     pub character: Option<AssignedCharacter>,}
 
+/// What a running character-asset export publishes while it writes the files,
+/// so the window can show which one is being written instead of freezing.
+#[derive(Clone, Default)]
+pub struct AssetProgress {
+    pub done: usize,
+    pub total: usize,
+    /// The file being written right now.
+    pub current: String,
+    pub written: usize,
+    pub failures: Vec<String>,
+    pub finished: bool,
+    pub cancelled: bool,
+    /// Where the files go, for the result line.
+    pub folder: String,
+}
+
+/// A character-asset export running on its own thread.
+#[derive(Clone)]
+pub struct AssetJob {
+    pub progress: Arc<Mutex<AssetProgress>>,
+}
+
 /// An imported character bound to one person.
 #[derive(Clone)]
 pub struct AssignedCharacter {
@@ -383,6 +405,8 @@ pub struct VeloMocap {
     pub asset_folder: String,
     /// What the last asset export did, for the panel.
     pub asset_status: String,
+    /// The export running right now, and what it has written so far.
+    pub asset_job: Option<AssetJob>,
     /// Per person, an optional file name for the exported model; empty means the
     /// model's own name.
     pub asset_names: Vec<String>,
@@ -524,6 +548,7 @@ impl VeloMocap {
             show_guide: false,
             show_settings: false,
             show_about: false,
+            asset_job: None,
             show_export: false,
             character_rest: None,
             character_rest_positions: None,
@@ -828,10 +853,18 @@ impl VeloMocap {
         };
     }
 
-    /// Write every ticked person's model as its own animated asset (`.glb`,
-    /// `.fbx`, or both): mesh with skin weights, materials with their textures,
-    /// and the take the viewport is playing.
+    /// Write every ticked person's model as its own animated `.glb`: mesh with
+    /// skin weights, materials with their textures, and the take the viewport is
+    /// playing.
+    ///
+    /// The writes happen on a worker thread: one avatar can take several
+    /// seconds, and a frozen window with no sign of which file is being written
+    /// is worse than a slow one. [`AssetProgress`] is what the export window
+    /// draws while it runs.
     pub fn export_asset_models(&mut self) {
+        if self.asset_job.is_some() {
+            return;
+        }
         let Some(project) = self.project_path.clone() else {
             self.asset_status = i18n::zh_en(
                 "先保存工程文件，再导出角色资产",
@@ -859,10 +892,7 @@ impl VeloMocap {
         };
         let model = self.smplh_model.display().to_string();
         let fps = self.current_fps() as f32;
-        let mut written = 0usize;
-        let mut failures: Vec<String> = Vec::new();
-        // Collect the paths first: the loop must not hold the people list while
-        // reporting an error through `self`.
+        // Collect the work first: the worker must not touch the people list.
         let wanted: Vec<(usize, PathBuf)> = self
             .people
             .iter()
@@ -875,44 +905,132 @@ impl VeloMocap {
                 Some((index, assigned.path.clone()))
             })
             .collect();
-        for (index, path) in wanted {
-            // A name typed in the panel wins; otherwise the model keeps its own.
-            let typed = self
-                .asset_names
-                .get(index)
-                .map(|name| name.trim().to_string())
-                .unwrap_or_default();
-            let stem = if typed.is_empty() {
-                path.file_stem()
-                    .map(|stem| stem.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| format!("person{}", index + 1))
+        if wanted.is_empty() {
+            self.asset_status = i18n::zh_en(
+                "没有勾选任何角色",
+                "No character is ticked",
+            )
+            .to_string();
+            return;
+        }
+        let jobs: Vec<(String, String, String)> = wanted
+            .iter()
+            .map(|(index, path)| {
+                // A name typed in the panel wins; otherwise the model keeps its
+                // own.
+                let typed = self
+                    .asset_names
+                    .get(*index)
+                    .map(|name| name.trim().to_string())
+                    .unwrap_or_default();
+                let stem = if typed.is_empty() {
+                    path.file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| format!("person{}", index + 1))
+                } else {
+                    typed
+                };
+                (
+                    path.display().to_string(),
+                    folder.join(format!("{stem}.glb")).display().to_string(),
+                    stem,
+                )
+            })
+            .collect();
+        let progress = Arc::new(Mutex::new(AssetProgress {
+            total: jobs.len(),
+            folder: folder.display().to_string(),
+            ..AssetProgress::default()
+        }));
+        let shared = Arc::clone(&progress);
+        let project = project.display().to_string();
+        let thread = std::thread::Builder::new()
+            .name("asset-export".into())
+            .spawn(move || {
+                for (character, out, stem) in jobs {
+                    {
+                        let mut state = shared.lock().unwrap();
+                        if state.cancelled {
+                            break;
+                        }
+                        state.current = stem.clone();
+                    }
+                    let result = crate::probe::export_animation(
+                        &model, &character, &project, &out, options, fps,
+                    );
+                    let mut state = shared.lock().unwrap();
+                    match result {
+                        Ok(()) => state.written += 1,
+                        Err(error) => state.failures.push(format!("{stem}: {error:#}")),
+                    }
+                    state.done += 1;
+                }
+                let mut state = shared.lock().unwrap();
+                state.finished = true;
+                state.current.clear();
+            });
+        match thread {
+            Ok(_) => {
+                self.asset_job = Some(AssetJob { progress });
+                self.asset_status.clear();
+            }
+            Err(error) => self.asset_status = format!("{error}"),
+        }
+    }
+
+    /// Fold a finished export job back into the panel, and keep the window
+    /// repainting while it runs.
+    pub fn poll_asset_export(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.asset_job else { return };
+        let status = {
+            let state = job.progress.lock().unwrap();
+            if !state.finished {
+                None
             } else {
-                typed
-            };
-            let out = folder.join(format!("{stem}.glb"));
-            let result = crate::probe::export_animation(
-                &model,
-                &path.display().to_string(),
-                &project.display().to_string(),
-                &out.display().to_string(),
-                options,
-                fps,
-            );
-            match result {
-                Ok(()) => written += 1,
-                Err(error) => failures.push(format!("{stem}: {error:#}")),
+                let failures = state.failures.clone();
+                let written = state.written;
+                let total = state.total;
+                let cancelled = state.cancelled;
+                Some((written, total, failures, cancelled))
+            }
+        };
+        match status {
+            None => ctx.request_repaint_after(Duration::from_millis(120)),
+            Some((written, total, failures, cancelled)) => {
+                for failure in failures {
+                    self.log(format!("asset: {failure}"));
+                }
+                self.asset_status = if cancelled {
+                    i18n::zh_en(
+                        &format!("已取消（已写出 {written}/{total}）"),
+                        &format!("Cancelled after {written} of {total}"),
+                    )
+                } else {
+                    i18n::zh_en(
+                        &format!("已导出 {written}/{total}"),
+                        &format!("Wrote {written} of {total}"),
+                    )
+                };
+                let folder = {
+                    let state = self.asset_job.as_ref().unwrap();
+                    let state = state.progress.lock().unwrap();
+                    state.folder.clone()
+                };
+                if !folder.is_empty() && written > 0 {
+                    self.asset_status.push_str(&format!(" → {folder}"));
+                }
+                self.asset_job = None;
             }
         }
-        for failure in failures {
-            self.log(format!("asset: {failure}"));
-        }
-        self.asset_status = format!(
-            "{} {} → {}",
-            i18n::zh_en("已导出", "wrote"),
-            written,
-            folder.display()
-        );
     }
+
+    /// Stop the running export after the file it is writing.
+    pub fn cancel_asset_export(&mut self) {
+        if let Some(job) = &self.asset_job {
+            job.progress.lock().unwrap().cancelled = true;
+        }
+    }
+
 
     /// Pick the folder the assets land in. A path field is fine for a path the
     /// user has in the clipboard; a DCC export dialog browses.
@@ -2756,6 +2874,7 @@ impl eframe::App for VeloMocap {
         self.poll_detection(ctx);
         self.poll_capture(ctx);
         self.poll_stream(ctx);
+        self.poll_asset_export(ctx);
         self.shortcuts(ctx);
         self.tick(ctx);
         ui::draw(self, ctx);

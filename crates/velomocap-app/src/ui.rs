@@ -3170,14 +3170,65 @@ fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
             if let Some(note) = &app.export_note {
                 ui.label(egui::RichText::new(note).size(10.0).color(MUTED));
             }
+            // While the worker writes, show which file is being written and how
+            // far along the run is: exporting two characters used to be two
+            // silent seconds with nothing on screen.
+            if let Some(job) = &app.asset_job {
+                let state = job.progress.lock().unwrap();
+                let fraction = if state.total == 0 {
+                    0.0
+                } else {
+                    (state.done as f32 / state.total as f32).clamp(0.0, 1.0)
+                };
+                ui.add_space(6.0);
+                let label = if state.cancelled {
+                    i18n::zh_en("正在停止…", "Stopping…").to_string()
+                } else {
+                    format!(
+                        "{}/{}  {}",
+                        (state.done + 1).min(state.total),
+                        state.total,
+                        state.current
+                    )
+                };
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .desired_height(16.0)
+                        .show_percentage()
+                        .text(egui::RichText::new(label).size(10.0)),
+                );
+                ui.label(
+                    egui::RichText::new(i18n::zh_en(
+                        "写文件时窗口不会卡住，可以继续用",
+                        "The window stays live while the files are written",
+                    ))
+                    .size(9.5)
+                    .color(MUTED),
+                );
+            }
             ui.add_space(8.0);
             ui.separator();
             ui.horizontal(|ui| {
-                let can = !rows.is_empty() && app.project_path.is_some();
+                let running = app.asset_job.is_some();
+                let can = !rows.is_empty() && app.project_path.is_some() && !running;
                 if primary_button(ui, i18n::zh_en("导出", "Export"), can, 104.0) {
                     app.export_asset_models();
                 }
+                if running {
+                    if ui
+                        .button(i18n::zh_en("取消", "Cancel"))
+                        .on_hover_text(i18n::zh_en(
+                            "写完当前这个文件后停止",
+                            "Stop after the file being written now",
+                        ))
+                        .clicked()
+                    {
+                        app.cancel_asset_export();
+                    }
+                }
                 if ui.button(i18n::t("Close")).clicked() {
+                    // Closing does not stop a running export: it keeps going in
+                    // the background and the status line reports the result.
                     app.show_export = false;
                 }
                 if rows.is_empty() {
@@ -3198,7 +3249,9 @@ fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
                 }
             });
         });
-    app.show_export = open;
+    // A button in the window may have set `show_export` to false; without the
+    // second half that assignment is undone here and Close does nothing.
+    app.show_export = open && app.show_export;
 }
 
 /// Settings that belong to the application rather than to a clip or a panel.
