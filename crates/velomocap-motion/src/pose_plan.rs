@@ -49,83 +49,209 @@ pub struct Frame {
     pub low: [f64; 2],
     /// Airborne: no support at all, so nothing may be lifted for.
     pub flight: bool,
+    /// The knee geometry of each leg (`anatomical::knee_plane`), which is what
+    /// turns a root height into the knee angle the solver will produce.
+    pub knee: [Knee; 2],
+}
+
+/// One leg's bend-plane geometry and how fast the source moved through it.
+#[derive(Clone, Copy, Debug)]
+pub struct Knee {
+    /// `anatomical::knee_plane`'s constant term, metres².
+    pub constant: f64,
+    /// Its bend radius, metres.
+    pub radius: f64,
+    /// Its phase, radians: where the source knee already is in the plane.
+    pub phase: f64,
+    /// Source knee angular speed, radians per second: a leg that is already
+    /// turning keeps its motion, a leg that is still must not acquire any.
+    pub speed: f64,
 }
 
 const ROOT_SIGMA: f64 = 0.01;
 const ROOT_ACCELERATION_SIGMA: f64 = 0.0004;
-const REACH_SIGMA: f64 = 0.0005;
 const ROOT_LIMIT: f64 = 0.02;
+/// `contact_temporal_root.CONFIG`: pose, velocity, acceleration and the shared
+/// temporal weight. The pose term is the predicted knee angle; the two difference
+/// terms are what keep the plan from buying height with a knee twitch.
+const POSE_SIGMA: f64 = 0.175;
+const VELOCITY_SIGMA: f64 = 0.025;
+const ACCELERATION_SIGMA: f64 = 0.004;
+const TEMPORAL_WEIGHT: f64 = 0.5;
+/// The source speed at which the "static" weight has fallen by half: 20 deg/s.
+const STILL_DEG_PER_S: f64 = 20.0;
+
+/// The knee angle a root shift implies, for one leg.
+///
+/// `contact_temporal_root.optimise`'s `angle`, without its mask: the bend plane's
+/// phase blended out where the source knee is nearly straight, plus the arc
+/// cosine of the reach triangle. `horizontal` is the squared XZ hip-to-target
+/// distance, `over` the hip's height above the target at `base`, `straight` the
+/// 0..1 extension support, and `shift` how far the root moves from `base`.
+pub fn knee_angle(knee: &Knee, horizontal: f64, over: f64, straight: f64, shift: f64) -> f64 {
+    let vertical = over + shift;
+    let ratio = (horizontal + vertical * vertical - knee.constant) / (2.0 * knee.radius);
+    let bent = ratio.clamp(-0.999_999_999, 0.999_999_999).acos();
+    knee.phase * (1.0 - straight) + bent
+}
 
 /// Plan the root height. Returns one height per frame.
-pub fn plan(frames: &[Frame], floor: f64, fps: f64, _flat: bool) -> Vec<f64> {
+pub fn plan(frames: &[Frame], _floor: f64, fps: f64, _flat: bool) -> Vec<f64> {
     let count = frames.len();
     if count < 3 {
         return frames.iter().map(|frame| frame.base).collect();
     }
-    let rate = fps.max(1.0) / 30.0;
+    let fps = fps.max(1.0);
+    let rate = fps / 30.0;
     let base: Vec<f64> = frames.iter().map(|frame| frame.base).collect();
-    let start = base.clone();
-    // Every frame stays inside 2 cm of the settled root, which is also where the
-    // reference's `lo`/`hi` come from. A frame with a planted foot additionally
-    // may not go below the floor: the plan exists to satisfy reach bounds, not to
-    // sink a sole into the ground, and the floor is already satisfied at `base`.
-    let lower: Vec<f64> = base
-        .iter()
-        .enumerate()
-        .map(|(frame, value)| {
-            let bound = value - ROOT_LIMIT;
-            if frames[frame].active[0] || frames[frame].active[1] {
-                bound.max(floor - frames[frame].lowest)
-            } else {
-                bound
+
+    // Per frame: the squared horizontal hip-to-target distance, and the hip's
+    // height over the target. Both are what the knee-angle prediction needs.
+    let mut horizontal = vec![[0.0f64; 2]; count];
+    let mut over = vec![[0.0f64; 2]; count];
+    // Per frame: the root shift each planted leg's reach allows, most restrictive
+    // wins. `contact_temporal_root`:
+    //   upper = target_y + sqrt((reach·.9995)² − horizontal) − hip_y
+    //   lower = target_y + sqrt((min·1.0005)² − horizontal) − hip_y
+    let mut lowest_shift = vec![f64::NEG_INFINITY; count];
+    let mut highest_shift = vec![f64::INFINITY; count];
+    for frame in 0..count {
+        let source = &frames[frame];
+        for leg in 0..2 {
+            let hip = source.hips[leg];
+            let target = source.ankles[leg];
+            horizontal[frame][leg] = (hip[0] - target[0]).powi(2) + (hip[2] - target[2]).powi(2);
+            over[frame][leg] = hip[1] - target[1];
+            if !source.active[leg] || over[frame][leg] <= 0.0 {
+                continue;
             }
-        })
-        .collect();
-    let upper: Vec<f64> = base.iter().map(|value| value + ROOT_LIMIT).collect();
+            let square = horizontal[frame][leg];
+            let upper = target[1]
+                + ((source.high[leg] * 0.9995).powi(2) - square).max(0.0).sqrt()
+                - hip[1];
+            let lower = target[1]
+                + ((source.low[leg] * 1.0005).powi(2) - square).max(0.0).sqrt()
+                - hip[1];
+            lowest_shift[frame] = lowest_shift[frame].max(lower);
+            highest_shift[frame] = highest_shift[frame].min(upper);
+        }
+    }
+    
+    let mut lower = vec![0.0f64; count];
+    let mut upper = vec![0.0f64; count];
+    for frame in 0..count {
+        // The shifts are relative to the settled root; the plan works in absolute
+        // heights, so the reach bounds move with `base` too.
+        let (low, high) = (
+            (base[frame] - ROOT_LIMIT).max(base[frame] + lowest_shift[frame]),
+            (base[frame] + ROOT_LIMIT).min(base[frame] + highest_shift[frame]),
+        );
+        if !lowest_shift[frame].is_finite() || !highest_shift[frame].is_finite() || high - low < 1e-7
+        {
+            lower[frame] = base[frame] - 1e-10;
+            upper[frame] = base[frame] + 1e-10;
+        } else {
+            lower[frame] = low;
+            upper[frame] = high;
+        }
+    }
+
+    // `mask`: a leg the plan is allowed to bend, i.e. one that is planted with
+    // its hip above the target.
+    let mask = |frame: usize, leg: usize| -> f64 {
+        if frames[frame].active[leg] && over[frame][leg] > 0.0 {
+            1.0
+        } else {
+            0.0
+        }
+    };
+    // `static_weight = .25 + .75/(1 + (speed/20°)²)`: a knee that is already
+    // moving is allowed to keep moving; a still one is what the plan smooths.
+    let still = |frame: usize, leg: usize| -> f64 {
+        let speed = frames[frame].knee[leg].speed;
+        0.25 + 0.75 / (1.0 + (speed / STILL_DEG_PER_S.to_radians()).powi(2))
+    };
+    // Near-collinear knees (|phase| under 5°) are counted as straight, which is
+    // where the arc-cosine is insensitive and chasing it would be noise.
+    let straight = |frame: usize, leg: usize| -> f64 {
+        let phase = frames[frame].knee[leg].phase.abs();
+        ((5.0f64.to_radians() - phase) / 4.0f64.to_radians()).clamp(0.0, 1.0)
+    };
+    // The knee angle a root height implies (`contact_temporal_root`'s `angle`).
+    let angle = |frame: usize, leg: usize, height: f64| -> f64 {
+        knee_angle(
+            &frames[frame].knee[leg],
+            horizontal[frame][leg],
+            over[frame][leg],
+            straight(frame, leg),
+            height - frames[frame].base,
+        ) * mask(frame, leg)
+    };
 
     let residual = |x: &[f64]| -> Vec<f64> {
-        let mut out: Vec<f64> = Vec::with_capacity(count * 6);
-        // Stay near the settled root.
+        let mut out: Vec<f64> = Vec::with_capacity(count * 8);
+        // 1. Stay near the settled root.
         for frame in 0..count {
             out.push((x[frame] - base[frame]) / ROOT_SIGMA);
         }
-        // A planted leg may neither over-extend nor over-bend.
+        // 2. No knee motion the source did not have: pose, then its first and
+        //    second differences, both faded where the source knee was moving.
+        let angles: Vec<[f64; 2]> = (0..count)
+            .map(|frame| [angle(frame, 0, x[frame]), angle(frame, 1, x[frame])])
+            .collect();
         for frame in 0..count {
-            let source = &frames[frame];
             for leg in 0..2 {
-                if !source.active[leg] {
-                    continue;
+                if mask(frame, leg) > 0.0 {
+                    out.push(angles[frame][leg] / POSE_SIGMA);
                 }
-                let hip = [
-                    source.hips[leg][0],
-                    source.hips[leg][1] + (x[frame] - source.base),
-                    source.hips[leg][2],
-                ];
-                let target = source.ankles[leg];
-                let reach = ((target[0] - hip[0]).powi(2)
-                    + (target[1] - hip[1]).powi(2)
-                    + (target[2] - hip[2]).powi(2))
-                .sqrt();
-                let over = (reach - source.high[leg] * 0.9995).max(0.0);
-                let under = (reach - source.low[leg] * 1.0005).min(0.0);
-                out.push((over + under) / REACH_SIGMA);
             }
         }
-        // No root kick.
+        for frame in 0..count - 1 {
+            for leg in 0..2 {
+                let weight = mask(frame, leg).min(mask(frame + 1, leg))
+                    * still(frame, leg).min(still(frame + 1, leg)).sqrt()
+                    * rate
+                    * TEMPORAL_WEIGHT
+                    / VELOCITY_SIGMA;
+                out.push((angles[frame + 1][leg] - angles[frame][leg]) * weight);
+            }
+        }
+        for frame in 0..count - 2 {
+            for leg in 0..2 {
+                let common = mask(frame, leg)
+                    .min(mask(frame + 1, leg))
+                    .min(mask(frame + 2, leg));
+                let common_still = still(frame, leg)
+                    .min(still(frame + 1, leg))
+                    .min(still(frame + 2, leg));
+                let weight = common
+                    * common_still.sqrt()
+                    * rate
+                    * rate
+                    * TEMPORAL_WEIGHT
+                    / ACCELERATION_SIGMA;
+                let second = angles[frame + 2][leg] - 2.0 * angles[frame + 1][leg] + angles[frame][leg];
+                out.push(second * weight);
+            }
+        }
+        // 3. No root kick.
         for frame in 0..count - 2 {
             let second = x[frame + 2] - 2.0 * x[frame + 1] + x[frame];
             out.push(second * rate * rate / ROOT_ACCELERATION_SIGMA);
         }
-        // A free foot that would clip the floor is *the foot's* problem: the leg
-        // solve lifts it (`correction::swing_lift`, the reference's guard). This
-        // plan used to lift the whole body for it, which also moved the planted
-        // foot and broke its contact. `lowest` is kept in the frame struct because
-        // a future pass may want it, but the root does not react to it.
         out
     };
 
     let solution = solver::minimise(
-        &start,
+        // The reference's trust region keeps the iterate feasible; this solver
+        // projects its steps, so the initial guess has to start inside the box or
+        // a frame whose reach forbids its settled height stays put. Clamping the
+        // start is what makes a hard bound hard.
+        &base
+            .iter()
+            .enumerate()
+            .map(|(frame, value)| value.clamp(lower[frame] + 1e-12, upper[frame] - 1e-12))
+            .collect::<Vec<f64>>(),
         &lower,
         &upper,
         residual,
@@ -162,7 +288,68 @@ mod tests {
             high: [0.95, 0.95],
             low: [0.20, 0.20],
             flight: false,
+            // A leg whose source knee already sits 30° into its bend plane, which
+            // is the configuration the plan reads as "no added correction": the
+            // predicted flex at `base` cancels the phase, so `angle(base) == 0`.
+            // Getting this wrong makes the plan chase an angle the source never
+            // had, which moves the root for no reason.
+            knee: [consistent_knee(), consistent_knee()],
         }
+    }
+
+    /// The geometry of a leg in its source configuration, hips 0.85 m over target.
+    fn consistent_knee() -> Knee {
+        let radius = 0.02f64;
+        let over = 0.85f64;
+        let phase = -30.0f64.to_radians();
+        Knee {
+            // So `arccos((over² − constant)/(2·radius))` is `−phase`: the flex the
+            // solver would add is exactly zero, which is what "no correction" means.
+            constant: over * over - 2.0 * radius * phase.abs().cos(),
+            radius,
+            phase,
+            speed: 0.0,
+        }
+    }
+
+    /// The angle the plan prices: 90° when the hip is where the geometry expects
+    /// it, larger as the root comes down, and blended toward the bend-plane phase
+    /// where the source knee is nearly straight.
+    #[test]
+    fn the_knee_angle_grows_as_the_root_lowers() {
+        let knee = Knee {
+            constant: 0.85 * 0.85,
+            radius: 0.02,
+            phase: 0.0,
+            speed: 0.0,
+        };
+        let at_base = knee_angle(&knee, 0.0, 0.85, 0.0, 0.0);
+        assert!((at_base - std::f64::consts::FRAC_PI_2).abs() < 1e-6, "{at_base}");
+        let lowered = knee_angle(&knee, 0.0, 0.85, 0.0, -0.02);
+        assert!(lowered > at_base + 0.3, "lowering must bend the knee: {lowered:.3}");
+        let raised = knee_angle(&knee, 0.0, 0.85, 0.0, 0.02);
+        assert!(raised < at_base, "raising must straighten it: {raised:.3}");
+        // A perfectly straight source knee drops its own phase everywhere.
+        let phased = Knee {
+            constant: 0.85 * 0.85,
+            radius: 0.02,
+            phase: 0.5,
+            speed: 0.0,
+        };
+        let blended = knee_angle(&phased, 0.0, 0.85, 0.5, -0.02);
+        let pure = knee_angle(&phased, 0.0, 0.85, 1.0, -0.02);
+        let only_bend = knee_angle(
+            &Knee {
+                phase: 0.0,
+                ..phased
+            },
+            0.0,
+            0.85,
+            1.0,
+            -0.02,
+        );
+        assert!((pure - only_bend).abs() < 1e-9, "the phase must be dropped");
+        assert!(blended > pure + 0.2, "half the phase must remain: {blended:.3}");
     }
 
     /// A leg asked to stretch past its reach makes the plan lower the root, and
@@ -243,6 +430,10 @@ mod tests {
         }
     }
 }
+
+
+
+
 
 
 

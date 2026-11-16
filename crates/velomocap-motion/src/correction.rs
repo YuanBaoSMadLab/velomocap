@@ -235,6 +235,11 @@ pub struct CorrectionReport {
     pub jitter_before: f32,
     /// Jitter after the pass.
     pub jitter_after: f32,
+    /// The root's own second difference (99th percentile) before the pass, in
+    /// metres: the pelvis bob the temporal root plan is aimed at.
+    pub root_jitter_before: f32,
+    /// The same after the pass.
+    pub root_jitter_after: f32,
     /// The pass was rolled back because it made the clip jumpier.
     pub skipped: bool,
     /// Which of the three quality conditions tripped that rollback.
@@ -297,6 +302,13 @@ impl CorrectionReport {
             self.jitter_before * 1000.0,
             self.jitter_after * 1000.0
         );
+        if self.root_jitter_before > 0.0 {
+            out.push_str(&format!(
+                " (root {:.1}->{:.1} mm)",
+                self.root_jitter_before * 1000.0,
+                self.root_jitter_after * 1000.0
+            ));
+        }
         if self.skipped {
             out.push_str(&format!(
                 " (rolled back by {}: float {:.1}->{:.1} mm, slide {:.2}->{:.2} cm/frame, jitter {:.1}->{:.1} mm)",
@@ -460,6 +472,8 @@ pub fn apply_with_locks(
     let after = quality(&clip.skeletons, settings.floor);
     report.jitter_before = before.jitter;
     report.jitter_after = after.jitter;
+    report.root_jitter_before = before.root;
+    report.root_jitter_after = after.root;
     // The gate reads the **sole** metrics, the ones a viewer sees: a pass that
     // lifts a planted foot off the plane or lets it skate is worse than the
     // network's own motion.
@@ -516,6 +530,9 @@ struct Quality {
     float: f32,
     slide: f32,
     jitter: f32,
+    /// 99th percentile of the **root's** second difference, in metres: how much
+    /// the pelvis itself bobs, which is what the temporal root plan is for.
+    root: f32,
 }
 
 fn quality(skeletons: &[Skeleton], floor: f32) -> Quality {
@@ -525,6 +542,7 @@ fn quality(skeletons: &[Skeleton], floor: f32) -> Quality {
             float: 0.0,
             slide: 0.0,
             jitter: 0.0,
+            root: 0.0,
         };
     }
     let mut float = 0.0f32;
@@ -554,10 +572,37 @@ fn quality(skeletons: &[Skeleton], floor: f32) -> Quality {
         float: float / count as f32,
         slide: slide / count as f32,
         jitter: jitter_score(skeletons),
+        root: root_jitter(skeletons),
     }
 }
 
-/// 99th percentile of the per-joint second difference of the joint positions,
+/// 99th percentile of the root's second difference, in metres.
+///
+/// The pelvis is what a viewer sees bob: contact_temporal_root's plan exists to
+/// trade root height against the knee angle, and this is the number that says
+/// whether it bought smoothness.
+fn root_jitter(skeletons: &[Skeleton]) -> f32 {
+    if skeletons.len() < 3 {
+        return 0.0;
+    }
+    let mut values = Vec::with_capacity(skeletons.len() - 2);
+    for frame in 1..skeletons.len() - 1 {
+        let previous = joint(&skeletons[frame - 1], 0);
+        let current = joint(&skeletons[frame], 0);
+        let next = joint(&skeletons[frame + 1], 0);
+        let mut sum = 0.0f32;
+        for axis in 0..3 {
+            let second = previous[axis] - 2.0 * current[axis] + next[axis];
+            sum += second * second;
+        }
+        values.push(sum.sqrt());
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let index = ((values.len() as f32 * 0.99) as usize).min(values.len() - 1);
+    values[index]
+}
+
+
 /// in metres. This is the number that tracks what reads as twitching.
 ///
 /// Exposed because the report quotes it and a dump has to be checkable against
@@ -934,6 +979,10 @@ fn pose_plan_window(
     let rest = body.rest_joints(&clip.betas);
     let legs = [(1usize, 4usize, 7usize), (2, 5, 8)];
     let mut frames = Vec::with_capacity(count);
+    // The knee's own rotation per frame and leg: its bend plane gives the plan the
+    // angle a root height would cost, its change over time gives the "static"
+    // weight (`contact_temporal_root`'s `static_weight`).
+    let mut knees: Vec<[[f64; 9]; 2]> = Vec::with_capacity(count);
     for frame in 0..count {
         let (world, positions) = crate::anatomical::forward(body, &clip.poses[frame], &rest);
         let row = &detection.rows[frame];
@@ -944,6 +993,14 @@ fn pose_plan_window(
         let active = foot.support[frame];
         let mut high = [0.0f64; 2];
         let mut low = [0.0f64; 2];
+        let mut knee_planes = [crate::anatomical::KneePlane {
+            constant: 0.0,
+            radius: 1e-9,
+            phase: 0.0,
+        }; 2];
+        let mut knee_rotations = [[
+            1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0,
+        ]; 2];
         for (leg, (hip, knee, ankle)) in legs.iter().enumerate() {
             let knee_local = match body.parents[*knee] {
                 parent if parent >= 0 => math::tmul3(&world[parent as usize], &world[*knee]),
@@ -951,7 +1008,10 @@ fn pose_plan_window(
             };
             high[leg] = crate::anatomical::reach(&rest, *hip, *knee, *ankle, &knee_local);
             low[leg] = crate::anatomical::minimum_reach(&rest, *hip, *knee, *ankle, &knee_local);
+            knee_planes[leg] = crate::anatomical::knee_plane(&rest, *hip, *knee, *ankle, &knee_local);
+            knee_rotations[leg] = knee_local;
         }
+        knees.push(knee_rotations);
         frames.push(crate::pose_plan::Frame {
             base: clip.poses[frame].translation[1] as f64,
             hips: [positions[1], positions[2]],
@@ -972,6 +1032,19 @@ fn pose_plan_window(
             high,
             low,
             flight: detection.prepared.flight.get(frame).copied().unwrap_or(false),
+            knee: [0, 1].map(|leg| crate::pose_plan::Knee {
+                constant: knee_planes[leg].constant,
+                radius: knee_planes[leg].radius,
+                phase: knee_planes[leg].phase,
+                speed: if frame > 0 {
+                    crate::anatomical::rotation_angle(
+                        &knee_rotations[leg],
+                        &knees[frame - 1][leg],
+                    ) * clip.fps.max(1.0) as f64
+                } else {
+                    0.0
+                },
+            }),
         });
     }
     let planned = crate::pose_plan::plan(
@@ -3470,5 +3543,7 @@ mod tests {
         assert!(drift < 1e-5, "hips drifted {drift}");
     }
 }
+
+
 
 

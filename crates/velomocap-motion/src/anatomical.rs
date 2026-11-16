@@ -96,6 +96,55 @@ fn plane(upper: [f64; 3], lower: [f64; 3], axis: [f64; 3], knee_local: &[f64; 9]
     }
 }
 
+/// The knee-angle geometry the temporal root plan reads, for one leg on one frame.
+///
+/// `contact_temporal_root.optimise` predicts the knee angle a root height implies
+/// and penalises its motion, which is what keeps a planted foot from being asked
+/// for a straightening that does not exist. The angle closes form:
+///
+/// ```text
+/// angle(y) = phase·(1 − straight) + arccos((horizontal + (hip_y + y − target_y)² − constant) / (2·radius))
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct KneePlane {
+    /// `|upper|² + |lower|² + 2·(upper·axis)·dot` from the rest pose.
+    pub constant: f64,
+    /// `hypot(a, b)`, floored so the arc cosine never divides by zero.
+    pub radius: f64,
+    /// `atan2(b, a)`: where the knee already is in its own bend plane.
+    pub phase: f64,
+}
+
+pub fn knee_plane(
+    rest: &[f32],
+    hip: usize,
+    knee: usize,
+    ankle: usize,
+    knee_local: &[f64; 9],
+) -> KneePlane {
+    let upper = sub(joint3(rest, knee), joint3(rest, hip));
+    let lower = sub(joint3(rest, ankle), joint3(rest, knee));
+    let axis = knee_axis(upper);
+    let plane = plane(upper, lower, axis, knee_local);
+    KneePlane {
+        constant: dot(upper, upper) + dot(lower, lower) + 2.0 * plane.constant,
+        radius: plane.radius.max(1e-9),
+        phase: plane.b.atan2(plane.a),
+    }
+}
+
+/// The angle between two rotations, in radians: `|log(aᵀb)|`.
+///
+/// `tr(aᵀb)` is the elementwise dot of the two row-major matrices, and
+/// `cos θ = (tr − 1)/2` for a proper rotation.
+pub fn rotation_angle(a: &[f64; 9], b: &[f64; 9]) -> f64 {
+    let mut dot = 0.0f64;
+    for index in 0..9 {
+        dot += a[index] * b[index];
+    }
+    ((dot - 1.0) * 0.5).clamp(-1.0, 1.0).acos()
+}
+
 /// Maximum physical reach of one leg for the given (world) knee rotation.
 pub fn reach(rest: &[f32], hip: usize, knee: usize, ankle: usize, knee_local: &[f64; 9]) -> f64 {
     let upper = sub(joint3(rest, knee), joint3(rest, hip));
@@ -556,3 +605,4 @@ mod tests {
         assert!(max >= actual - 1e-6, "max {max:.3} < actual {actual:.3}");
     }
 }
+
