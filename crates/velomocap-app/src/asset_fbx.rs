@@ -100,7 +100,15 @@ fn string(name: &str, value: &str) -> Node {
     Node::with(name, vec![Prop::Str(value.to_string())])
 }
 
+/// An `int` property. FBX has both `I` (32-bit) and `L` (64-bit), and the DCCs
+/// use the narrow one for versions and counts — the FBX SDK reads those with
+/// `GetInt()`, which is happier with the type it exported itself.
 fn int(name: &str, value: i64) -> Node {
+    Node::with(name, vec![Prop::I32(value as i32)])
+}
+
+/// Object ids are 64-bit in every file Maya and Blender write.
+fn oid(name: &str, value: i64) -> Node {
     Node::with(name, vec![Prop::I64(value)])
 }
 
@@ -221,6 +229,7 @@ fn local_bind(index: usize, character: &Character) -> [f32; 16] {
 struct Counts {
     model: i64,
     geometry: i64,
+    node_attribute: i64,
     material: i64,
     texture: i64,
     deformer: i64,
@@ -234,6 +243,7 @@ struct Counts {
 impl Counts {
     fn total(&self) -> i64 {
         1 + self.model
+            + self.node_attribute
             + self.geometry
             + self.material
             + self.texture
@@ -249,6 +259,7 @@ impl Counts {
         let mut types: Vec<(&'static str, i64)> = vec![
             ("GlobalSettings", 1),
             ("Model", self.model),
+            ("NodeAttribute", self.node_attribute),
             ("Geometry", self.geometry),
             ("Material", self.material),
             ("Texture", self.texture),
@@ -391,10 +402,13 @@ pub fn write_fbx(
             let path = directory.join(&file);
             std::fs::write(&path, png_bytes(texture)?)
                 .with_context(|| format!("writing {}", path.display()))?;
-            let absolute = path
-                .canonicalize()
+            // `canonicalize` returns `\\?\C:\…` on Windows, which no importer
+            // resolves; the absolute path as the user sees it is what the file
+            // has to name.
+            let absolute = std::path::absolute(&path)
                 .unwrap_or_else(|_| path.clone())
                 .to_string_lossy()
+                .trim_start_matches("\\\\?\\")
                 .replace('\\', "/");
             textures.push((absolute, file));
         }
@@ -441,7 +455,7 @@ pub fn write_fbx(
     let normals = vertex_normals(character);
     let normal_values: Vec<f64> = normals.iter().map(|value| *value as f64).collect();
     geometry = geometry.child(
-        Node::with("LayerElementNormal", vec![Prop::I64(0)])
+        Node::with("LayerElementNormal", vec![Prop::I32(0)])
             .child(int("Version", 101))
             .child(string("Name", ""))
             .child(string("MappingInformationType", "ByPolygonVertex"))
@@ -457,7 +471,7 @@ pub fn write_fbx(
             uvs.push(uv[1] as f64);
         }
         geometry = geometry.child(
-            Node::with("LayerElementUV", vec![Prop::I64(0)])
+            Node::with("LayerElementUV", vec![Prop::I32(0)])
                 .child(int("Version", 101))
                 .child(string("Name", "UVMap"))
                 .child(string("MappingInformationType", "ByPolygonVertex"))
@@ -469,7 +483,7 @@ pub fn write_fbx(
     }
     if !textures.is_empty() {
         geometry = geometry.child(
-            Node::with("LayerElementMaterial", vec![Prop::I64(0)])
+            Node::with("LayerElementMaterial", vec![Prop::I32(0)])
                 .child(int("Version", 101))
                 .child(string("Name", ""))
                 .child(string("MappingInformationType", "ByPolygon"))
@@ -545,6 +559,26 @@ pub fn write_fbx(
                 fbx::property_int("InheritType", "enum", 1),
             ])),
         );
+        // Every bone carries its attribute object, as Maya and Blender write it:
+        // it is what says "this node is a skeleton joint" rather than a marker.
+        let attribute = ids.take();
+        counts.node_attribute += 1;
+        objects.push(
+            Node::with(
+                "NodeAttribute",
+                vec![
+                    Prop::I64(attribute),
+                    class_prop(&bones[index].name, "NodeAttribute"),
+                    Prop::Str("LimbNode".to_string()),
+                ],
+            )
+            .child(int("Version", 100))
+            .child(Node::with(
+                "TypeFlags",
+                vec![Prop::Str("Skeleton".to_string())],
+            )),
+        );
+        connections.push(connect("OO", attribute, id, None));
     }
     for &index in &character.order {
         let parent = match bones[index].parent {
@@ -829,13 +863,13 @@ pub fn write_fbx(
     let mut pose_nodes: Vec<Node> = Vec::with_capacity(bones.len() + 1);
     pose_nodes.push(
         Node::with("PoseNode", Vec::new())
-            .child(int("Node", mesh_model))
+            .child(oid("Node", mesh_model))
             .child(array("Matrix", Prop::F64Array(matrix16(&IDENTITY4)))),
     );
     for &index in &character.order {
         pose_nodes.push(
             Node::with("PoseNode", Vec::new())
-                .child(int("Node", node_of[index]))
+                .child(oid("Node", node_of[index]))
                 .child(array(
                     "Matrix",
                     Prop::F64Array(matrix16(&bind_matrix(index, character))),
@@ -919,7 +953,7 @@ pub fn write_fbx(
     fbx::write_element(&mut bytes, &Node::new("Connections").children(connections))?;
     fbx::write_element(
         &mut bytes,
-        &Node::new("Takes").child(string("Current", "Take 001")),
+        &Node::new("Takes").child(string("Current", "")),
     )?;
     fbx::finish(&mut bytes);
     std::fs::write(out, &bytes).with_context(|| format!("writing {}", out.display()))?;

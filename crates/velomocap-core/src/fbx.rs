@@ -230,11 +230,15 @@ pub fn write_element(out: &mut Vec<u8>, node: &Node) -> Result<()> {
     for child in &node.children {
         write_element(out, child)?;
     }
-    // Every node's nested list is terminated by a NULL record, leaves included.
-    // Writing it only for nodes with children left a leaf ending exactly at its
-    // own end offset, which the FBX SDK tolerates but stricter importers read as
-    // a child list that runs into the next sibling.
-    out.extend_from_slice(&[0u8; 13]);
+    // A NULL record closes the child list. Maya writes one only for an element
+    // that has children (plus a completely empty element, which reads as having
+    // an empty list); a leaf ends at its last property. Writing it for leaves
+    // too keeps the arithmetic self-consistent, but it is not what a DCC
+    // produces, and the importers are written against the DCCs.
+    let empty = node.props.is_empty() && node.children.is_empty();
+    if !node.children.is_empty() || empty {
+        out.extend_from_slice(&[0u8; 13]);
+    }
     let end = out.len();
     if end >= u32::MAX as usize {
         return Err(Error::new("FBX exceeds the 4 GiB format limit; split the clip"));
