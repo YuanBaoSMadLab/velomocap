@@ -1277,6 +1277,9 @@ fn leg_ik(
         (2, 5, 8, 11), // right hip, knee, ankle, toe
     ];
     let cap = thresholds.max_correction.min(0.05) as f64;
+    // 1 - exp(-dt/0.05): the reference's 50 ms one-pole on the applied
+    // correction (pear/foot_lock.py::smooth_correction).
+    let alpha = (1.0 - (-(1.0 / fps as f64) / 0.05).exp()) as f32;
     for (foot_index, (hip, knee, ankle, toe)) in legs.into_iter().enumerate() {
         // Bone lengths from the rest pose: the reach limit for the falloff.
         let thigh = distance3(
@@ -1294,6 +1297,8 @@ fn leg_ik(
             crate::anatomical::minimum_reach(&rest, hip, knee, ankle, &knee_local)
         };
 
+        // Per foot, the applied correction is filtered across frames.
+        let mut filter = PinFilter::default();
         // The same runs the root pass holds on: contact timing resolved once.
         for (begin, end) in foot_runs(&foot.support, foot_index) {
             // Same rolling anchor the root pass uses, so the leg IK and the root
@@ -1331,6 +1336,12 @@ fn leg_ik(
                 // reference: the anchor's height is the floor, so the vertical
                 // component of the offset is what puts the sole *on* the plane
                 // instead of leaving the network's height error in place.
+                //
+                // The goal itself is *not* smoothed along the stance: that was
+                // tried and it let the foot skate (0.26 cm/frame) and float. The
+                // reference filters the applied *correction* instead
+                // (`smooth_correction` underneath), which keeps the pin exact and
+                // only removes the per-frame twitch.
                 let hold = foot.holds[index][foot_index] as f64;
                 let mut target = contact_target(anchors[offset], sole_at, current, hold);
                 if settings.mode == CorrectionMode::Flat {
@@ -1359,7 +1370,8 @@ fn leg_ik(
                     continue;
                 }
                 apply_leg_pin(
-                    body, clip, &rest, hip, knee, ankle, index, target, weight, cap, report,
+                    body, clip, &rest, hip, knee, ankle, index, target, weight, cap, alpha, &mut filter,
+                    report,
                 );
             }
         }
@@ -1391,7 +1403,8 @@ fn leg_ik(
                 continue;
             }
             apply_leg_pin(
-                body, clip, &rest, hip, knee, ankle, index, target, weight, cap, report,
+                body, clip, &rest, hip, knee, ankle, index, target, weight, cap, alpha, &mut filter,
+                report,
             );
         }
     }
@@ -1402,6 +1415,13 @@ fn leg_ik(
 /// still holds. The displacement is weighted and capped **before** the solve, so
 /// the cap is what the solve is asked for — not a number computed and ignored.
 #[allow(clippy::too_many_arguments)]
+/// Last applied hip/knee angles of one leg, for the one-pole filter below.
+#[derive(Clone, Copy, Default)]
+struct PinFilter {
+    hip: Option<[f32; 3]>,
+    knee: Option<[f32; 3]>,
+}
+
 fn apply_leg_pin(
     body: &BodyModel,
     clip: &mut FlowClip,
@@ -1413,6 +1433,8 @@ fn apply_leg_pin(
     target: [f64; 3],
     weight: f32,
     cap: f64,
+    alpha: f32,
+    filter: &mut PinFilter,
     report: &mut CorrectionReport,
 ) {
     let current = joint(&clip.skeletons[index], ankle);
@@ -1454,6 +1476,36 @@ fn apply_leg_pin(
         // An off-axis knee would mean the anatomical constraint broke: keep the
         // source pose rather than ship it.
         if anatomy.off_axis_deg < 1e-4 {
+            // `pear/foot_lock.py::smooth_correction`: the applied correction, not
+            // the solve, is what the viewer sees, and the reference runs *that*
+            // through a 50 ms one-pole before applying it. That is why its live
+            // feet look rock solid while a per-frame analytic solve trembles: the
+            // solve chases a noisy target, the filter does not.
+            for (joint, slot) in [(hip, 0usize), (knee, 1)] {
+                let at = (joint - 1) * 3;
+                let solved_angles = [
+                    clip.poses[index].body[at],
+                    clip.poses[index].body[at + 1],
+                    clip.poses[index].body[at + 2],
+                ];
+                let previous = if slot == 0 { filter.hip } else { filter.knee };
+                let blended = match previous {
+                    Some(previous) => [
+                        previous[0] + (solved_angles[0] - previous[0]) * alpha,
+                        previous[1] + (solved_angles[1] - previous[1]) * alpha,
+                        previous[2] + (solved_angles[2] - previous[2]) * alpha,
+                    ],
+                    None => solved_angles,
+                };
+                clip.poses[index].body[at] = blended[0];
+                clip.poses[index].body[at + 1] = blended[1];
+                clip.poses[index].body[at + 2] = blended[2];
+                if slot == 0 {
+                    filter.hip = Some(blended);
+                } else {
+                    filter.knee = Some(blended);
+                }
+            }
             scale_chain_towards_source(body, &mut clip.poses[index], rest, &source, &[hip, knee], 1.0);
             clip.skeletons[index] = body.forward_joints(&clip.poses[index]);
             report.ik_frames += 1;
@@ -3551,6 +3603,7 @@ mod tests {
         assert!(drift < 1e-5, "hips drifted {drift}");
     }
 }
+
 
 
 
