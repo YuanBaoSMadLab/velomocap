@@ -399,6 +399,7 @@ impl VeloMocap {
             play_check,
             render_probe,
             render_character,
+            export_asset,
             render_pose,
             save_project,
             open_project,
@@ -546,6 +547,33 @@ impl VeloMocap {
             let model = app.smplh_model.display().to_string();
             if let Err(error) = crate::probe::render_rest_pose(&model, &out) {
                 eprintln!("render-probe failed: {error:#}");
+            }
+            std::process::exit(0);
+        }
+        if let Some((file, out)) = export_asset.clone() {
+            match crate::character::Character::load(std::path::Path::new(&file)) {
+                Ok(character) => {
+                    let options = crate::asset::Options::default();
+                    if let Err(error) = crate::asset::write_glb(
+                        &character,
+                        &[],
+                        options,
+                        std::path::Path::new(&out),
+                    ) {
+                        eprintln!("export-asset failed: {error:#}");
+                        std::process::exit(1);
+                    }
+                    eprintln!(
+                        "export-asset: {} — {} verts, {} faces -> {out}",
+                        character.name,
+                        character.vertex_count(),
+                        character.faces.len()
+                    );
+                }
+                Err(error) => {
+                    eprintln!("export-asset failed: {error:#}");
+                    std::process::exit(1);
+                }
             }
             std::process::exit(0);
         }
@@ -2714,6 +2742,7 @@ fn cli_args() -> CliArgs {
     let mut play_check: Option<usize> = None;
     let mut render_probe: Option<String> = None;
     let mut render_character: Option<(String, String)> = None;
+    let mut export_asset: Option<(String, String)> = None;
     let mut render_pose: Option<(String, String, usize, String)> = None;
     let mut select: Option<usize> = None;
     let mut args = std::env::args().skip(1);
@@ -2736,6 +2765,11 @@ fn cli_args() -> CliArgs {
             "--detect-only" => detect_only = true,
             "--render-probe" => {
                 render_probe = args.next();
+            }
+            "--export-asset" => {
+                if let (Some(file), Some(out)) = (args.next(), args.next()) {
+                    export_asset = Some((file, out));
+                }
             }
             "--render-character" => {
                 if let (Some(file), Some(out)) = (args.next(), args.next()) {
@@ -2815,6 +2849,7 @@ fn cli_args() -> CliArgs {
         play_check,
         render_probe,
         render_character,
+        export_asset,
         render_pose,
         save_project,
         open_project,
@@ -2834,6 +2869,7 @@ struct CliArgs {
     play_check: Option<usize>,
     render_probe: Option<String>,
     render_character: Option<(String, String)>,
+    export_asset: Option<(String, String)>,
     render_pose: Option<(String, String, usize, String)>,
     save_project: Option<PathBuf>,
     open_project: Option<PathBuf>,
