@@ -1071,20 +1071,12 @@ impl Character {
         // angle it plays comes out that much short — Manny's arms sat 52° below
         // the clip's and crossed in front of the chest.
         //
-        // The correction is a *local* rotation per bone, and it is walked down
-        // the hierarchy so a bone without one of its own still inherits the one
-        // its parent got: swinging the forearm but not the hand tore the wrist
-        // open the last time this was a flat per-bone rotation in world space.
-        let alignment = self.rest_alignment(&joint_of, &units, rest_positions);
-        let mut aligned = vec![identity(); self.bones.len()];
-        for &index in &self.order {
-            let bone = &self.bones[index];
-            let base = match bone.parent {
-                Some(parent) => multiply(&aligned[parent], &multiply(&transpose(&units[parent]), &units[index])),
-                None => units[index],
-            };
-            aligned[index] = multiply(&base, &alignment[index]);
-        }
+        // The correction is a *local* rotation per bone, measured against what
+        // the bone already got from its parent, and it is walked down the
+        // hierarchy: a bone without one of its own inherits the one its parent
+        // got, so a whole arm turns as one piece. Measuring each bone's angle
+        // from its own bind instead left the forearm corrected twice, 52° off.
+        let (aligned, _) = self.align_hierarchy(&joint_of, &units, rest_positions);
         // Walk parents first: a bone's world rotation is its parent's times its
         // own rest-relative local rotation and the clip's deviation for that
         // joint, and its pivot follows its parent.
@@ -1320,26 +1312,26 @@ impl Character {
         sequence
     }
 
-    /// The local rotation that takes each limb bone from its bind direction to
-    /// the clip's rest direction, so an A-posed character plays the clip's angles
-    /// rather than its own bind.
+    /// Where each bone sits with the clip at its rest pose, and the local rotation
+    /// that brought it there.
     ///
-    /// The direction is the segment to the bone's longest direct child; the clip's
-    /// rest comes from the body model's neutral pose. Both directions are brought
-    /// into the bone's own frame before the rotation is measured, because that is
-    /// the frame the result is applied in, and only the limb segments where a
-    /// bind pose really differs are corrected — a clavicle's direction is a rig
-    /// convention (the clip's rises 18°, Mixamo's is level, Unreal's slopes down)
-    /// and correcting it only lifts the shoulder pad into a shrug.
-    fn rest_alignment(
+    /// A character bound in an A-pose has to bring its limb segments onto the
+    /// clip's rest, or every angle it plays comes out that much short. Each
+    /// correction is measured against what the bone already inherited from its
+    /// parent, in the bone's own frame, and only where a bind pose really differs
+    /// between the rigs: a clavicle's direction is a rig convention (the clip's
+    /// rises 18°, Mixamo's is level, Unreal's slopes down) and correcting it only
+    /// lifts the shoulder pad into a shrug.
+    fn align_hierarchy(
         &self,
         joint_of: &[usize; 52],
         units: &[[f32; 9]],
         rest_positions: &[[f32; 3]],
-    ) -> Vec<[f32; 9]> {
+    ) -> (Vec<[f32; 9]>, Vec<[f32; 9]>) {
+        let mut aligned = vec![identity(); self.bones.len()];
         let mut alignment = vec![identity(); self.bones.len()];
         if std::env::var_os("VELOMOCAP_NO_ALIGN").is_some() {
-            return alignment;
+            return (units.to_vec(), alignment);
         }
         let mut children: Vec<Vec<usize>> = vec![Vec::new(); self.bones.len()];
         for (index, bone) in self.bones.iter().enumerate() {
@@ -1347,79 +1339,107 @@ impl Character {
                 children[parent].push(index);
             }
         }
-        for (slot, bone) in self.bones.iter().enumerate() {
-            let Some(canonical) = bone.canonical else {
-                continue;
+        for &index in &self.order {
+            let bone = &self.bones[index];
+            let base = match bone.parent {
+                Some(parent) => multiply(
+                    &aligned[parent],
+                    &multiply(&transpose(&units[parent]), &units[index]),
+                ),
+                None => units[index],
             };
-            if !matches!(canonical, 7 | 8 | 26 | 27 | 44 | 45 | 48 | 49) {
+            let own = self.alignment_for(index, &base, joint_of, units, rest_positions, &children);
+            aligned[index] = multiply(&base, &own);
+            alignment[index] = own;
+        }
+        (aligned, alignment)
+    }
+
+    /// The local turn one bone needs to bring its segment from where it sits with
+    /// `base` onto the clip's rest direction. `None` for a bone that is already
+    /// aimed, has no usable segment, or whose difference is a rig convention.
+    fn alignment_for(
+        &self,
+        slot: usize,
+        base: &[f32; 9],
+        joint_of: &[usize; 52],
+        units: &[[f32; 9]],
+        rest_positions: &[[f32; 3]],
+        children: &[Vec<usize>],
+    ) -> [f32; 9] {
+        let bone = &self.bones[slot];
+        let Some(canonical) = bone.canonical else {
+            return identity();
+        };
+        if !matches!(canonical, 7 | 8 | 26 | 27 | 44 | 45 | 48 | 49) {
+            return identity();
+        }
+        // The segment is the one to the bone's longest direct child that the clip
+        // can also name. A rig can hang a one-centimetre null bone off an upper
+        // arm, and a direction measured over a centimetre is noise.
+        let mut child_slot = usize::MAX;
+        let mut length = 0.0f32;
+        for &candidate in &children[slot] {
+            if self.bones[candidate].canonical.is_none() {
                 continue;
             }
-            let mut child_slot = usize::MAX;
-            let mut length = 0.0f32;
-            for &candidate in &children[slot] {
-                if self.bones[candidate].canonical.is_none() {
-                    continue;
-                }
-                let offset = [
-                    self.bones[candidate].bind[0] - bone.bind[0],
-                    self.bones[candidate].bind[1] - bone.bind[1],
-                    self.bones[candidate].bind[2] - bone.bind[2],
-                ];
-                let reach =
-                    (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt();
-                if reach > length {
-                    length = reach;
-                    child_slot = candidate;
-                }
-            }
-            // Below a couple of centimetres the direction is not a segment.
-            if child_slot == usize::MAX || length < 0.02 {
-                continue;
-            }
-            let Some(child_canonical) = self.bones[child_slot].canonical else {
-                continue;
-            };
-            let (joint, child_joint) = (joint_of[canonical], joint_of[child_canonical]);
-            if joint == usize::MAX || child_joint == usize::MAX {
-                continue;
-            }
-            if joint >= rest_positions.len() || child_joint >= rest_positions.len() {
-                continue;
-            }
-            let Some(bind_dir) = unit([
-                self.bones[child_slot].bind[0] - bone.bind[0],
-                self.bones[child_slot].bind[1] - bone.bind[1],
-                self.bones[child_slot].bind[2] - bone.bind[2],
-            ]) else {
-                continue;
-            };
-            let Some(rest_dir) = unit([
-                rest_positions[child_joint][0] - rest_positions[joint][0],
-                rest_positions[child_joint][1] - rest_positions[joint][1],
-                rest_positions[child_joint][2] - rest_positions[joint][2],
-            ]) else {
-                continue;
-            };
-            let cosine = bind_dir[0] * rest_dir[0]
-                + bind_dir[1] * rest_dir[1]
-                + bind_dir[2] * rest_dir[2];
-            // Already the same direction: nothing to correct.
-            if cosine > 0.9995 {
-                continue;
-            }
-            // Past 75° this is a different rig convention, not a bind pose.
-            if cosine < 0.26 {
-                continue;
-            }
-            // Both directions in the bone's own frame, where the rotation lands.
-            let inverse = transpose(&units[slot]);
-            let from = turn(&inverse, bind_dir);
-            let to = turn(&inverse, rest_dir);
-            if let Some(rotation) = rotation_between(from, to) {
-                alignment[slot] = rotation;
+            let offset = [
+                self.bones[candidate].bind[0] - bone.bind[0],
+                self.bones[candidate].bind[1] - bone.bind[1],
+                self.bones[candidate].bind[2] - bone.bind[2],
+            ];
+            let reach =
+                (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt();
+            if reach > length {
+                length = reach;
+                child_slot = candidate;
             }
         }
-        alignment
+        if child_slot == usize::MAX || length < 0.02 {
+            return identity();
+        }
+        let Some(child_canonical) = self.bones[child_slot].canonical else {
+            return identity();
+        };
+        let (joint, child_joint) = (joint_of[canonical], joint_of[child_canonical]);
+        if joint == usize::MAX
+            || child_joint == usize::MAX
+            || joint >= rest_positions.len()
+            || child_joint >= rest_positions.len()
+        {
+            return identity();
+        }
+        let Some(bind_dir) = unit([
+            self.bones[child_slot].bind[0] - bone.bind[0],
+            self.bones[child_slot].bind[1] - bone.bind[1],
+            self.bones[child_slot].bind[2] - bone.bind[2],
+        ]) else {
+            return identity();
+        };
+        let Some(rest_dir) = unit([
+            rest_positions[child_joint][0] - rest_positions[joint][0],
+            rest_positions[child_joint][1] - rest_positions[joint][1],
+            rest_positions[child_joint][2] - rest_positions[joint][2],
+        ]) else {
+            return identity();
+        };
+        let cosine =
+            bind_dir[0] * rest_dir[0] + bind_dir[1] * rest_dir[1] + bind_dir[2] * rest_dir[2];
+        // Already aimed: nothing to correct.
+        if cosine > 0.9995 {
+            return identity();
+        }
+        // Past 75° this is a different rig convention, not a bind pose.
+        if cosine < 0.26 {
+            return identity();
+        }
+        // Where the segment points with what it already inherited, and where the
+        // clip's rest wants it, both in this bone's own frame: that difference is
+        // the rotation that lands here.
+        let inverse = transpose(&units[slot]);
+        let from = turn(&inverse, bind_dir);
+        let to = turn(&transpose(base), rest_dir);
+        rotation_between(from, to).unwrap_or_else(identity)
     }
 
     /// Print the bones that own the lowest part of the bind mesh — the soles —
