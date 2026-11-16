@@ -8,7 +8,6 @@ use eframe::egui;
 
 use crate::app::{LockDrag, LockGrab, VeloMocap};
 use crate::i18n;
-use crate::capture::CaptureStage;
 use crate::viewport::{self, Scene, ViewMode};
 
 // Palette: a dark slate workspace with one cool accent. The panel order is the
@@ -27,7 +26,6 @@ const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(0x2a, 0x59, 0xc4);
 const ERR: egui::Color32 = egui::Color32::from_rgb(0xff, 0x7a, 0x76);
 const OK: egui::Color32 = egui::Color32::from_rgb(0x5f, 0xd0, 0x9c);
 
-const TITLE_HEIGHT: f32 = 26.0;
 const HEADER_HEIGHT: f32 = 26.0;
 const FOOTER_HEIGHT: f32 = 24.0;
 const STATUS_HEIGHT: f32 = 24.0;
@@ -124,7 +122,6 @@ fn install_cjk_font(ctx: &egui::Context) {
 /// The whole window, in the order the Qt build lays it out.
 pub fn draw(app: &mut VeloMocap, ctx: &egui::Context) {
     menu_bar(app, ctx);
-    title_strip(app, ctx);
     // The status bar spans the window; the timeline sits inside the workspace,
     // between the clip column and the sidebar, exactly as in Qt.
     status_bar(app, ctx);
@@ -135,6 +132,7 @@ pub fn draw(app: &mut VeloMocap, ctx: &egui::Context) {
     console_window(app, ctx);
     about_window(app, ctx);
     guide_window(app, ctx);
+    settings_window(app, ctx);
     export_window(app, ctx);
     person_window(app, ctx);
     clear_scene_prompt(app, ctx);
@@ -319,12 +317,25 @@ fn menu_bar(app: &mut VeloMocap, ctx: &egui::Context) {
                     if ui
                         .button(i18n::t("Export character assets…"))
                         .on_hover_text(i18n::t(
-                            "Mesh, skeleton, materials and animation as .glb or .fbx",
+                            "Mesh, skeleton, materials and animation as one .glb",
                         ))
                         .clicked()
                     {
                         ui.close();
                         app.show_export = true;
+                    }
+                    ui.separator();
+                    // Preferences are a property of the application, not of the
+                    // panel that happened to hold them.
+                    if ui
+                        .add(
+                            egui::Button::new(i18n::t("Settings…"))
+                                .shortcut_text("Ctrl+,"),
+                        )
+                        .clicked()
+                    {
+                        ui.close();
+                        app.show_settings = true;
                     }
                     ui.separator();
                     if ui.button(i18n::t("Quit")).clicked() {
@@ -369,73 +380,6 @@ fn menu_bar(app: &mut VeloMocap, ctx: &egui::Context) {
         });
 }
 
-/// The bar under the menus: what is loaded, and the numbers that describe it.
-///
-/// The window title already carries the application name, so this strip does not
-/// repeat it — it shows the clip and the facts a glance needs (fps, size, how
-/// many people, whether the workspace has been saved).
-fn title_strip(app: &mut VeloMocap, ctx: &egui::Context) {
-    egui::TopBottomPanel::top("title")
-        .exact_height(TITLE_HEIGHT)
-        .frame(
-            egui::Frame::new()
-                .fill(WINDOW_BG)
-                .inner_margin(egui::Margin::symmetric(10, 2)),
-        )
-        .show(ctx, |ui| {
-            ui.horizontal_centered(|ui| {
-                let (mark, colour) = match (&app.video, &app.error) {
-                    (_, Some(_)) => ("●", ERR),
-                    (Some(_), None) => ("●", OK),
-                    (None, None) => ("●", MUTED),
-                };
-                ui.label(egui::RichText::new(mark).size(9.0).color(colour));
-                let name = app
-                    .video
-                    .as_ref()
-                    .and_then(|path| path.file_name())
-                    .map(|name| name.to_string_lossy().to_string())
-                    .unwrap_or_else(|| i18n::t("Open a video or drop it into the workspace").into());
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(name)
-                            .size(12.0)
-                            .strong()
-                            .color(if app.video.is_some() { TEXT } else { MUTED }),
-                    )
-                    .truncate(),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let mut chips: Vec<String> = Vec::new();
-                    if app.video.is_some() {
-                        chips.push(format!("{:.2} fps", app.current_fps()));
-                        if app.video_size != (0, 0) {
-                            chips.push(format!("{}×{}", app.video_size.0, app.video_size.1));
-                        }
-                        chips.push(i18n::zh_en(
-                            &format!("{} 人", app.people.len()),
-                            &format!("{} people", app.people.len()),
-                        ));
-                    }
-                    chips.push(match &app.project_path {
-                        Some(path) => path
-                            .file_name()
-                            .map(|name| name.to_string_lossy().to_string())
-                            .unwrap_or_else(|| i18n::t("Project").into()),
-                        None => i18n::zh_en("未保存", "unsaved").to_string(),
-                    });
-                    for chip in chips.iter().rev() {
-                        ui.label(
-                            egui::RichText::new(chip.as_str())
-                                .size(10.0)
-                                .color(MUTED),
-                        );
-                        ui.label(egui::RichText::new("·").size(10.0).color(BORDER));
-                    }
-                });
-            });
-        });
-}
 
 /// A panel: raised above the gutters, one hairline border, rounded corners.
 fn panel(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
@@ -538,6 +482,7 @@ fn people_column(app: &mut VeloMocap, ui: &mut egui::Ui, rect: egui::Rect) {
     // one disabled, which read as a broken tab. All three are pages now, and the
     // character page is where imported models live so one can be switched onto a
     // person without finding the file again.
+    ui.add_space(6.0);
     ui.horizontal(|ui| {
         // The three tabs share the column's width. A fixed 54 px each ran past
         // the edge of a narrow column and the third one was clipped, which read
@@ -616,14 +561,18 @@ fn characters_column(app: &mut VeloMocap, ui: &mut egui::Ui) {
         .collect();
     let mut remove: Option<usize> = None;
     let mut select: Option<usize> = None;
+    // The list of cards, then the import button: the scroll area is given the
+    // height that is left *after* the button, otherwise a long list pushes the
+    // button under the status bar.
+    let list_height = (ui.available_height() - 36.0).max(80.0);
     egui::Frame::new()
         .fill(egui::Color32::from_rgb(0x24, 0x24, 0x24))
         .stroke(egui::Stroke::new(1.0_f32, BORDER))
         .inner_margin(egui::Margin::same(3))
         .show(ui, |ui| {
-            ui.set_min_height((ui.available_height() - 32.0).max(60.0));
             ui.set_width(ui.available_width());
             egui::ScrollArea::vertical()
+                .max_height(list_height)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     if cards.is_empty() {
@@ -634,89 +583,113 @@ fn characters_column(app: &mut VeloMocap, ui: &mut egui::Ui) {
                                 .color(MUTED),
                         );
                     }
-                    for (index, name, format, matched, bones) in &cards {
-                        // PMX is experimental: the skeleton and 付与 work, but the
-                        // rigid-body physics that moves hair and cloth in MMD is
-                        // not simulated here yet.
-                        let tag = if format == "PMX" {
-                            format!("{} · ", i18n::t("Experimental"))
-                        } else {
-                            String::new()
-                        };
-                        let selected = app.character_panel == Some(*index);
-                        let worn_by = app
-                            .people
+                    // Two shelves: what ships with the app, and what the user
+                    // brought in. Built-ins come from this install's folder, so
+                    // the same avatar arriving from another path is the same
+                    // entry, and it is listed once.
+                    for (builtin, title) in [
+                        (true, i18n::zh_en("内置模型", "Built in")),
+                        (false, i18n::zh_en("导入模型", "Imported")),
+                    ] {
+                        let group: Vec<_> = cards
                             .iter()
-                            .find(|person| {
-                                person
-                                    .character
-                                    .as_ref()
-                                    .map(|assigned| assigned.path == app.characters[*index].path)
-                                    .unwrap_or(false)
-                            })
-                            .map(|person| person.name.clone());
-                        let caption = match &worn_by {
-                            Some(person) => {
-                                format!("{}{format} · {matched}/{bones} · {person}", tag)
-                            }
-                            None => format!("{}{format} · {matched}/{bones}", tag),
-                        };
-                        let row = egui::Frame::new()
-                            .fill(if selected {
-                                egui::Color32::from_rgb(0x2b, 0x36, 0x44)
+                            .filter(|(index, ..)| app.characters[*index].builtin == builtin)
+                            .collect();
+                        if group.is_empty() {
+                            continue;
+                        }
+                        ui.add_space(3.0);
+                        ui.label(
+                            egui::RichText::new(title)
+                                .size(10.0)
+                                .strong()
+                                .color(MUTED),
+                        );
+                        for (index, name, format, matched, bones) in group {
+                            // PMX is experimental: the skeleton and 付与 work, but the
+                            // rigid-body physics that moves hair and cloth in MMD is
+                            // not simulated here yet.
+                            let tag = if format == "PMX" {
+                                format!("{} · ", i18n::t("Experimental"))
                             } else {
-                                egui::Color32::TRANSPARENT
-                            })
-                            .stroke(egui::Stroke::new(
-                                1.0_f32,
-                                if selected {
-                                    ACCENT_DIM
+                                String::new()
+                            };
+                            let selected = app.character_panel == Some(*index);
+                            let worn_by = app
+                                .people
+                                .iter()
+                                .find(|person| {
+                                    person
+                                        .character
+                                        .as_ref()
+                                        .map(|assigned| assigned.path == app.characters[*index].path)
+                                        .unwrap_or(false)
+                                })
+                                .map(|person| person.name.clone());
+                            let caption = match &worn_by {
+                                Some(person) => {
+                                    format!("{}{format} · {matched}/{bones} · {person}", tag)
+                                }
+                                None => format!("{}{format} · {matched}/{bones}", tag),
+                            };
+                            let row = egui::Frame::new()
+                                .fill(if selected {
+                                    egui::Color32::from_rgb(0x2b, 0x36, 0x44)
                                 } else {
                                     egui::Color32::TRANSPARENT
-                                },
-                            ))
-                            .inner_margin(egui::Margin::symmetric(4, 3))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.vertical(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(name).size(11.5).color(
-                                                if selected {
-                                                    egui::Color32::WHITE
-                                                } else {
-                                                    TEXT
-                                                },
-                                            ),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(caption).size(10.0).color(MUTED),
+                                })
+                                .stroke(egui::Stroke::new(
+                                    1.0_f32,
+                                    if selected {
+                                        ACCENT_DIM
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    },
+                                ))
+                                .inner_margin(egui::Margin::symmetric(4, 3))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.vertical(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(name).size(11.5).color(
+                                                    if selected {
+                                                        egui::Color32::WHITE
+                                                    } else {
+                                                        TEXT
+                                                    },
+                                                ),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(caption).size(10.0).color(MUTED),
+                                            );
+                                        });
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new("×")
+                                                            .min_size(egui::vec2(16.0, 16.0)),
+                                                    )
+                                                    .on_hover_text(i18n::t("Remove from list"))
+                                                    .clicked()
+                                                {
+                                                    remove = Some(*index);
+                                                }
+                                            },
                                         );
                                     });
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if ui
-                                                .add(
-                                                    egui::Button::new("×")
-                                                        .min_size(egui::vec2(16.0, 16.0)),
-                                                )
-                                                .on_hover_text(i18n::t("Remove from list"))
-                                                .clicked()
-                                            {
-                                                remove = Some(*index);
-                                            }
-                                        },
-                                    );
-                                });
-                            })
-                            .response;
-                        let row = row.interact(egui::Sense::click());
-                        if row.clicked() {
-                            select = Some(*index);
+                                })
+                                .response;
+                            let row = row.interact(egui::Sense::click());
+                            if row.clicked() {
+                                select = Some(*index);
+                            }
+                            row.on_hover_text(i18n::t(
+                                "Click for this model's details, then put it on the selected person",
+                            ));
                         }
-                        row.on_hover_text(i18n::t(
-                            "Click for this model's details, then put it on the selected person",
-                        ));
                     }
                 });
         });
@@ -804,14 +777,20 @@ fn people_list(app: &mut VeloMocap, ui: &mut egui::Ui) {
         .map(|person| (person.id, person.name.clone(), person.hits(), person.colour))
         .collect::<Vec<_>>();
 
+    // The list gets what is left after the button row below it. Measuring this
+    // *inside* the frame reads the column's whole height, which made the frame
+    // tall enough to push "Find person" out through the bottom of the panel,
+    // half-hidden behind the status bar.
+    let list_height = (ui.available_height() - 34.0).max(60.0);
     egui::Frame::new()
         .fill(egui::Color32::from_rgb(0x24, 0x24, 0x24))
         .stroke(egui::Stroke::new(1.0_f32, BORDER))
         .inner_margin(egui::Margin::same(3))
         .show(ui, |ui| {
-            ui.set_min_height((ui.available_height() - 28.0).max(60.0));
+            ui.set_min_height(list_height);
             ui.set_width(ui.available_width());
             egui::ScrollArea::vertical()
+                .max_height(list_height)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     if people.is_empty() {
@@ -1237,20 +1216,31 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                     ));
                     eprintln!("{line}");
                 }
-                // The trail must belong to the body that is on screen. It used to
-                // come from the per-frame MHR keypoints, which live in the camera
-                // space of the reconstruction, while the drawn body is the placed
-                // FlowHMR clip — so the path floated far away from the character.
-                let trail: Vec<[f32; 3]> = flow
+                // The trail belongs to the body that is on screen, and it is a
+                // walk *on the floor*: the point under each frame's root at the
+                // height of the lowest joint — the sole of the supporting foot.
+                // A path through the root itself reads as a line through the
+                // character's hips, which is what it looked like before. It is
+                // also a trail and not a roadmap: only the frames that have
+                // already played, and only the last few seconds of them, so it
+                // grows with the take and fades out behind.
+                let lowest_of = |points: &[f32]| -> f32 {
+                    points
+                        .chunks_exact(3)
+                        .map(|point| point[1])
+                        .fold(f32::INFINITY, f32::min)
+                };
+                let path: Vec<[f32; 3]> = flow
                     .get(selected)
                     .filter(|clip| !clip.skeletons.is_empty())
                     .map(|clip| {
                         clip.skeletons
                             .iter()
                             .map(|skeleton| {
+                                let sole = lowest_of(&skeleton.positions);
                                 [
                                     skeleton.positions[0],
-                                    skeleton.positions[1],
+                                    if sole.is_finite() { sole } else { floor },
                                     skeleton.positions[2],
                                 ]
                             })
@@ -1263,11 +1253,24 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                                 .iter()
                                 .flatten()
                                 .filter(|frame| frame.joints.len() >= 3)
-                                .map(|frame| [frame.joints[0], frame.joints[1], frame.joints[2]])
+                                .map(|frame| {
+                                    let sole = lowest_of(&frame.joints);
+                                    [
+                                        frame.joints[0],
+                                        if sole.is_finite() { sole } else { floor },
+                                        frame.joints[2],
+                                    ]
+                                })
                                 .collect()
                         })
                     })
                     .unwrap_or_default();
+                let trail: Vec<[f32; 3]> = {
+                    // Three seconds at 30 fps: long enough to read a stride,
+                    // short enough that the path never becomes a second drawing.
+                    const TRAIL_FRAMES: usize = 90;
+                    trail_window(&path, app.playhead, TRAIL_FRAMES).to_vec()
+                };
                 let scene = Scene {
                     people: &draws,
                     trail: &trail,
@@ -2080,12 +2083,10 @@ fn sidebar(app: &mut VeloMocap, ctx: &egui::Context) {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        model_group(app, ui);
                         character_group(app, ui);
                         people_group(app, ui);
                         solver_group(app, ui);
                         correction_group(app, ui);
-                        storage_group(app, ui);
                         resources_group(app, ui);
                     });
             });
@@ -2110,23 +2111,6 @@ fn group<R>(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui) -> 
         body(ui)
     })
     .inner
-}
-
-fn model_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
-    let _ = app;
-    group(ui, i18n::t("Solver"), |ui| {
-        // The reference lets the user choose a motion backend (ExMR / GVHMR /
-        // PEAR / …). This build has exactly one — FlowHMR with SAM 3D Body — so
-        // the row is a label, not a combo box with a single dead entry.
-        ui.label(egui::RichText::new(i18n::t("SAM 3D Body · MHR")).size(11.0))
-            .on_hover_text(i18n::t(
-                "The only reconstruction backend in this build; ExMR, GVHMR, PEAR, MAMMA, PromptHMR and GEM-X are not ported",
-            ));
-        // The graph folder and the two mesh read-outs that used to sit here were
-        // information nobody acts on: the folder comes with the install and the
-        // vertex counts are fixed by the model, so they only took space away
-        // from the settings someone actually changes.
-    });
 }
 
 /// The details of the selected character card: what the file is, and the one
@@ -2713,27 +2697,37 @@ fn resources_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
     });
 }
 
+/// The bottom strip: the clip on the left with the state of the last action, and
+/// the numbers a glance needs on the right. It used to be a second title bar
+/// above the panels, which repeated the window title and pushed everything down.
 fn status_bar(app: &mut VeloMocap, ctx: &egui::Context) {
     egui::TopBottomPanel::bottom("status")
         .exact_height(STATUS_HEIGHT)
         .frame(
             egui::Frame::new()
                 .fill(HEADER_BG)
-                .inner_margin(egui::Margin::symmetric(8, 3)),
+                .inner_margin(egui::Margin::symmetric(10, 3)),
         )
         .show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
-                let colour = match app.capture.as_ref().map(|j| {
-                    j.shared.lock().unwrap().progress.stage
-                }) {
-                    Some(CaptureStage::Failed) => ERR,
-                    Some(CaptureStage::Done) => OK,
-                    _ => egui::Color32::from_rgb(0xb8, 0xb8, 0xb8),
+                let (mark, colour) = match (&app.video, &app.error) {
+                    (_, Some(_)) => ("●", ERR),
+                    (Some(_), None) => ("●", OK),
+                    (None, None) => ("●", MUTED),
                 };
+                ui.label(egui::RichText::new(mark).size(9.0).color(colour));
                 if let Some(error) = &app.error {
-                    ui.label(egui::RichText::new(error).size(11.0).color(ERR));
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(error).size(11.0).color(ERR))
+                            .truncate(),
+                    );
                 } else {
-                    ui.label(egui::RichText::new(&app.status).size(11.0).color(colour));
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&app.status).size(11.0).color(colour),
+                        )
+                        .truncate(),
+                    );
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -2741,6 +2735,28 @@ fn status_bar(app: &mut VeloMocap, ctx: &egui::Context) {
                         .clicked()
                     {
                         app.show_console = !app.show_console;
+                    }
+                    let mut chips: Vec<String> = Vec::new();
+                    chips.push(match &app.project_path {
+                        Some(path) => path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                            .unwrap_or_else(|| i18n::t("Project").into()),
+                        None => i18n::zh_en("未保存", "unsaved").to_string(),
+                    });
+                    if app.video.is_some() {
+                        chips.push(i18n::zh_en(
+                            &format!("{} 人", app.people.len()),
+                            &format!("{} people", app.people.len()),
+                        ));
+                        if app.video_size != (0, 0) {
+                            chips.push(format!("{}×{}", app.video_size.0, app.video_size.1));
+                        }
+                        chips.push(format!("{:.2} fps", app.current_fps()));
+                    }
+                    for chip in &chips {
+                        ui.label(egui::RichText::new(chip.as_str()).size(10.0).color(MUTED));
+                        ui.label(egui::RichText::new("·").size(10.0).color(BORDER));
                     }
                     let busy = app.capture.as_ref().map(|j| j.is_running()).unwrap_or(false);
                     if busy {
@@ -3052,6 +3068,43 @@ fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
     app.show_export = open;
 }
 
+/// Settings that belong to the application rather than to a clip or a panel.
+///
+/// The storage precision and compression used to sit at the bottom of the
+/// sidebar, where they read as a property of the renderer and pushed the
+/// per-clip settings off the screen.
+fn settings_window(app: &mut VeloMocap, ctx: &egui::Context) {
+    if !app.show_settings {
+        return;
+    }
+    let mut open = app.show_settings;
+    egui::Window::new(i18n::t("Settings"))
+        .open(&mut open)
+        .default_width(430.0)
+        .min_width(360.0)
+        .resizable(false)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            section_label(ui, i18n::zh_en("工程存储", "PROJECT STORAGE"));
+            storage_group(app, ui);
+            ui.add_space(8.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                if primary_button(ui, i18n::zh_en("完成", "Done"), true, 92.0) {
+                    app.show_settings = false;
+                }
+                ui.label(
+                    egui::RichText::new(i18n::zh_en(
+                        "设置存在本机，对所有工程生效",
+                        "Stored on this machine, applied to every project",
+                    ))
+                    .size(10.0)
+                    .color(MUTED),
+                );
+            });
+        });
+    app.show_settings = open && app.show_settings;
+}
 
 fn guide_window(app: &mut VeloMocap, ctx: &egui::Context) {    if !app.show_guide {
         return;
@@ -3142,8 +3195,34 @@ fn person_palette() -> [egui::Color32; 5] {
     ]
 }
 
+/// The part of a motion path a trail shows: the frames that have already played,
+/// and at most `span` of them. Frame 0 is one point, so nothing is drawn until
+/// the take has actually moved.
+fn trail_window(path: &[[f32; 3]], playhead: usize, span: usize) -> &[[f32; 3]] {
+    let head = (playhead + 1).min(path.len());
+    let start = head.saturating_sub(span.max(1));
+    &path[start..head]
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The trail grows with the playhead and forgets what is older than its
+    /// span, so the viewport shows the last few metres walked rather than the
+    /// whole take at once.
+    #[test]
+    fn the_trail_grows_with_the_playhead_and_fades_out_behind() {
+        let path: Vec<[f32; 3]> = (0..10).map(|step| [step as f32, 0.0, 0.0]).collect();
+        assert_eq!(trail_window(&path, 0, 4).len(), 1);
+        assert_eq!(trail_window(&path, 3, 4).len(), 4);
+        assert_eq!(trail_window(&path, 9, 4), &path[6..10]);
+        assert_eq!(trail_window(&path, 9, 90), &path[..]);
+        // A playhead past the end of the path cannot produce an empty slice out
+        // of range.
+        assert_eq!(trail_window(&path, 999, 4), &path[6..10]);
+    }
+
     /// The lock drag arithmetic: growing from the press, dragging an edge
     /// without crossing the other one, and sliding a lock inside the clip.
     #[test]

@@ -34,6 +34,38 @@ pub struct AssignedCharacter {
 pub struct LibraryCharacter {
     pub path: PathBuf,
     pub character: Arc<crate::character::Character>,
+    /// Shipped beside the executable in `models/characters/`, rather than
+    /// imported by the user. The list shows the two groups apart.
+    pub builtin: bool,
+}
+
+/// Identity of a shelf entry, for keeping one copy of a model: the file name and
+/// its size. The same avatar arrives from several places — the install folder,
+/// a development build, a project file — and every one of those paths is a
+/// different string for the same model.
+fn same_model(path: &Path, other: &Path) -> bool {
+    if path == other {
+        return true;
+    }
+    let name = |path: &Path| path.file_name().map(|name| name.to_os_string());
+    if name(path) != name(other) || name(path).is_none() {
+        return false;
+    }
+    match (std::fs::metadata(path), std::fs::metadata(other)) {
+        (Ok(a), Ok(b)) => a.len() == b.len(),
+        _ => false,
+    }
+}
+
+/// Whether `path` sits in the character folder shipped with this executable.
+fn is_builtin_path(path: &Path) -> bool {
+    let Some(folder) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|parent| parent.join("models").join("characters")))
+    else {
+        return false;
+    };
+    path.parent() == Some(folder.as_path())
 }
 #[derive(Clone)]pub struct FlowBody {
     pub name: String,
@@ -306,6 +338,9 @@ pub struct VeloMocap {
     pub show_help: bool,
     pub show_models: bool,
     pub show_guide: bool,
+    /// Settings that belong to the application rather than to one panel: how a
+    /// project is written, and anything else that is not a per-clip choice.
+    pub show_settings: bool,
     /// The export window: what to write, where, and under which name.
     pub show_export: bool,
     /// An imported character (VRM / glTF) that replaces the built-in body in the
@@ -491,6 +526,7 @@ impl VeloMocap {
             show_help: false,
             show_models: false,
             show_guide: false,
+            show_settings: false,
             show_export: false,
             character_rest: None,
             character_rest_positions: None,
@@ -694,7 +730,19 @@ impl VeloMocap {
     /// Load a character into the workspace library, or return the entry that is
     /// already there. The file is read once per workspace.
     pub fn add_character(&mut self, path: PathBuf) -> Option<usize> {
-        if let Some(index) = self.characters.iter().position(|entry| entry.path == path) {
+        if let Some(index) = self
+            .characters
+            .iter()
+            .position(|entry| same_model(&entry.path, &path))
+        {
+            // The same model under another path: keep one copy, and let the
+            // copy from this install win, so the entry points at a file that is
+            // still here after the build folder is cleaned.
+            if is_builtin_path(&path) && !self.characters[index].builtin {
+                self.characters[index].path = path;
+                self.characters[index].builtin = true;
+                self.save_library();
+            }
             self.character_panel = Some(index);
             return Some(index);
         }
@@ -718,6 +766,7 @@ impl VeloMocap {
                     }
                 ));
                 self.characters.push(LibraryCharacter {
+                    builtin: is_builtin_path(&path),
                     path,
                     character: Arc::new(character),
                 });
@@ -1561,6 +1610,7 @@ impl VeloMocap {
             }
             match crate::character::Character::load(path) {
                 Ok(character) => self.characters.push(LibraryCharacter {
+                    builtin: is_builtin_path(path),
                     path: path.clone(),
                     character: Arc::new(character),
                 }),

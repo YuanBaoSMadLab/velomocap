@@ -502,6 +502,145 @@ impl Canvas {
         self.line_2d(sa, 1.0 / a[2], sb, 1.0 / b[2], t0, t1, colour);
     }
 
+    /// A line blended over what is already there, for a trail that fades with
+    /// age. It is an overlay: a path lying exactly on the floor loses a
+    /// depth-test against the floor it sits on.
+    pub fn line_faded(
+        &mut self,
+        camera: &Camera,
+        from: [f32; 3],
+        to: [f32; 3],
+        colour: [u8; 3],
+        alpha: f32,
+    ) {
+        if alpha <= 0.01 {
+            return;
+        }
+        let a = to_view(camera, from);
+        let b = to_view(camera, to);
+        let Some((a, b)) = clip_segment(a, b, camera.near) else {
+            return;
+        };
+        let (sa, sb) = (to_screen(camera, a), to_screen(camera, b));
+        let rect = [
+            0.0,
+            0.0,
+            self.width as f32 - 1.0,
+            self.height as f32 - 1.0,
+        ];
+        let Some((t0, t1)) = clip_to_rect(sa, sb, rect) else {
+            return;
+        };
+        let (dx, dy) = (sb[0] - sa[0], sb[1] - sa[1]);
+        let (x0, y0) = (sa[0] + dx * t0, sa[1] + dy * t0);
+        let (x1, y1) = (sa[0] + dx * t1, sa[1] + dy * t1);
+        let steps = (x1 - x0).abs().max((y1 - y0).abs()).max(1.0) as i32;
+        for step in 0..=steps {
+            let u = step as f32 / steps as f32;
+            self.paint_blend(
+                (x0 + (x1 - x0) * u) as i32,
+                (y0 + (y1 - y0) * u) as i32,
+                colour,
+                alpha,
+            );
+        }
+    }
+
+    #[inline]
+    fn paint_blend(&mut self, x: i32, y: i32, colour: [u8; 3], alpha: f32) {
+        if x < self.clip[0] as i32
+            || y < self.clip[1] as i32
+            || x >= self.clip[2] as i32
+            || y >= self.clip[3] as i32
+        {
+            return;
+        }
+        let at = y as usize * self.width + x as usize;
+        let alpha = alpha.clamp(0.0, 1.0);
+        let existing = self.colour[at];
+        let mix = |a: u8, b: u8| (a as f32 * (1.0 - alpha) + b as f32 * alpha) as u8;
+        self.colour[at] = [
+            mix(existing[0], colour[0]),
+            mix(existing[1], colour[1]),
+            mix(existing[2], colour[2]),
+            255,
+        ];
+    }
+
+    /// A line blended over what is already there, tested against the depth
+    /// buffer: for an overlay that the geometry in front should hide.
+    pub fn line_faded_depth(
+        &mut self,
+        camera: &Camera,
+        from: [f32; 3],
+        to: [f32; 3],
+        colour: [u8; 3],
+        alpha: f32,
+    ) {
+        if alpha <= 0.01 {
+            return;
+        }
+        let a = to_view(camera, from);
+        let b = to_view(camera, to);
+        let Some((a, b)) = clip_segment(a, b, camera.near) else {
+            return;
+        };
+        let (sa, sb) = (to_screen(camera, a), to_screen(camera, b));
+        let rect = [
+            0.0,
+            0.0,
+            self.width as f32 - 1.0,
+            self.height as f32 - 1.0,
+        ];
+        let Some((t0, t1)) = clip_to_rect(sa, sb, rect) else {
+            return;
+        };
+        let (dx, dy) = (sb[0] - sa[0], sb[1] - sa[1]);
+        let (x0, y0) = (sa[0] + dx * t0, sa[1] + dy * t0);
+        let (x1, y1) = (sa[0] + dx * t1, sa[1] + dy * t1);
+        let steps = (x1 - x0).abs().max((y1 - y0).abs()).max(1.0) as i32;
+        let inv_a = 1.0 / a[2];
+        let inv_b = 1.0 / b[2];
+        for step in 0..=steps {
+            let u = step as f32 / steps as f32;
+            let t = t0 + (t1 - t0) * u;
+            let inv = inv_a + (inv_b - inv_a) * t;
+            self.put_blend(
+                (x0 + (x1 - x0) * u) as i32,
+                (y0 + (y1 - y0) * u) as i32,
+                colour,
+                inv,
+                alpha,
+            );
+        }
+    }
+
+    #[inline]
+    fn put_blend(&mut self, x: i32, y: i32, colour: [u8; 3], inv_depth: f32, alpha: f32) {
+        if x < self.clip[0] as i32
+            || y < self.clip[1] as i32
+            || x >= self.clip[2] as i32
+            || y >= self.clip[3] as i32
+        {
+            return;
+        }
+        let at = y as usize * self.width + x as usize;
+        if inv_depth <= self.depth[at] {
+            return;
+        }
+        let alpha = alpha.clamp(0.0, 1.0);
+        let existing = self.colour[at];
+        let mix = |a: u8, b: u8| (a as f32 * (1.0 - alpha) + b as f32 * alpha) as u8;
+        self.colour[at] = [
+            mix(existing[0], colour[0]),
+            mix(existing[1], colour[1]),
+            mix(existing[2], colour[2]),
+            255,
+        ];
+        // The depth is left alone: a faded pixel should not hide the ground
+        // reference behind it, and the bodies are drawn after this anyway.
+    }
+
     /// A line that ignores depth, for world-space overlays drawn on top.
     pub fn line_overlay(&mut self, camera: &Camera, from: [f32; 3], to: [f32; 3], colour: [u8; 3]) {
         let a = to_view(camera, from);

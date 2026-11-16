@@ -300,8 +300,14 @@ pub fn show(
         None
     };
     if scene.layers.motion_path && scene.trail.len() > 1 {
-        for pair in scene.trail.windows(2) {
-            canvas.line(&camera, pair[0], pair[1], TRAIL);
+        // A trail, not a roadmap: the newest segment is at full strength and the
+        // older ones fade out, so the path is drawn behind the walk as the take
+        // plays instead of appearing whole from the first frame.
+        let count = scene.trail.len();
+        for (index, pair) in scene.trail.windows(2).enumerate() {
+            let age = 1.0 - (index + 1) as f32 / count as f32;
+            let alpha = (1.0 - age * age) * 0.85;
+            canvas.line_faded(&camera, pair[0], pair[1], TRAIL, alpha);
         }
     }
 
