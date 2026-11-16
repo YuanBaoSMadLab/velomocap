@@ -203,7 +203,9 @@ pub const ALIASES: &[(&str, u8)] = &[
     ("anklel", 46),
     ("ankler", 50),
     ("balll", 47),
+    ("toesl", 47),
     ("ballr", 51),
+    ("toesr", 51),
     ("calcaneusl", 46),
     ("calcaneusr", 50),
     ("calfl", 45),
@@ -955,8 +957,7 @@ pub fn coverage<'a>(bones: impl IntoIterator<Item = &'a str>) -> f32 {
     }
 }
 
-fn lookup(raw: &str) -> Option<usize> {
-    let mut name = strip_namespace(raw);
+fn lookup(raw: &str) -> Option<usize> {    let mut name = strip_namespace(raw);
     name = strip_mixamo(name);
     name = strip_prefix_optional(name, "Armature", &['_', '/']);
     name = strip_tag(name);
@@ -983,6 +984,44 @@ fn lookup(raw: &str) -> Option<usize> {
         .chain(EXTRA.iter())
         .find(|(alias, _)| *alias == key)
         .map(|(_, index)| *index as usize)
+        .or_else(|| segmented_finger(&key))
+}
+
+/// `Proximal.Index.L` / `IndexProximal.L` — the finger bones VRM humanoids name
+/// by segment rather than by digit. Blender's VRM add-on writes the typo
+/// `Poximal` often enough that it is accepted too.
+fn segmented_finger(key: &str) -> Option<usize> {
+    let segment = if key.contains("proximal") || key.contains("poximal") {
+        0
+    } else if key.contains("intermediate") {
+        1
+    } else if key.contains("distal") {
+        2
+    } else {
+        return None;
+    };
+    let finger = if key.contains("thumb") {
+        0
+    } else if key.contains("index") {
+        1
+    } else if key.contains("middle") {
+        2
+    } else if key.contains("ring") {
+        3
+    } else if key.contains("little") || key.contains("littele") || key.contains("pinky") {
+        4
+    } else {
+        return None;
+    };
+    let side = if key.contains("left") || key.ends_with('l') {
+        0
+    } else if key.contains("right") || key.ends_with('r') {
+        1
+    } else {
+        return None;
+    };
+    // Canonical order per hand: index 10, middle 13, pinky 16, ring 19, thumb 22.
+    Some([22usize, 10, 13, 19, 16][finger] + side * 19 + segment)
 }
 
 /// `^(?:[A-Za-z][\w]*:)+` — drop every leading `namespace:` group.
@@ -1738,6 +1777,24 @@ mod tests {
                 Some(expected),
                 "{raw} did not resolve to {expected}"
             );
+        }
+    }
+
+    /// VRM humanoids name a finger bone by its segment, not by its digit:
+    /// `Proximal.Index.L` is the first phalanx of the left index finger. This is
+    /// what an avatar's hands were missing when only the body was driven.
+    #[test]
+    fn a_vrm_finger_bone_resolves_by_segment() {
+        let cases: [(&str, usize); 6] = [
+            ("Proximal.Index.L", 10),
+            ("Intermediate.Middle.L", 14),
+            ("Distal.Ring.R", 40),
+            ("IndexProximal.L", 10),
+            ("Poximal.Thumb.L", 22),
+            ("Distal.Little.R", 37),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(canonicalize(raw), Some(expected), "{raw}");
         }
     }
 

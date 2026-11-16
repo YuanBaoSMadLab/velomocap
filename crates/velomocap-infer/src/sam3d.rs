@@ -256,10 +256,9 @@ pub struct Sam3dFrame {
     pub cam_t: [f32; 3],
     /// The `pred` vector those parameters were decoded from, for diagnostics.
     pub pred: Vec<f32>,
-    /// `1024`: token 0 of the left-hand decoder call, when the backend runs the
-    /// hands (the TorchScript module does; the ONNX chain leaves it empty).
+    /// `1024`: token 0 of the left-hand decoder call.
     pub left_token: Vec<f32>,
-    /// `1024`: token 0 of the right-hand decoder call, same rule.
+    /// `1024`: token 0 of the right-hand decoder call.
     pub right_token: Vec<f32>,
 }
 

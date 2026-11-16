@@ -137,15 +137,12 @@ impl FlowClip {
 /// Build the `3072`-wide feature rows for one person.
 ///
 /// The layout is the reference's: body token `[0..1024]`, left hand
-/// `[1024..2048]`, right hand `[2048..3072]`. The hand rows are zero when the
-/// backend did not run the hands (the ONNX chain, or frames the reference did
-/// not sample them on — `flow_fast_sam.py` leaves `tokens[:, 1024:]` zero
-/// where no hand was sampled). The TorchScript backend does run them, so they
-/// carry the real rows there.
+/// `[1024..2048]`, right hand `[2048..3072]`. This build runs the hands, so both
+/// hand rows carry the sampled tokens and the generated motion includes finger
+/// animation.
 pub fn feature_rows(track: &PersonTrack, frames: &[usize]) -> Result<Vec<f32>> {
     // Diagnostic, mirroring `flow --blank`: drop the hand rows so the effect of
-    // the hand decoder on the generated motion can be isolated. The reference
-    // leaves them zero for frames it does not sample hands on.
+    // the hand decoder on the generated motion can be isolated.
     let zero_hands = std::env::var_os("VELOMOCAP_ZERO_HANDS").is_some();
     let mut rows = Vec::with_capacity(frames.len() * FEATURE_DIM);
     let mut previous: Option<&PersonFrame> = None;

@@ -222,7 +222,7 @@ fn rasterize(
     let verts = verts.to_vec();
     let faces = character.faces.clone();
     eprintln!(
-        "render-character: {} — {} verts, {} faces, {} textures {:?}",
+        "render-character: {} — {} verts, {} faces, {} textures {:?}, {}/{} bones matched",
         character.name,
         verts.len() / 3,
         faces.len(),
@@ -230,8 +230,13 @@ fn rasterize(
         character
             .textures
             .first()
-            .map(|texture| (texture.width, texture.height))
+            .map(|texture| (texture.width, texture.height)),
+        character.matched(),
+        character.bones.len()
     );
+    if std::env::var_os("VELOMOCAP_DEBUG_NAMES").is_some() {
+        eprintln!("render-character: unmatched {:?}", character.unmatched());
+    }
 
     let mut lo = [f32::INFINITY; 3];
     let mut hi = [f32::NEG_INFINITY; 3];
