@@ -9,6 +9,8 @@
 
 use eframe::egui;
 
+use crate::character::Texture;
+
 /// A tiny camera: a pinhole at `eye` looking at `forward`, y-up.
 #[derive(Clone, Debug)]
 pub struct Camera {
@@ -297,7 +299,7 @@ impl Canvas {
             sub(vertices[2], vertices[0]),
         ));
         let shade = shading(normal, camera, light);
-        self.fill(camera, vertices, [shade; 3], colour);
+        self.fill(camera, vertices, [shade; 3], colour, None);
     }
 
     /// Rasterise one triangle with per-vertex shading (smooth bodies).
@@ -310,7 +312,22 @@ impl Canvas {
         light: [f32; 3],
     ) {
         let shades = normals.map(|normal| shading(normal, camera, light));
-        self.fill(camera, vertices, shades, colour);
+        self.fill(camera, vertices, shades, colour, None);
+    }
+
+    /// Rasterise one triangle sampling a model's own texture: the image times
+    /// the same lighting the clay bodies get.
+    pub fn triangle_textured(
+        &mut self,
+        camera: &Camera,
+        vertices: [[f32; 3]; 3],
+        normals: [[f32; 3]; 3],
+        uvs: [[f32; 2]; 3],
+        texture: &Texture,
+        light: [f32; 3],
+    ) {
+        let shades = normals.map(|normal| shading(normal, camera, light));
+        self.fill(camera, vertices, shades, [255, 255, 255], Some((texture, uvs)));
     }
 
     /// Rasterise one triangle with a constant colour (the floor plane).
@@ -322,7 +339,7 @@ impl Canvas {
         cull: bool,
     ) {
         let _ = cull;
-        self.fill(camera, vertices, [1.0; 3], shaded);
+        self.fill(camera, vertices, [1.0; 3], shaded, None);
     }
 
     fn fill(
@@ -331,21 +348,47 @@ impl Canvas {
         vertices: [[f32; 3]; 3],
         shades: [f32; 3],
         colour: [u8; 3],
+        texture: Option<(&Texture, [[f32; 2]; 3])>,
     ) {
         // Clip against the near plane *before* projecting. A corner behind the
         // eye used to drop the whole triangle, which is why the floor plane
         // popped out of the viewport whenever the camera got close to it.
+        let view = vertices.map(|vertex| to_view(camera, vertex));
+        let behind = view.iter().any(|point| point[2] <= camera.near);
+        if let Some((texture, uvs)) = texture {
+            if !behind {
+                // Nothing to clip, so the texture coordinates stay valid.
+                self.raster(
+                    camera,
+                    [
+                        (view[0], shades[0]),
+                        (view[1], shades[1]),
+                        (view[2], shades[2]),
+                    ],
+                    colour,
+                    Some((texture, uvs)),
+                );
+                return;
+            }
+            // A textured triangle crossing the near plane loses its texture for
+            // that one frame rather than being dropped.
+        }
         let triangle = [
-            (to_view(camera, vertices[0]), shades[0]),
-            (to_view(camera, vertices[1]), shades[1]),
-            (to_view(camera, vertices[2]), shades[2]),
+            (view[0], shades[0]),
+            (view[1], shades[1]),
+            (view[2], shades[2]),
         ];
         let (polygon, count) = clip_triangle_near(camera.near, triangle);
         if count < 3 {
             return;
         }
         for index in 1..count - 1 {
-            self.raster(camera, [polygon[0], polygon[index], polygon[index + 1]], colour);
+            self.raster(
+                camera,
+                [polygon[0], polygon[index], polygon[index + 1]],
+                colour,
+                None,
+            );
         }
     }
 
@@ -355,6 +398,7 @@ impl Canvas {
         camera: &Camera,
         triangle: [([f32; 3], f32); 3],
         colour: [u8; 3],
+        texture: Option<(&Texture, [[f32; 2]; 3])>,
     ) {
         let s = [
             to_screen(camera, triangle[0].0),
@@ -406,11 +450,33 @@ impl Canvas {
                 }
                 let depth = w0 * inv[0] + w1 * inv[1] + w2 * inv[2];
                 let level = w0 * shade[0] + w1 * shade[1] + w2 * shade[2];
-                let shaded = [
-                    (colour[0] as f32 * level).clamp(0.0, 255.0) as u8,
-                    (colour[1] as f32 * level).clamp(0.0, 255.0) as u8,
-                    (colour[2] as f32 * level).clamp(0.0, 255.0) as u8,
-                ];
+                let shaded = match &texture {
+                    Some((texture, uvs)) => {
+                        // Perspective-correct: interpolate uv/z, divide by 1/z.
+                        let weight = [
+                            w0 * inv[0] / depth,
+                            w1 * inv[1] / depth,
+                            w2 * inv[2] / depth,
+                        ];
+                        let u = weight[0] * uvs[0][0]
+                            + weight[1] * uvs[1][0]
+                            + weight[2] * uvs[2][0];
+                        let v = weight[0] * uvs[0][1]
+                            + weight[1] * uvs[1][1]
+                            + weight[2] * uvs[2][1];
+                        let texel = texture.sample(u, v);
+                        [
+                            (texel[0] * level * 255.0).clamp(0.0, 255.0) as u8,
+                            (texel[1] * level * 255.0).clamp(0.0, 255.0) as u8,
+                            (texel[2] * level * 255.0).clamp(0.0, 255.0) as u8,
+                        ]
+                    }
+                    None => [
+                        (colour[0] as f32 * level).clamp(0.0, 255.0) as u8,
+                        (colour[1] as f32 * level).clamp(0.0, 255.0) as u8,
+                        (colour[2] as f32 * level).clamp(0.0, 255.0) as u8,
+                    ],
+                };
                 self.put(x, y, shaded, depth);
             }
         }
@@ -523,12 +589,17 @@ impl Canvas {
     }
 }
 
-/// Blinn-ish lighting in `0.34..1`, never above 1 so a body does not clip white.
+/// Blinn-ish lighting in `0.3..1`, never above 1 so a body does not clip white.
+///
+/// A key light plus a cool fill from the camera's far side: one light alone
+/// crushes a textured model's shadow side to black, which is what made an
+/// imported avatar read as a silhouette rather than as a lit surface.
 fn shading(normal: [f32; 3], camera: &Camera, light: [f32; 3]) -> f32 {
     let facing = -dot(normal, camera.forward).abs();
-    let diffuse = dot(normal, normalise(light)).abs();
-    let rim = (1.0 - facing).powf(2.5) * 0.18;
-    (0.34 + 0.58 * diffuse + rim).min(1.0)
+    let key = dot(normal, normalise(light)).abs();
+    let fill = dot(normal, normalise([-0.65, 0.15, -0.75])).max(0.0);
+    let rim = (1.0 - facing).powf(2.5) * 0.16;
+    (0.30 + 0.52 * key + 0.16 * fill + rim).min(1.0)
 }
 
 fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {

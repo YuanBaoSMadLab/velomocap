@@ -13,6 +13,7 @@
 //! which already knows Mixamo, VRM `J_Bip_*`, MMD and the other vendor spellings.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
@@ -34,6 +35,54 @@ pub struct Bone {
     pub inverse_bind: [f32; 16],
 }
 
+/// A model's base-colour image, decoded once.
+#[derive(Clone)]
+pub struct Texture {
+    pub width: usize,
+    pub height: usize,
+    /// RGBA8, row-major, top row first.
+    pub rgba: Vec<u8>,
+}
+
+impl Texture {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Texture> {
+        let image = image::load_from_memory(bytes).ok()?.to_rgba8();
+        Some(Texture {
+            width: image.width() as usize,
+            height: image.height() as usize,
+            rgba: image.into_raw(),
+        })
+    }
+
+    /// Bilinear sample in glTF's UV convention (v up).
+    pub fn sample(&self, u: f32, v: f32) -> [f32; 3] {
+        if self.width == 0 || self.height == 0 || self.rgba.len() < self.width * self.height * 4 {
+            return [1.0; 3];
+        }
+        let x = u.fract().rem_euclid(1.0) * self.width as f32 - 0.5;
+        let y = (1.0 - v).fract().rem_euclid(1.0) * self.height as f32 - 0.5;
+        let (x0, y0) = (x.floor(), y.floor());
+        let (fx, fy) = (x - x0, y - y0);
+        let at = |px: f32, py: f32| -> [f32; 3] {
+            let px = (px as i64).rem_euclid(self.width as i64) as usize;
+            let py = (py as i64).rem_euclid(self.height as i64) as usize;
+            let index = (py * self.width + px) * 4;
+            [
+                self.rgba[index] as f32 / 255.0,
+                self.rgba[index + 1] as f32 / 255.0,
+                self.rgba[index + 2] as f32 / 255.0,
+            ]
+        };
+        let mut out = [0.0f32; 3];
+        for axis in 0..3 {
+            let top = at(x0, y0)[axis] * (1.0 - fx) + at(x0 + 1.0, y0)[axis] * fx;
+            let bottom = at(x0, y0 + 1.0)[axis] * (1.0 - fx) + at(x0 + 1.0, y0 + 1.0)[axis] * fx;
+            out[axis] = top * (1.0 - fy) + bottom * fy;
+        }
+        out
+    }
+}
+
 /// A skinned mesh ready to be drawn.
 #[derive(Clone)]
 pub struct Character {
@@ -47,6 +96,10 @@ pub struct Character {
     pub joints: Vec<[u16; 4]>,
     pub weights: Vec<[f32; 4]>,
     pub faces: Vec<[u32; 3]>,
+    /// Texture coordinates per vertex, when the file has them.
+    pub uv: Vec<[f32; 2]>,
+    /// The model's base-colour image, when the file carried one.
+    pub texture: Option<Arc<Texture>>,
     /// How much the bind space was scaled to bring the character to human size.
     pub scale: f32,
 }
@@ -82,20 +135,22 @@ impl Character {
             .and_then(|value| value.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
+        // Textures and FBX/PMX image paths are relative to the model's folder.
+        let folder = path.parent().unwrap_or(Path::new(".")).to_path_buf();
         // A binary FBX is a container of its own; the glTF-family files (VRM is
         // GLB) share the reader below.
         if extension == "fbx" {
             let document = velomocap_core::fbx_read::parse(&bytes)
                 .map_err(|error| anyhow::anyhow!(error))
                 .with_context(|| format!("{} is not a readable binary FBX", path.display()))?;
-            return Self::from_fbx(&document, name);
+            return Self::from_fbx(&document, name, &folder);
         }
         if extension == "pmx" {
-            return Self::from_pmx(&bytes, name);
+            return Self::from_pmx(&bytes, name, &folder);
         }
         let gltf = Gltf::parse(&bytes)
             .with_context(|| format!("{} is not a readable glTF/GLB file", path.display()))?;
-        gltf.build(name)
+        gltf.build(name, &folder)
     }
 
     /// Build a character from a PMX (MMD) model.
@@ -103,7 +158,7 @@ impl Character {
     /// PMX has no bind matrices: the rest pose is the bone positions with an
     /// identity orientation, so each bone's bind is a translation and the skin
     /// factor is its inverse. That is exactly what MMD's own skinning does.
-    fn from_pmx(bytes: &[u8], name: String) -> Result<Self> {
+    fn from_pmx(bytes: &[u8], name: String, folder: &Path) -> Result<Self> {
         let mut cursor = Cursor { data: bytes, offset: 0 };
         anyhow::ensure!(bytes.starts_with(b"PMX "), "not a PMX file");
         cursor.offset = 4;
@@ -113,7 +168,7 @@ impl Character {
         let encoding = cursor.u8();
         let extra_uvs = cursor.u8() as usize;
         let vertex_index_size = cursor.u8() as usize;
-        let _texture_index_size = cursor.u8() as usize;
+        let texture_index_size = cursor.u8() as usize;
         let _material_index_size = cursor.u8() as usize;
         let bone_index_size = cursor.u8() as usize;
         let _morph_index_size = cursor.u8() as usize;
@@ -126,6 +181,7 @@ impl Character {
         let vertices = cursor.i32();
         anyhow::ensure!(vertices > 0, "the PMX has no vertices");
         let mut rest = Vec::with_capacity(vertices as usize * 3);
+        let mut uv: Vec<[f32; 2]> = Vec::with_capacity(vertices as usize);
         let mut joints: Vec<[u16; 4]> = Vec::with_capacity(vertices as usize);
         let mut weights: Vec<[f32; 4]> = Vec::with_capacity(vertices as usize);
         for _ in 0..vertices {
@@ -135,9 +191,7 @@ impl Character {
             for _ in 0..3 {
                 cursor.f32(); // normal
             }
-            for _ in 0..2 {
-                cursor.f32(); // uv
-            }
+            uv.push([cursor.f32(), cursor.f32()]);
             for _ in 0..extra_uvs * 4 {
                 cursor.f32();
             }
@@ -197,9 +251,11 @@ impl Character {
         }
 
         let textures = cursor.i32();
+        let mut texture_paths: Vec<String> = Vec::new();
         for _ in 0..textures.max(0) {
-            let _ = cursor.text(encoding);
+            texture_paths.push(cursor.text(encoding));
         }
+        let mut first_texture: Option<usize> = None;
         let materials = cursor.i32();
         for _ in 0..materials.max(0) {
             for _ in 0..4 {
@@ -213,15 +269,19 @@ impl Character {
             for _ in 0..5 {
                 cursor.f32(); // edge colour and size
             }
-            let _texture = cursor.index(_texture_index_size);
-            let _sphere = cursor.index(_texture_index_size);
+            let texture = cursor.index(texture_index_size);
+            let _sphere = cursor.index(texture_index_size);
             cursor.u8(); // sphere mode
             if cursor.u8() == 0 {
-                let _ = cursor.index(_texture_index_size);
+                let _ = cursor.index(texture_index_size);
             } else {
                 cursor.u8();
             }
             let _ = cursor.text(encoding);
+            // The first material's base-colour texture is the model's skin.
+            if first_texture.is_none() && texture >= 0 {
+                first_texture = Some(texture as usize);
+            }
         }
 
         let bone_count = cursor.i32();
@@ -301,14 +361,20 @@ impl Character {
             .chunks_exact(3)
             .map(|face| [face[0], face[1], face[2]])
             .collect();
-        Ok(finalize(name, bones, rest, joints, weights, faces))
+        let texture = first_texture
+            .and_then(|index| texture_paths.get(index))
+            .and_then(|reference| load_texture(folder, reference));
+        Ok(finalize(
+            name, bones, rest, joints, weights, faces, uv, texture,
+        ))
     }
 
-    /// Build a character from a parsed FBX: the skin deformer's clusters give the
-    /// bones and their bind matrices, the geometry gives the mesh.
+    /// Build a character from a parsed FBX: the skin deformer's clusters give
+    /// the bones and their bind matrices, the geometry gives the mesh.
     fn from_fbx(
         document: &velomocap_core::fbx_read::Document,
         name: String,
+        folder: &Path,
     ) -> Result<Self> {
         use std::collections::HashMap;
         let objects = document.child("Objects").context("the FBX has no Objects node")?;
@@ -363,11 +429,11 @@ impl Character {
                 .map(|prop| prop.as_i32s().to_vec())
                 .unwrap_or_default();
             if positions.len() >= 3 && !indices.is_empty() {
-                geometry = Some((positions, indices));
+                geometry = Some((positions, indices, node));
                 break;
             }
         }
-        let (positions, polygons) =
+        let (positions, polygons, geometry_node) =
             geometry.context("the FBX has no mesh geometry (Vertices / PolygonVertexIndex)")?;
 
         // Each cluster is a bone: its linked Model names it, `TransformLink` is
@@ -463,14 +529,95 @@ impl Character {
             }
         }
 
-        let mut rest: Vec<f32> = Vec::with_capacity(vertex_count * 3);
-        for value in &positions {
-            rest.push(*value as f32);
+        // Texture coordinates, when the geometry has a UV layer. FBX stores one
+        // UV per polygon corner, so a vertex on a seam needs one copy per
+        // distinct UV or the texture smears across it.
+        let uv_layer = geometry_node.child("LayerElementUV");
+        let uv_values: Vec<[f32; 2]> = uv_layer
+            .and_then(|node| node.child("UV"))
+            .and_then(|node| node.props.first())
+            .map(|prop| {
+                let values = prop.as_f64s();
+                values
+                    .chunks_exact(2)
+                    .map(|pair| [pair[0] as f32, pair[1] as f32])
+                    .collect()
+            })
+            .unwrap_or_default();
+        let uv_index: Vec<i32> = uv_layer
+            .and_then(|node| node.child("UVIndex"))
+            .and_then(|node| node.props.first())
+            .map(|prop| prop.as_i32s().to_vec())
+            .unwrap_or_default();
+
+        // Rebuild the vertices keyed by (position, uv): the skin weights belong
+        // to the position, the texture coordinate to the corner.
+        let mut rest: Vec<f32> = Vec::new();
+        let mut uv: Vec<[f32; 2]> = Vec::new();
+        let mut remap: HashMap<(u32, i32), u32> = HashMap::new();
+        let mut faces: Vec<[u32; 3]> = Vec::new();
+        let mut polygon: Vec<u32> = Vec::new();
+        let mut corners = 0usize;
+        let mut resolved = |position: u32, corner: usize, rest: &mut Vec<f32>| -> u32 {
+            let uv_at = if uv_values.is_empty() {
+                -1
+            } else if let Some(index) = uv_index.get(corner) {
+                *index
+            } else {
+                position as i32
+            };
+            let key = (position, uv_at);
+            if let Some(existing) = remap.get(&key) {
+                return *existing;
+            }
+            let at = position as usize * 3;
+            rest.push(positions[at] as f32);
+            rest.push(positions[at + 1] as f32);
+            rest.push(positions[at + 2] as f32);
+            let index = uv.len() as u32;
+            uv.push(
+                uv_values
+                    .get(uv_at.max(0) as usize)
+                    .copied()
+                    .unwrap_or([0.0, 0.0]),
+            );
+            remap.insert(key, index);
+            index
+        };
+        // Polygons: the last index of each is bitwise-not'ed; fan-triangulate.
+        for index in &polygons {
+            let position = if *index < 0 {
+                (!*index) as u32
+            } else {
+                *index as u32
+            };
+            let vertex = resolved(position, corners, &mut rest);
+            corners += 1;
+            polygon.push(vertex);
+            if *index < 0 {
+                for corner in 1..polygon.len().saturating_sub(1) {
+                    faces.push([polygon[0], polygon[corner], polygon[corner + 1]]);
+                }
+                polygon.clear();
+            }
         }
-        // Top four influences per vertex, normalised like a glTF skin.
-        let mut joints: Vec<[u16; 4]> = vec![[0; 4]; vertex_count];
-        let mut weights: Vec<[f32; 4]> = vec![[0.0; 4]; vertex_count];
-        for (vertex, list) in per_vertex.iter_mut().enumerate() {
+        anyhow::ensure!(!faces.is_empty(), "the FBX geometry has no polygons");
+        // Weights follow the position a rebuilt vertex came from.
+        let mut joints: Vec<[u16; 4]> = vec![[0; 4]; uv.len()];
+        let mut weights: Vec<[f32; 4]> = vec![[0.0; 4]; uv.len()];
+        let mut source_of: Vec<Option<u32>> = vec![None; uv.len()];
+        for ((position, _), index) in remap.iter() {
+            if let Some(slot) = source_of.get_mut(*index as usize) {
+                *slot = Some(*position);
+            }
+        }
+        for (vertex, position) in source_of.iter().enumerate() {
+            let Some(position) = position else {
+                continue;
+            };
+            let Some(list) = per_vertex.get_mut(*position as usize) else {
+                continue;
+            };
             list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             list.truncate(4);
             let total: f32 = list.iter().map(|(_, weight)| *weight).sum();
@@ -482,25 +629,19 @@ impl Character {
                 weights[vertex][slot] = weight / total;
             }
         }
-        // Polygons: the last index of each is bitwise-not'ed; fan-triangulate.
-        let mut faces: Vec<[u32; 3]> = Vec::new();
-        let mut corners: Vec<u32> = Vec::new();
-        for index in &polygons {
-            if *index < 0 {
-                corners.push((!*index) as u32);
-                for corner in 1..corners.len().saturating_sub(1) {
-                    faces.push([corners[0], corners[corner], corners[corner + 1]]);
-                }
-                corners.clear();
-            } else {
-                corners.push(*index as u32);
-            }
-        }
-        anyhow::ensure!(!faces.is_empty(), "the FBX geometry has no polygons");
         vertex_count = rest.len() / 3;
         joints.truncate(vertex_count);
         weights.truncate(vertex_count);
-        Ok(finalize(name, bones, rest, joints, weights, faces))
+        let _ = vertex_count;
+        // The skin is a material's base-colour texture in the file's folder.
+        let texture = objects.children_named("Texture").find_map(|node| {
+            node.child("RelativeFilename")
+                .and_then(|name| name.props.first())
+                .and_then(|prop| prop.as_str().map(|value| value.to_string()))
+                .or_else(|| node.str_at(1).map(|value| value.to_string()))
+                .and_then(|reference| load_texture(folder, &reference))
+        });
+        Ok(finalize(name, bones, rest, joints, weights, faces, uv, texture))
     }
 
     /// Pose the mesh with the clip's joint rotations.
@@ -870,6 +1011,8 @@ fn finalize(
     joints: Vec<[u16; 4]>,
     weights: Vec<[f32; 4]>,
     faces: Vec<[u32; 3]>,
+    mut uv: Vec<[f32; 2]>,
+    texture: Option<Texture>,
 ) -> Character {
     let mut height_min = f32::INFINITY;
     let mut height_max = f32::NEG_INFINITY;
@@ -903,6 +1046,7 @@ fn finalize(
         }
     }
     let order = hierarchy_order(&bones);
+    uv.resize(rest.len() / 3, [0.0, 0.0]);
     Character {
         name,
         bones,
@@ -911,8 +1055,32 @@ fn finalize(
         joints,
         weights,
         faces,
+        uv,
+        texture: texture.map(Arc::new),
         scale,
     }
+}
+
+/// Load a texture a model points at, relative to the model's folder.
+///
+/// MMD and FBX write Windows paths, sometimes with a subfolder that the export
+/// dropped, so a few spellings are tried before giving up.
+fn load_texture(folder: &Path, reference: &str) -> Option<Texture> {
+    let normalised = reference.replace('\\', "/");
+    let mut candidates = vec![folder.join(&normalised)];
+    if let Some(name) = Path::new(&normalised).file_name() {
+        candidates.push(folder.join(name));
+        candidates.push(folder.join("texture").join(name));
+        candidates.push(folder.join("tex").join(name));
+    }
+    for candidate in candidates {
+        if let Ok(bytes) = std::fs::read(&candidate) {
+            if let Some(texture) = Texture::from_bytes(&bytes) {
+                return Some(texture);
+            }
+        }
+    }
+    None
 }
 
 /// Parents before children, so one pass can carry each joint's motion down the
@@ -1067,7 +1235,7 @@ impl Gltf {
         anyhow::bail!("a plain .gltf keeps its buffer in a separate file; use .glb or .vrm");
     }
 
-    fn build(&self, name: String) -> Result<Character> {
+    fn build(&self, name: String, folder: &Path) -> Result<Character> {
         let skins = self
             .document
             .get("skins")
@@ -1158,9 +1326,11 @@ impl Gltf {
 
         // Every skinned primitive becomes triangles in one buffer.
         let mut rest: Vec<f32> = Vec::new();
+        let mut uv: Vec<[f32; 2]> = Vec::new();
         let mut joints: Vec<[u16; 4]> = Vec::new();
         let mut weights: Vec<[f32; 4]> = Vec::new();
         let mut faces: Vec<[u32; 3]> = Vec::new();
+        let mut texture: Option<Texture> = None;
         let meshes = self
             .document
             .get("meshes")
@@ -1186,8 +1356,19 @@ impl Gltf {
                 };
                 let positions = self.read_vec3(position as usize)?;
                 let base = (rest.len() / 3) as u32;
+                let count = positions.len() / 3;
                 for corner in positions.chunks_exact(3) {
                     rest.extend_from_slice(corner);
+                }
+                // Texture coordinates, zero-filled when the primitive has none
+                // so every vertex keeps a pair.
+                let coordinates = attributes
+                    .get("TEXCOORD_0")
+                    .and_then(|value| value.as_u64())
+                    .and_then(|accessor| self.read_vec2(accessor as usize).ok())
+                    .unwrap_or_default();
+                for index in 0..count {
+                    uv.push(coordinates.get(index).copied().unwrap_or([0.0, 0.0]));
                 }
                 for joint in self.read_joints(joint_accessor as usize)? {
                     joints.push(joint);
@@ -1206,6 +1387,11 @@ impl Gltf {
                         base + triangle[2],
                     ]);
                 }
+                if texture.is_none() {
+                    if let Some(material) = primitive.get("material").and_then(|v| v.as_u64()) {
+                        texture = self.material_texture(material as usize, folder);
+                    }
+                }
             }
         }
         anyhow::ensure!(!faces.is_empty(), "the file has no skinned mesh");
@@ -1213,7 +1399,100 @@ impl Gltf {
             joints.len() == rest.len() / 3 && weights.len() == rest.len() / 3,
             "the mesh attributes disagree on the vertex count"
         );
-        Ok(finalize(name, bones, rest, joints, weights, faces))
+        Ok(finalize(
+            name, bones, rest, joints, weights, faces, uv, texture,
+        ))
+    }
+
+    /// A material's base-colour image: `pbrMetallicRoughness` for glTF 2 and the
+    /// spec-gloss extension VRM 0.x avatars use.
+    fn material_texture(&self, index: usize, folder: &Path) -> Option<Texture> {
+        let material = self.document.get("materials")?.as_array()?.get(index)?;
+        let reference = material
+            .get("pbrMetallicRoughness")
+            .and_then(|pbr| pbr.get("baseColorTexture"))
+            .or_else(|| {
+                material
+                    .get("extensions")
+                    .and_then(|extensions| extensions.get("KHR_materials_pbrSpecularGlossiness"))
+                    .and_then(|spec| spec.get("diffuseTexture"))
+            })
+            .and_then(|texture| texture.get("index"))
+            .and_then(|value| value.as_u64())?;
+        let source = self
+            .document
+            .get("textures")?
+            .as_array()?
+            .get(reference as usize)?
+            .get("source")?
+            .as_u64()?;
+        self.image(source as usize, folder)
+    }
+
+    fn image(&self, index: usize, folder: &Path) -> Option<Texture> {
+        let image = self.document.get("images")?.as_array()?.get(index)?;
+        if let Some(view) = image.get("bufferView").and_then(|value| value.as_u64()) {
+            let view = self
+                .document
+                .get("bufferViews")?
+                .as_array()?
+                .get(view as usize)?;
+            let offset = view
+                .get("byteOffset")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0) as usize;
+            let length = view.get("byteLength").and_then(|value| value.as_u64())? as usize;
+            let bytes = self.bin.get(offset..offset + length)?;
+            return Texture::from_bytes(bytes);
+        }
+        let uri = image.get("uri")?.as_str()?;
+        // A `data:` URI would need a base64 decoder; the embedded bufferView is
+        // what GLB avatars and Mixamo exports use, so it is the path taken.
+        if uri.starts_with("data:") {
+            return None;
+        }
+        load_texture(folder, uri)
+    }
+
+    fn read_vec2(&self, accessor: usize) -> Result<Vec<[f32; 2]>> {
+        let (definition, data, offset, count, stride) = self.view(accessor)?;
+        let kind = definition
+            .get("componentType")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(5126);
+        let width = match kind {
+            5121 => 1,
+            5123 => 2,
+            _ => 4,
+        };
+        let stride = if stride == 0 { width * 2 } else { stride };
+        let scale = match kind {
+            5121 => 1.0 / 255.0,
+            5123 => 1.0 / 65535.0,
+            _ => 1.0,
+        };
+        let mut out = Vec::with_capacity(count);
+        for index in 0..count {
+            let at = offset + index * stride;
+            let read = |slot: usize| -> f32 {
+                let at = at + slot * width;
+                let Some(bytes) = data.get(at..at + width) else {
+                    return 0.0;
+                };
+                let raw = match kind {
+                    5121 => bytes[0] as u32,
+                    5123 => u16::from_le_bytes([bytes[0], bytes[1]]) as u32,
+                    _ => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                };
+                if kind == 5126 {
+                    f32::from_bits(raw)
+                } else {
+                    raw as f32 * scale
+                }
+            };
+            out.push([read(0), read(1)]);
+        }
+        Ok(out)
     }
 
     fn view(&self, accessor: usize) -> Result<(&serde_json::Value, &[u8], usize, usize, usize)> {
@@ -1594,6 +1873,30 @@ mod tests {
             hi - lo,
             lo,
             character.unmatched()
+        );
+        eprintln!(
+            "{}: {} texture coordinates, texture {:?}",
+            character.name,
+            character.uv.len(),
+            character
+                .texture
+                .as_ref()
+                .map(|texture| (texture.width, texture.height))
+        );
+        let mut uv_lo = [f32::INFINITY; 2];
+        let mut uv_hi = [f32::NEG_INFINITY; 2];
+        for at in &character.uv {
+            for axis in 0..2 {
+                uv_lo[axis] = uv_lo[axis].min(at[axis]);
+                uv_hi[axis] = uv_hi[axis].max(at[axis]);
+            }
+        }
+        eprintln!(
+            "{}: uv range {:?} .. {:?}, first {:?}",
+            character.name,
+            uv_lo,
+            uv_hi,
+            &character.uv[..character.uv.len().min(4)]
         );
         // What the pose fix depends on: a hierarchy to carry motion down, and
         // the limb angles it has to swing away. A T-pose arm is level, an A-pose
@@ -2072,7 +2375,7 @@ mod tests {
     #[test]
     fn an_fbx_skin_imports_with_its_clusters() {
         let character =
-            Character::from_fbx(&fbx_sample(), "fbx".into()).expect("from_fbx");
+            Character::from_fbx(&fbx_sample(), "fbx".into(), Path::new(".")).expect("from_fbx");
         assert_eq!(character.bones.len(), 2);
         assert_eq!(character.bones[0].name, "Hips");
         assert_eq!(character.bones[0].canonical, Some(0));
@@ -2153,7 +2456,7 @@ mod tests {
     #[test]
     fn a_pmx_model_imports_with_its_bones_and_faces() {
         let character =
-            Character::from_pmx(&pmx_sample(), "pmx".into()).expect("from_pmx");
+            Character::from_pmx(&pmx_sample(), "pmx".into(), Path::new(".")).expect("from_pmx");
         assert_eq!(character.bones.len(), 2);
         assert_eq!(character.bones[0].name, "Hips");
         assert_eq!(character.bones[0].canonical, Some(0));
@@ -2170,7 +2473,7 @@ mod tests {
     fn a_glb_skin_imports_with_its_bones_and_mesh() {
         let bytes = sample();
         let gltf = Gltf::parse(&bytes).expect("parse");
-        let character = gltf.build("sample".into()).expect("build");
+        let character = gltf.build("sample".into(), Path::new(".")).expect("build");
         assert_eq!(character.bones.len(), 2);
         assert_eq!(character.bones[0].name, "Hips");
         assert_eq!(character.bones[0].canonical, Some(0));
@@ -2187,7 +2490,7 @@ mod tests {
     #[test]
     fn a_pinned_vertex_follows_a_rotated_bone() {
         let bytes = sample();
-        let character = Gltf::parse(&bytes).unwrap().build("sample".into()).unwrap();
+        let character = Gltf::parse(&bytes).unwrap().build("sample".into(), Path::new(".")).unwrap();
         let world = vec![neutral(); 52];
         let rest = vec![neutral(); 52];
         let rest_positions = vec![[0.0f32; 3]; 52];
@@ -2232,6 +2535,8 @@ mod tests {
             joints: vec![[0, 0, 0, 0]; count],
             weights: vec![[1.0, 0.0, 0.0, 0.0]; count],
             faces: Vec::new(),
+            uv: vec![[0.0, 0.0]; count],
+            texture: None,
             scale: 1.0,
         }
     }

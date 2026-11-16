@@ -360,6 +360,8 @@ pub struct VeloMocap {
     pub character_panel: Option<usize>,
     /// Which page the movie-clip column shows: 0 people, 1 characters, 2 stream.
     pub left_tab: usize,
+    /// Text for the drop overlay while files hover over the window.
+    pub drop_hint: Option<String>,
     /// The saved character map has been applied to the current people.
     pub characters_loaded: bool,
     pub export_format: ExportFormat,
@@ -389,6 +391,7 @@ impl VeloMocap {
             select,
             play_check,
             render_probe,
+            render_character,
             save_project,
             open_project,
             storage_precision,
@@ -518,6 +521,7 @@ impl VeloMocap {
             characters: Vec::new(),
             character_panel: None,
             left_tab: 0,
+            drop_hint: None,
             characters_loaded: false,
             export_format: ExportFormat::Bvh,
             export_name: String::new(),
@@ -531,6 +535,13 @@ impl VeloMocap {
             let model = app.smplh_model.display().to_string();
             if let Err(error) = crate::probe::render_rest_pose(&model, &out) {
                 eprintln!("render-probe failed: {error:#}");
+            }
+            std::process::exit(0);
+        }
+        if let Some((file, out)) = render_character.clone() {
+            if let Err(error) = crate::probe::render_character(&file, &out) {
+                eprintln!("render-character failed: {error:#}");
+                std::process::exit(1);
             }
             std::process::exit(0);
         }
@@ -896,6 +907,95 @@ impl VeloMocap {
     }
     pub fn has_scene(&self) -> bool {
         !self.people.is_empty() || !self.flow.is_empty()
+    }
+
+    /// Files dropped onto the window: a clip becomes the take, a humanoid joins
+    /// the character shelf, a `.vp` replaces the workspace. A drop is the
+    /// quickest path to all three, so it goes through the same code the menus
+    /// use rather than a parallel one.
+    pub fn handle_drops(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|input| input.raw.dropped_files.clone());
+        if dropped.is_empty() {
+            self.drop_hint = None;
+            return;
+        }
+        for file in dropped {
+            let Some(path) = file.path else {
+                continue;
+            };
+            let extension = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            match extension.as_str() {
+                "mp4" | "mov" | "mkv" | "avi" | "webm" | "m4v" => {
+                    if self.has_scene() {
+                        // Replacing the take throws the reconstruction away, so
+                        // ask instead of guessing.
+                        self.pending_import = Some(path);
+                        self.ask_clear = true;
+                    } else {
+                        self.finish_import(path, true);
+                    }
+                }
+                "vrm" | "glb" | "fbx" | "pmx" => {
+                    let person = if self.people.is_empty() {
+                        None
+                    } else {
+                        Some(self.selected.min(self.people.len() - 1))
+                    };
+                    if let Some(index) = self.add_character(path.clone()) {
+                        if let Some(person) = person {
+                            self.use_character(person, index);
+                        }
+                        // The shelf is where an imported model is visible, so
+                        // show it rather than leaving the click unexplained.
+                        self.left_tab = 1;
+                    }
+                }
+                "vp" => self.open_project(path),
+                other => self.log(i18n::zh_en(
+                    &format!("这个文件类型导入不了：.{other}"),
+                    &format!("Cannot import this file type: .{other}"),
+                )),
+            }
+        }
+    }
+
+    /// What a drag is about to do, for the drop overlay.
+    pub fn drop_hint(ctx: &egui::Context) -> Option<String> {
+        let files: Vec<String> = ctx.input(|input| {
+            input
+                .raw
+                .hovered_files
+                .iter()
+                .filter_map(|file| file.path.as_ref())
+                .filter_map(|path| {
+                    let extension = path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let kind = match extension.as_str() {
+                        "mp4" | "mov" | "mkv" | "avi" | "webm" | "m4v" => i18n::t("as the motion clip"),
+                        "vrm" | "glb" | "fbx" | "pmx" => i18n::t("as a character"),
+                        "vp" => i18n::t("as the whole project"),
+                        _ => return None,
+                    };
+                    Some(format!("{name} · {kind}"))
+                })
+                .collect()
+        });
+        if files.is_empty() {
+            None
+        } else {
+            Some(files.join("\n"))
+        }
     }
         pub fn finish_import(&mut self, path: PathBuf, clear: bool) {
         if clear {
@@ -2282,6 +2382,7 @@ impl VeloMocap {
         }
     }
         pub fn poll(&mut self, ctx: &egui::Context) {
+        self.handle_drops(ctx);
         // Framing follows the selection, not the motion: the camera is placed
         // once for the person being looked at and then left alone, so the
         // subject drifting during the clip does not shake the view.
@@ -2479,6 +2580,7 @@ fn cli_args() -> CliArgs {
     let mut detect_only = false;
     let mut play_check: Option<usize> = None;
     let mut render_probe: Option<String> = None;
+    let mut render_character: Option<(String, String)> = None;
     let mut select: Option<usize> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -2500,6 +2602,11 @@ fn cli_args() -> CliArgs {
             "--detect-only" => detect_only = true,
             "--render-probe" => {
                 render_probe = args.next();
+            }
+            "--render-character" => {
+                if let (Some(file), Some(out)) = (args.next(), args.next()) {
+                    render_character = Some((file, out));
+                }
             }
             "--play-check" => {
                 if let Some(value) = args.next() {
@@ -2562,6 +2669,7 @@ fn cli_args() -> CliArgs {
         select,
         play_check,
         render_probe,
+        render_character,
         save_project,
         open_project,
         storage_precision,
@@ -2579,6 +2687,7 @@ struct CliArgs {
     select: Option<usize>,
     play_check: Option<usize>,
     render_probe: Option<String>,
+    render_character: Option<(String, String)>,
     save_project: Option<PathBuf>,
     open_project: Option<PathBuf>,
     storage_precision: Option<crate::project::Precision>,

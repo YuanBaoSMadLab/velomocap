@@ -130,3 +130,113 @@ fn vertex(verts: &[f32], index: u32) -> [f32; 3] {
     let at = index as usize * 3;
     [verts[at], verts[at + 1], verts[at + 2]]
 }
+
+/// Render an imported character in its bind pose to a PNG.
+///
+/// The window cannot always be brought forward for a screenshot, and a texture
+/// or lighting mistake is much easier to see than to argue about. This is the
+/// same `Canvas` and the same textured triangle path the viewport uses.
+pub fn render_character(character_path: &str, out: &str) -> anyhow::Result<()> {
+    let character =
+        crate::character::Character::load(std::path::Path::new(character_path))?;
+    let verts = character.rest.clone();
+    let faces = character.faces.clone();
+    eprintln!(
+        "render-character: {} — {} verts, {} faces, texture {:?}",
+        character.name,
+        verts.len() / 3,
+        faces.len(),
+        character
+            .texture
+            .as_ref()
+            .map(|texture| (texture.width, texture.height))
+    );
+
+    let mut lo = [f32::INFINITY; 3];
+    let mut hi = [f32::NEG_INFINITY; 3];
+    for point in verts.chunks_exact(3) {
+        for axis in 0..3 {
+            lo[axis] = lo[axis].min(point[axis]);
+            hi[axis] = hi[axis].max(point[axis]);
+        }
+    }
+    let target = [
+        (lo[0] + hi[0]) * 0.5,
+        (lo[1] + hi[1]) * 0.5,
+        (lo[2] + hi[2]) * 0.5,
+    ];
+    let radius = render::length(render::sub(hi, lo)).max(1.0);
+    let size = [640.0f32, 800.0f32];
+    let camera = Camera::orbit(target, 0.35, 0.05, radius * 1.1, size);
+    let mut canvas = Canvas::new(size[0] as usize, size[1] as usize);
+    canvas.clear_gradient([0x22, 0x24, 0x28], [0x0e, 0x0f, 0x12]);
+
+    let mut normals = vec![[0.0f32; 3]; verts.len() / 3];
+    for face in &faces {
+        let a = vertex(&verts, face[0]);
+        let b = vertex(&verts, face[1]);
+        let c = vertex(&verts, face[2]);
+        let normal = render::cross(render::sub(b, a), render::sub(c, a));
+        for index in face {
+            let slot = &mut normals[*index as usize];
+            slot[0] += normal[0];
+            slot[1] += normal[1];
+            slot[2] += normal[2];
+        }
+    }
+    let light = [0.35, 0.85, 0.4];
+    // `VELOMOCAP_RENDER_CHECKER=1` swaps in a checkerboard, which makes a wrong
+    // texture coordinate obvious: a real skin hides a bad unwrap.
+    let checker = std::env::var_os("VELOMOCAP_RENDER_CHECKER").map(|_| {
+        let size = 64usize;
+        let mut rgba = Vec::with_capacity(size * size * 4);
+        for y in 0..size {
+            for x in 0..size {
+                let value = if (x / 8 + y / 8) % 2 == 0 { 235 } else { 40 };
+                rgba.extend_from_slice(&[value, value, value, 255]);
+            }
+        }
+        crate::character::Texture {
+            width: size,
+            height: size,
+            rgba,
+        }
+    });
+    let texture = checker.as_ref().or(character.texture.as_deref());
+    for normal in &mut normals {
+        *normal = render::normalise(*normal);
+    }
+
+    for face in &faces {
+        let a = vertex(&verts, face[0]);
+        let b = vertex(&verts, face[1]);
+        let c = vertex(&verts, face[2]);
+        let n = [
+            normals[face[0] as usize],
+            normals[face[1] as usize],
+            normals[face[2] as usize],
+        ];
+        match texture {
+            Some(texture) if character.uv.len() >= verts.len() / 3 => {
+                let uvs = [
+                    character.uv[face[0] as usize],
+                    character.uv[face[1] as usize],
+                    character.uv[face[2] as usize],
+                ];
+                canvas.triangle_textured(&camera, [a, b, c], n, uvs, texture, light);
+            }
+            _ => canvas.triangle_gouraud(&camera, [a, b, c], n, [0x9c, 0xc2, 0xf0], light),
+        }
+    }
+    let image = canvas.to_image();
+    let pixels: Vec<u8> = image
+        .pixels
+        .iter()
+        .flat_map(|pixel| pixel.to_array())
+        .collect();
+    let buffer = image::RgbaImage::from_raw(image.width() as u32, image.height() as u32, pixels)
+        .ok_or_else(|| anyhow::anyhow!("could not build the image"))?;
+    buffer.save(out)?;
+    eprintln!("render-character: wrote {out}");
+    Ok(())
+}

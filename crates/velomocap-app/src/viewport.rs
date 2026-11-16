@@ -6,6 +6,8 @@
 //! keeps the same content and interaction, with a CPU rasteriser instead of GL:
 //! one texture per frame, plus egui text for the labels.
 
+use std::sync::Arc;
+
 use eframe::egui;
 
 use crate::i18n;
@@ -148,6 +150,9 @@ pub struct PersonDraw<'a> {
     /// Triangles for these vertices. Each body carries its own: the MHR mesh
     /// and the FlowHMR SMPL-H body have different topologies.
     pub faces: &'a [[u32; 3]],
+    /// Texture coordinates and the image they index, for an imported character.
+    pub uv: Option<&'a [[f32; 2]]>,
+    pub texture: Option<&'a Arc<crate::character::Texture>>,
     pub selected: bool,
 }
 
@@ -330,7 +335,21 @@ pub fn show(
                 normals[triangle[1] as usize],
                 normals[triangle[2] as usize],
             ];
-            canvas.triangle_gouraud(&camera, [a, b, c], n, tint, light);
+            // An imported character brings its own image and coordinates; the
+            // built-in bodies are clay, tinted by the person's colour.
+            match (person.uv, person.texture) {
+                (Some(uv), Some(texture))
+                    if uv.len() >= person.verts.len() / 3 =>
+                {
+                    let coordinates = [
+                        uv[triangle[0] as usize],
+                        uv[triangle[1] as usize],
+                        uv[triangle[2] as usize],
+                    ];
+                    canvas.triangle_textured(&camera, [a, b, c], n, coordinates, texture, light);
+                }
+                _ => canvas.triangle_gouraud(&camera, [a, b, c], n, tint, light),
+            }
         }
         if scene.layers.bones && person.selected {
             draw_bones(canvas, &camera, person.keypoints);

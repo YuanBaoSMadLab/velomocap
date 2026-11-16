@@ -64,6 +64,10 @@ pub fn t(english: &'static str) -> &'static str {
         "Bone Overlay" => "骨骼叠加",
         "Bone overlay" => "骨骼叠加",
         "Characters" => "角色",
+        "Drop to import" => "松开即导入",
+        "as the motion clip" => "作为动捕视频",
+        "as a character" => "作为角色模型",
+        "as the whole project" => "作为工程",
         "Import character" => "导入角色",
         "No characters imported yet" => "还没有导入角色",
         "Import a VRM / glTF / FBX / PMX humanoid and it joins this list" => {

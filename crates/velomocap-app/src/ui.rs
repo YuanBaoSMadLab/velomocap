@@ -123,6 +123,42 @@ pub fn draw(app: &mut VeloMocap, ctx: &egui::Context) {
     export_window(app, ctx);
     person_window(app, ctx);
     clear_scene_prompt(app, ctx);
+    drop_overlay(ctx);
+}
+
+/// While files hover over the window, say what releasing them would do. Without
+/// it a drop is a guess: the same gesture means "this is the clip", "this is a
+/// character" and "this is the project".
+fn drop_overlay(ctx: &egui::Context) {
+    let Some(hint) = VeloMocap::drop_hint(ctx) else {
+        return;
+    };
+    let screen = ctx.screen_rect();
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("drop-overlay"),
+    ));
+    painter.rect_filled(screen, 0.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140));
+    egui::Area::new(egui::Id::new("drop-card"))
+        .order(egui::Order::Tooltip)
+        .fixed_pos(screen.center() - egui::vec2(150.0, 40.0))
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(PANEL_BG)
+                .stroke(egui::Stroke::new(1.0, ACCENT_DIM))
+                .inner_margin(egui::Margin::symmetric(14, 10))
+                .show(ui, |ui| {
+                    ui.set_max_width(320.0);
+                    ui.label(
+                        egui::RichText::new(i18n::t("Drop to import"))
+                            .size(13.0)
+                            .color(egui::Color32::WHITE),
+                    );
+                    for line in hint.lines() {
+                        ui.label(egui::RichText::new(line).size(11.0).color(MUTED));
+                    }
+                });
+        });
 }
 
 /// Ask what to do with the scene that is already on screen before an import.
@@ -1050,6 +1086,8 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                                     verts,
                                     keypoints: &[],
                                     faces: &assigned.character.faces,
+                                    uv: Some(&assigned.character.uv),
+                                    texture: assigned.character.texture.as_ref(),
                                     selected: slot == selected,
                                 });
                             }
@@ -1066,6 +1104,8 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                                     verts,
                                     keypoints: &[],
                                     faces,
+                                    uv: None,
+                                    texture: None,
                                     selected: slot == selected,
                                 });
                             }
@@ -1078,6 +1118,8 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                                 verts: &frame.verts,
                                 keypoints: &frame.keypoints,
                                 faces: mhr_faces,
+                                uv: None,
+                                texture: None,
                                 selected: slot == selected,
                             })
                     })
