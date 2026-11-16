@@ -43,9 +43,9 @@ pub enum Prop {
 
 /// One FBX element: a name, its properties and its children.
 ///
-/// Public because the skinned-asset writer builds the same container: the
-/// element encoding (13-byte records, zlib arrays, the end markers) is the part
-/// that is easy to get wrong and hard to notice, so there is one copy of it.
+/// Public so a second writer can share the container: the element encoding
+/// (13-byte records, zlib arrays, the end markers) is the part that is easy to
+/// get wrong and hard to notice, so there is one copy of it.
 #[derive(Clone, Debug)]
 pub struct Node {
     pub name: String,

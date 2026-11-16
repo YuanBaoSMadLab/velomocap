@@ -12,7 +12,6 @@
 
 mod app;
 mod asset;
-mod asset_fbx;
 mod capture;
 mod character;
 mod i18n;

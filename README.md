@@ -4,7 +4,7 @@
 
 VeloMocap turns a phone clip into a rigged, animated 3D human: detect people, reconstruct
 their bodies with a 3D body model, estimate camera motion, generate temporally coherent
-motion, and export **BVH** or **FBX** that drops straight into Blender, Maya, Unity or Unreal.
+motion, and export the avatar as one animated **.glb** — mesh, skeleton, materials and take — that drops straight into Blender, Unity or Unreal.
 
 ![The VeloMocap workspace](assets/screenshot.png)
 
@@ -19,7 +19,7 @@ video ─► YOLOv8 detector ─► IoU tracker
        VGGT-Omega camera (ONNX) ─► FlowHMR MMDiT (ONNX) + a Rust sampler
                               │  SMPL-H  6 890 v / 52 joints
                               ▼
-       contact cleanup ─► 3D viewport · BVH · FBX 7.4
+       contact cleanup ─► 3D viewport · animated .glb
 ```
 
 | Stage | Implementation | Measured (RTX 5060 Ti) |
@@ -32,7 +32,7 @@ video ─► YOLOv8 detector ─► IoU tracker
 | **FlowHMR motion** | VGGT + MMDiT ONNX, sampler in Rust | 20 Euler steps, 30 fps output |
 | Body model | pure Rust SMPL-H / SMPL-X | 6 890 verts, 52 joints |
 | Viewport | CPU rasteriser, z-buffer, Gouraud | 147 k triangles ≈ 3 ms |
-| **Export** | BVH (52-bone biped) + binary FBX 7.4 | verified against the source skeleton |
+| **Export** | character asset .glb: mesh, skin, materials, take | 105 368 v / 67 bones in 30.0 MB |
 
 ## Why it exists
 
@@ -53,23 +53,23 @@ around it.
   drive the playhead, so picture and animation never drift apart.
 * **Multi-person**: every person gets an identity, a colour and its own motion clip.
 * **Exports**: the character asset export above is the app's export. The `velomocap-cli` binary
-  can also write BVH (Character Studio bone names, a uniform `Zrotation Xrotation Yrotation`
-  encoding) and binary FBX 7.4 in centimetres for a bare skeleton.
+  can also write a bare skeleton as BVH (Character Studio bone names, a uniform
+  `Zrotation Xrotation Yrotation` encoding) or binary FBX 7.4 in centimetres.
 * **Characters**: import a **VRM** avatar, an **Unreal Engine** body, or any
   **Mixamo-rigged** glTF/FBX/GLB, and the generated clip drives it in the viewport with its own
   materials and textures. `UE5_Manny_Simple`, `UE5_Quinn_Simple` and `Mixamo_Remy` ship in
   `models/characters/`, so a fresh install already has three rigs to export to. The library is
   shared by every project: import once, use everywhere.
-* **Character asset export**: one window sized like a DCC export dialog — pick **GLB**, **FBX**
-  or both, tick mesh/skin, materials and animation, give each character its own file name, and
-  browse for the output folder. It writes the model that is on screen, so Unreal, Unity or Blender
-  import a skeletal mesh with its take instead of motion that has to be re-skinned. An FBX keeps
-  its textures in `<name>_textures/` beside it; a `.glb` carries them inside one file.
+* **Character asset export**: one window sized like a DCC export panel — tick mesh/skin,
+  materials and animation, give each character its own file name, and browse for the output
+  folder. It writes the model that is on screen as a single **.glb**, so Blender, Unity or
+  Unreal import a skeletal mesh with its take instead of motion that has to be re-skinned;
+  the textures travel inside the file.
 * **MMD (experimental)**: PMX models load with their materials, 付与 (inherit) links and
   deform bones; the rigid-body physics that moves MMD hair and cloth is not simulated yet.
 * **Self-checking**: SAM parity tests run the PyTorch reference and the exported module
-  in one process; the FBX writer is verified by re-parsing the file and comparing every
-  joint against the skeleton it came from.
+  in one process; an exported `.glb` is checked by importing it into Blender and comparing
+  the rebuilt skeleton — rest poses and every animated frame — against the file's own data.
 
 ## Install
 

@@ -9,8 +9,9 @@
 //!
 //! glTF is the single-file container: one `.glb` carries its textures inside it,
 //! so there is no sidecar folder to lose, and Unity, Unreal, Blender and Godot
-//! all read it. [`crate::asset_fbx`] writes the same character as an FBX for the
-//! tools that ask for one by name.
+//! all read it. (There was an FBX writer beside this one; Unreal's Interchange
+//! FBX parser refused its files, so the app offers the `.glb` only. It lives in
+//! the history if it is ever wanted back.)
 
 use anyhow::{Context, Result};
 use std::path::Path;

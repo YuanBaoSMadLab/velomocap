@@ -298,17 +298,7 @@ pub fn export_animation(
         frames.len(),
         joints
     );
-    let path = std::path::Path::new(out);
-    let fbx = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.eq_ignore_ascii_case("fbx"))
-        .unwrap_or(false);
-    if fbx {
-        crate::asset_fbx::write_fbx(&character, &frames, options, fps, path)
-    } else {
-        crate::asset::write_glb(&character, &frames, options, fps, path)
-    }
+    crate::asset::write_glb(&character, &frames, options, fps, std::path::Path::new(out))
 }
 fn rasterize(
     character: &crate::character::Character,

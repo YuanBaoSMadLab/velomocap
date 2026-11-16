@@ -6,23 +6,26 @@
 
 use eframe::egui;
 
-use crate::app::{AssetFormat, LockDrag, LockGrab, VeloMocap};
+use crate::app::{LockDrag, LockGrab, VeloMocap};
 use crate::i18n;
 use crate::capture::CaptureStage;
 use crate::viewport::{self, Scene, ViewMode};
 
-// Palette from the Qt stylesheet.
-const WINDOW_BG: egui::Color32 = egui::Color32::from_rgb(0x25, 0x25, 0x25);
-const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(0x30, 0x30, 0x30);
-const HEADER_BG: egui::Color32 = egui::Color32::from_rgb(0x29, 0x29, 0x29);
-const BORDER: egui::Color32 = egui::Color32::from_rgb(0x19, 0x19, 0x19);
-const MENU_BG: egui::Color32 = egui::Color32::from_rgb(0x22, 0x22, 0x22);
-const TEXT: egui::Color32 = egui::Color32::from_rgb(0xd5, 0xd5, 0xd5);
-const MUTED: egui::Color32 = egui::Color32::from_rgb(0xa0, 0xa0, 0xa0);
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x47, 0x7b, 0xb7);
-const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(0x37, 0x68, 0x9d);
-const ERR: egui::Color32 = egui::Color32::from_rgb(0xff, 0x8a, 0x80);
-const OK: egui::Color32 = egui::Color32::from_rgb(0x8f, 0xd0, 0x9b);
+// Palette: a dark slate workspace with one cool accent. The panel order is the
+// Qt build's — same information in the same places — but the skin is its own:
+// deeper gutters, raised headers, rounded corners, and a brighter accent than
+// the flat steel grey the reference shipped.
+const WINDOW_BG: egui::Color32 = egui::Color32::from_rgb(0x13, 0x15, 0x19);
+const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(0x1c, 0x1f, 0x25);
+const HEADER_BG: egui::Color32 = egui::Color32::from_rgb(0x24, 0x28, 0x30);
+const BORDER: egui::Color32 = egui::Color32::from_rgb(0x0c, 0x0e, 0x11);
+const MENU_BG: egui::Color32 = egui::Color32::from_rgb(0x17, 0x1a, 0x1f);
+const TEXT: egui::Color32 = egui::Color32::from_rgb(0xe2, 0xe6, 0xed);
+const MUTED: egui::Color32 = egui::Color32::from_rgb(0x8a, 0x93, 0xa2);
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x3d, 0x7d, 0xff);
+const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(0x2a, 0x59, 0xc4);
+const ERR: egui::Color32 = egui::Color32::from_rgb(0xff, 0x7a, 0x76);
+const OK: egui::Color32 = egui::Color32::from_rgb(0x5f, 0xd0, 0x9c);
 
 const TITLE_HEIGHT: f32 = 26.0;
 const HEADER_HEIGHT: f32 = 26.0;
@@ -37,31 +40,43 @@ pub fn configure(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = PANEL_BG;
     visuals.window_fill = PANEL_BG;
-    visuals.extreme_bg_color = egui::Color32::from_rgb(0x24, 0x24, 0x24);
-    visuals.faint_bg_color = egui::Color32::from_rgb(0x33, 0x33, 0x33);
+    visuals.extreme_bg_color = egui::Color32::from_rgb(0x11, 0x13, 0x17);
+    visuals.faint_bg_color = egui::Color32::from_rgb(0x26, 0x2b, 0x33);
     visuals.override_text_color = Some(TEXT);
     visuals.selection.bg_fill = ACCENT;
     visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
     visuals.window_stroke = egui::Stroke::new(1.0_f32, BORDER);
     visuals.widgets.noninteractive.bg_fill = PANEL_BG;
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
-    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(0x45, 0x45, 0x45);
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x24, 0x24, 0x24));
-    visuals.widgets.inactive.corner_radius = 3.into();
-    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x55, 0x55, 0x55);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x73, 0x73, 0x73));
-    visuals.widgets.hovered.corner_radius = 3.into();
-    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0x33, 0x33, 0x33);
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT_DIM);
-    visuals.widgets.active.corner_radius = 3.into();
-    visuals.widgets.open.bg_fill = egui::Color32::from_rgb(0x45, 0x45, 0x45);
-    visuals.window_corner_radius = 2.into();
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(0x2a, 0x2f, 0x38);
+    visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(0x26, 0x2b, 0x33);
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x34, 0x3a, 0x45));
+    visuals.widgets.inactive.corner_radius = 4.into();
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x36, 0x3d, 0x49);
+    visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(0x2f, 0x35, 0x3f);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x4a, 0x53, 0x62));
+    visuals.widgets.hovered.corner_radius = 4.into();
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0x25, 0x2b, 0x35);
+    visuals.widgets.active.weak_bg_fill = ACCENT_DIM;
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT);
+    visuals.widgets.active.corner_radius = 4.into();
+    visuals.widgets.open.bg_fill = egui::Color32::from_rgb(0x2a, 0x2f, 0x38);
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x34, 0x3a, 0x45));
+    visuals.window_corner_radius = 6.into();
+    visuals.menu_corner_radius = 6.into();
+    visuals.popup_shadow = egui::epaint::Shadow {
+        offset: [0, 6],
+        blur: 18,
+        spread: 0,
+        color: egui::Color32::from_black_alpha(160),
+    };
+    visuals.window_shadow = visuals.popup_shadow;
     ctx.set_visuals(visuals);
 
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = egui::vec2(6.0, 5.0);
-    style.spacing.button_padding = egui::vec2(9.0, 3.0);
-    style.spacing.interact_size.y = 20.0;
+    style.spacing.item_spacing = egui::vec2(7.0, 6.0);
+    style.spacing.button_padding = egui::vec2(10.0, 4.0);
+    style.spacing.interact_size.y = 21.0;
     style.spacing.slider_width = 110.0;
     style.spacing.combo_width = 110.0;
     style.spacing.indent = 12.0;
@@ -70,7 +85,7 @@ pub fn configure(ctx: &egui::Context) {
         (TextStyle::Small, FontId::new(10.5, FontFamily::Proportional)),
         (TextStyle::Body, FontId::new(12.0, FontFamily::Proportional)),
         (TextStyle::Button, FontId::new(12.0, FontFamily::Proportional)),
-        (TextStyle::Heading, FontId::new(13.0, FontFamily::Proportional)),
+        (TextStyle::Heading, FontId::new(13.5, FontFamily::Proportional)),
         (TextStyle::Monospace, FontId::new(11.0, FontFamily::Monospace)),
     ]
     .into();
@@ -354,56 +369,105 @@ fn menu_bar(app: &mut VeloMocap, ctx: &egui::Context) {
         });
 }
 
+/// The bar under the menus: what is loaded, and the numbers that describe it.
+///
+/// The window title already carries the application name, so this strip does not
+/// repeat it — it shows the clip and the facts a glance needs (fps, size, how
+/// many people, whether the workspace has been saved).
 fn title_strip(app: &mut VeloMocap, ctx: &egui::Context) {
     egui::TopBottomPanel::top("title")
         .exact_height(TITLE_HEIGHT)
         .frame(
             egui::Frame::new()
                 .fill(WINDOW_BG)
-                .inner_margin(egui::Margin::symmetric(8, 3)),
+                .inner_margin(egui::Margin::symmetric(10, 2)),
         )
         .show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
-                ui.label(
-                    egui::RichText::new("VeloMocap")
-                        .size(13.0)
-                        .strong()
-                        .color(egui::Color32::from_rgb(0xed, 0xed, 0xed)),
-                );
-                ui.label(egui::RichText::new(i18n::t("Motion Workspace   |")).color(MUTED));
+                let (mark, colour) = match (&app.video, &app.error) {
+                    (_, Some(_)) => ("●", ERR),
+                    (Some(_), None) => ("●", OK),
+                    (None, None) => ("●", MUTED),
+                };
+                ui.label(egui::RichText::new(mark).size(9.0).color(colour));
                 let name = app
                     .video
                     .as_ref()
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().to_string())
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().to_string())
                     .unwrap_or_else(|| i18n::t("Open a video or drop it into the workspace").into());
-                ui.add(egui::Label::new(egui::RichText::new(name).color(MUTED)).truncate());
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(name)
+                            .size(12.0)
+                            .strong()
+                            .color(if app.video.is_some() { TEXT } else { MUTED }),
+                    )
+                    .truncate(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut chips: Vec<String> = Vec::new();
+                    if app.video.is_some() {
+                        chips.push(format!("{:.2} fps", app.current_fps()));
+                        if app.video_size != (0, 0) {
+                            chips.push(format!("{}×{}", app.video_size.0, app.video_size.1));
+                        }
+                        chips.push(i18n::zh_en(
+                            &format!("{} 人", app.people.len()),
+                            &format!("{} people", app.people.len()),
+                        ));
+                    }
+                    chips.push(match &app.project_path {
+                        Some(path) => path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                            .unwrap_or_else(|| i18n::t("Project").into()),
+                        None => i18n::zh_en("未保存", "unsaved").to_string(),
+                    });
+                    for chip in chips.iter().rev() {
+                        ui.label(
+                            egui::RichText::new(chip.as_str())
+                                .size(10.0)
+                                .color(MUTED),
+                        );
+                        ui.label(egui::RichText::new("·").size(10.0).color(BORDER));
+                    }
+                });
             });
         });
 }
 
-/// A panel with the Qt `editor` look: 1 px border, flat body.
+/// A panel: raised above the gutters, one hairline border, rounded corners.
 fn panel(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(PANEL_BG)
         .stroke(egui::Stroke::new(1.0_f32, BORDER))
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::same(6))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+            // Fill the column instead of shrinking to the content: a panel that
+            // stops halfway leaves a slab of empty gutter under it.
+            ui.spacing_mut().item_spacing = egui::vec2(7.0, 5.0);
             add(ui);
+            let spare = ui.available_height();
+            if spare.is_finite() && spare > 0.0 {
+                ui.allocate_space(egui::vec2(ui.available_width(), spare));
+            }
         });
 }
 
-/// The `editorHeader` strip that titles every panel.
+/// The strip that titles every panel.
 fn header(ui: &mut egui::Ui, title: &str, right: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(HEADER_BG)
-        .inner_margin(egui::Margin::symmetric(9, 3))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(9, 4))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             // `horizontal_centered` would stretch the strip to the panel height.
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(title).color(TEXT));
+                ui.label(egui::RichText::new(title).size(11.5).strong().color(TEXT));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
             });
         });
@@ -413,6 +477,7 @@ fn header(ui: &mut egui::Ui, title: &str, right: impl FnOnce(&mut egui::Ui)) {
 fn footer(ui: &mut egui::Ui, left: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(HEADER_BG)
+        .corner_radius(4.0)
         .inner_margin(egui::Margin::symmetric(9, 3))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -424,7 +489,7 @@ fn movie_clip(app: &mut VeloMocap, ctx: &egui::Context) {
     egui::SidePanel::left("movie-clip")
         .exact_width(CLIP_PANEL_WIDTH)
         .resizable(false)
-        .frame(egui::Frame::new().fill(WINDOW_BG).inner_margin(egui::Margin::same(4)))
+        .frame(egui::Frame::new().fill(WINDOW_BG).inner_margin(egui::Margin::same(6)))
         .show(ctx, |ui| {
             let available = ui.available_size();
             ui.allocate_ui(available, |ui| {
@@ -495,7 +560,8 @@ fn people_column(app: &mut VeloMocap, ui: &mut egui::Ui, rect: egui::Rect) {
                     1.0_f32,
                     if selected { ACCENT_DIM } else { BORDER },
                 ))
-                .min_size(egui::vec2(width, 20.0));
+                .corner_radius(4.0)
+                .min_size(egui::vec2(width, 21.0));
             if ui.add(button).clicked() {
                 app.left_tab = index;
             }
@@ -992,7 +1058,7 @@ fn video_view(app: &mut VeloMocap, ui: &mut egui::Ui, rect: egui::Rect) {
 }
 
 fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPanel::default()
-        .frame(egui::Frame::new().fill(WINDOW_BG).inner_margin(egui::Margin::same(4)))
+        .frame(egui::Frame::new().fill(WINDOW_BG).inner_margin(egui::Margin::same(6)))
         .show(ctx, |ui| {
             panel(ui, |ui| {
                 header(ui, i18n::t("3D Viewport"), |ui| {
@@ -1276,7 +1342,7 @@ fn footer_checks(app: &mut VeloMocap, ui: &mut egui::Ui) {
 fn timeline(app: &mut VeloMocap, ctx: &egui::Context) {
     egui::TopBottomPanel::bottom("timeline")
         .exact_height(TIMELINE_HEIGHT)
-        .frame(egui::Frame::new().fill(WINDOW_BG).inner_margin(egui::Margin::same(4)))
+        .frame(egui::Frame::new().fill(WINDOW_BG).inner_margin(egui::Margin::same(6)))
         .show(ctx, |ui| {
             panel(ui, |ui| {
                 // Header: title and help on the left, transport in the middle,
@@ -1999,7 +2065,7 @@ fn sidebar(app: &mut VeloMocap, ctx: &egui::Context) {
     egui::SidePanel::right("sidebar")
         .exact_width(SIDEBAR_WIDTH)
         .resizable(false)
-        .frame(egui::Frame::new().fill(WINDOW_BG).inner_margin(egui::Margin::same(4)))
+        .frame(egui::Frame::new().fill(WINDOW_BG).inner_margin(egui::Margin::same(6)))
         .show(ctx, |ui| {
             panel(ui, |ui| {
                 header(ui, i18n::t("AI Model"), |ui| {
@@ -2778,11 +2844,41 @@ fn about_window(app: &mut VeloMocap, ctx: &egui::Context) {
     app.show_help = open;
 }
 
+/// A muted caption that titles a block inside a window.
+fn section_label(ui: &mut egui::Ui, text: impl Into<String>) {
+    let text: String = text.into();
+    ui.add_space(3.0);
+    ui.label(
+        egui::RichText::new(text)
+            .size(10.0)
+            .strong()
+            .color(MUTED),
+    );
+}
+
+/// The one button in a window that does the thing, filled with the accent so it
+/// reads as the primary action rather than as one of equals.
+fn primary_button(ui: &mut egui::Ui, text: impl Into<String>, enabled: bool, width: f32) -> bool {
+    let text: String = text.into();
+    let fill = if enabled { ACCENT } else { HEADER_BG };
+    let stroke = if enabled { ACCENT } else { BORDER };
+    let ink = if enabled { egui::Color32::WHITE } else { MUTED };
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(egui::RichText::new(text).size(12.0).strong().color(ink))
+            .fill(fill)
+            .stroke(egui::Stroke::new(1.0_f32, stroke))
+            .corner_radius(5.0)
+            .min_size(egui::vec2(width, 27.0)),
+    )
+    .clicked()
+}
+
 /// The export window: what to write, where, and under which name.
 ///
-/// Shaped like a DCC's export dialog on purpose: the container and the parts at
-/// the top, one row per character with its own file name, the folder with a
-/// browse button, and one button that writes everything that is ticked.
+/// Shaped like a DCC's export panel on purpose — a format block, the parts to
+/// include, one row per character with its own file name, the destination, then
+/// the action. Everything it writes is a single `.glb` per character.
 fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
     if !app.show_export {
         return;
@@ -2790,16 +2886,36 @@ fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
     let mut open = app.show_export;
     egui::Window::new(i18n::t("Export character assets"))
         .open(&mut open)
-        .default_width(660.0)
-        .min_width(560.0)
+        .default_width(640.0)
+        .min_width(540.0)
         .resizable(true)
         .show(ctx, |ui| {
+            section_label(ui, i18n::zh_en("格式", "FORMAT"));
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(i18n::t("Format")).size(11.0).color(MUTED));
-                for format in [AssetFormat::Glb, AssetFormat::Fbx, AssetFormat::Both] {
-                    ui.selectable_value(&mut app.export_format, format, format.label());
-                }
+                egui::Frame::new()
+                    .fill(HEADER_BG)
+                    .stroke(egui::Stroke::new(1.0_f32, ACCENT_DIM))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::symmetric(8, 3))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("glTF Binary  ·  .glb")
+                                .size(11.0)
+                                .strong()
+                                .color(TEXT),
+                        );
+                    });
+                ui.label(
+                    egui::RichText::new(i18n::zh_en(
+                        "网格、骨骼、材质和动画都在这一个文件里",
+                        "Mesh, skeleton, materials and animation in one file",
+                    ))
+                    .size(10.0)
+                    .color(MUTED),
+                );
             });
+
+            section_label(ui, i18n::zh_en("内容", "INCLUDE"));
             ui.horizontal(|ui| {
                 ui.checkbox(
                     &mut app.asset_skin,
@@ -2811,18 +2927,7 @@ fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
                 );
                 ui.checkbox(&mut app.asset_animation, i18n::zh_en("动画", "Animation"));
             });
-            if app.export_format.fbx() && app.asset_materials {
-                ui.label(
-                    egui::RichText::new(i18n::zh_en(
-                        "FBX 的贴图写在 <文件名>_textures/ 里：这个容器装不下图片",
-                        "An FBX keeps its textures in <name>_textures/: the container cannot hold images",
-                    ))
-                    .size(10.0)
-                    .color(MUTED),
-                );
-            }
-            ui.add_space(6.0);
-            ui.separator();
+
             let rows: Vec<(usize, String, String)> = app
                 .people
                 .iter()
@@ -2838,11 +2943,7 @@ fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
                 })
                 .collect();
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(i18n::zh_en("角色", "Characters"))
-                        .size(11.0)
-                        .color(MUTED),
-                );
+                section_label(ui, i18n::zh_en("角色", "CHARACTERS"));
                 if rows.len() > 1 {
                     let every = rows.iter().all(|(index, _, _)| {
                         app.asset_selected.get(*index).copied().unwrap_or(true)
@@ -2881,21 +2982,10 @@ fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
                     ui.add(
                         egui::TextEdit::singleline(&mut app.asset_names[*index])
                             .hint_text(stem)
-                            .desired_width(200.0)
+                            .desired_width(220.0)
                             .font(egui::TextStyle::Small),
                     );
-                    let mut suffixes: Vec<&str> = Vec::new();
-                    if app.export_format.glb() {
-                        suffixes.push(".glb");
-                    }
-                    if app.export_format.fbx() {
-                        suffixes.push(".fbx");
-                    }
-                    ui.label(
-                        egui::RichText::new(suffixes.join(" / "))
-                            .size(10.0)
-                            .color(MUTED),
-                    );
+                    ui.label(egui::RichText::new(".glb").size(10.0).color(MUTED));
                 });
             }
             if rows.is_empty() {
@@ -2908,10 +2998,10 @@ fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
                     .color(MUTED),
                 );
             }
-            ui.add_space(6.0);
+
+            section_label(ui, i18n::zh_en("输出目录", "DESTINATION"));
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(i18n::zh_en("输出目录", "Output folder")).size(10.5));
-                let width = (ui.available_width() - 84.0).max(120.0);
+                let width = (ui.available_width() - 88.0).max(140.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut app.asset_folder)
                         .hint_text(i18n::zh_en("留空＝工程所在目录", "empty = beside the project"))
@@ -2931,18 +3021,11 @@ fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
             if let Some(note) = &app.export_note {
                 ui.label(egui::RichText::new(note).size(10.0).color(MUTED));
             }
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             ui.separator();
             ui.horizontal(|ui| {
                 let can = !rows.is_empty() && app.project_path.is_some();
-                if ui
-                    .add_enabled(
-                        can,
-                        egui::Button::new(i18n::zh_en("导出", "Export"))
-                            .min_size(egui::vec2(96.0, 24.0)),
-                    )
-                    .clicked()
-                {
+                if primary_button(ui, i18n::zh_en("导出", "Export"), can, 104.0) {
                     app.export_asset_models();
                 }
                 if ui.button(i18n::t("Close")).clicked() {
@@ -2969,6 +3052,7 @@ fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
     app.show_export = open;
 }
 
+
 fn guide_window(app: &mut VeloMocap, ctx: &egui::Context) {    if !app.show_guide {
         return;
     }
@@ -2987,8 +3071,7 @@ fn guide_window(app: &mut VeloMocap, ctx: &egui::Context) {    if !app.show_guid
                     "3. 拖动时间轴、或按空格回放；下面四条锁定轨可以手绘接触帧。",
                     "4. 右侧「人物」列表点一行 → 替换模型…：导入 VRM / GLB 虚拟人物，",
                     "   用它替换内置身体播放这段动作（选择会存到片段旁边）。",
-                    "5. 文件 → 导出角色资产…：选 GLB / FBX、勾网格/材质/动画、给每个角色起名，",
-                    "   然后一键写出；FBX 的贴图放在旁边的 <文件名>_textures/ 里。",
+                    "5. 文件 → 导出角色资产…：勾网格/材质/动画、给每个角色起名，然后一键写出",
                 ]
             } else {
                 &[
@@ -3000,9 +3083,8 @@ fn guide_window(app: &mut VeloMocap, ctx: &egui::Context) {    if !app.show_guid
                     "4. Click a row in the People list on the right → Replace model… to",
                     "   import a VRM / GLB avatar and play this motion on it (the choice",
                     "   is saved next to the clip).",
-                    "5. File → Export character assets… picks GLB / FBX and the parts to",
-                    "   include, names each character, and writes them; an FBX keeps its",
-                    "   textures in <name>_textures/ beside it.",
+                    "5. File → Export character assets… ticks mesh/material/animation and",
+                    "   names each character, then writes one .glb per character.",
                 ]
             };
             for line in workflow {
@@ -3047,7 +3129,7 @@ fn guide_window(app: &mut VeloMocap, ctx: &egui::Context) {    if !app.show_guid
 
 /// Window title in the current language.
 pub fn window_title() -> String {
-    format!("VeloMocap | {}", i18n::t("Motion Workspace   |").trim())
+    format!("VeloMocap | {}", i18n::t("Motion Workspace").trim())
 }
 
 fn person_palette() -> [egui::Color32; 5] {

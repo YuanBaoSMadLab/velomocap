@@ -311,9 +311,6 @@ pub struct SettingsState {
     pub memory_mode: String,
     pub scale_width: usize,
     pub max_frames: usize,
-    /// What the character asset export writes: `glb`, `fbx` or `both`.
-    #[serde(default)]
-    pub asset_format: String,
     #[serde(default = "yes")]
     pub asset_skin: bool,
     #[serde(default = "yes")]
@@ -482,12 +479,6 @@ impl Project {
                 memory_mode: memory_mode_slug(app.memory_mode).to_string(),
                 scale_width: app.scale_width,
                 max_frames: app.max_frames,
-                asset_format: match app.export_format {
-                    crate::app::AssetFormat::Glb => "glb",
-                    crate::app::AssetFormat::Fbx => "fbx",
-                    crate::app::AssetFormat::Both => "both",
-                }
-                .to_string(),
                 asset_skin: app.asset_skin,
                 asset_materials: app.asset_materials,
                 asset_animation: app.asset_animation,
@@ -850,7 +841,6 @@ mod tests {
                 memory_mode: "hybrid".to_string(),
                 scale_width: 640,
                 max_frames: 0,
-                asset_format: "both".to_string(),
                 asset_skin: true,
                 asset_materials: true,
                 asset_animation: true,

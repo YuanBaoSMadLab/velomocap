@@ -8,31 +8,6 @@ use crate::capture::{self, CaptureJob, CaptureStage};
 use crate::i18n;
 use crate::ui;
 use crate::viewport::{Layers, Orbit, ViewportCache, PERSON_COLOURS};
-/// Which container(s) a character asset export writes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AssetFormat {
-    Glb,
-    Fbx,
-    Both,
-}
-
-impl AssetFormat {
-    pub fn label(self) -> &'static str {
-        match self {
-            AssetFormat::Glb => "GLB",
-            AssetFormat::Fbx => "FBX",
-            AssetFormat::Both => "GLB + FBX",
-        }
-    }
-
-    pub fn glb(self) -> bool {
-        matches!(self, AssetFormat::Glb | AssetFormat::Both)
-    }
-
-    pub fn fbx(self) -> bool {
-        matches!(self, AssetFormat::Fbx | AssetFormat::Both)
-    }
-}
 
 #[derive(Clone)]pub struct PersonView {
     pub id: usize,
@@ -360,7 +335,6 @@ pub struct VeloMocap {
     pub drop_hint: Option<String>,
     /// The saved character map has been applied to the current people.
     pub characters_loaded: bool,
-    pub export_format: AssetFormat,
     /// What a character asset export writes: mesh with skin weights, materials
     /// with their textures, and the animation. All on by default, which is what
     /// a game engine needs to import the model and play the take.
@@ -529,7 +503,6 @@ impl VeloMocap {
             left_tab: 0,
             drop_hint: None,
             characters_loaded: false,
-            export_format: AssetFormat::Glb,
         asset_skin: true,
         asset_materials: true,
         asset_animation: true,
@@ -568,17 +541,8 @@ impl VeloMocap {
             match crate::character::Character::load(std::path::Path::new(&file)) {
                 Ok(character) => {
                     let options = crate::asset::Options::default();
-                    let path = std::path::Path::new(&out);
-                    let fbx = path
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .map(|extension| extension.eq_ignore_ascii_case("fbx"))
-                        .unwrap_or(false);
-                    let result = if fbx {
-                        crate::asset_fbx::write_fbx(&character, &[], options, 30.0, path)
-                    } else {
-                        crate::asset::write_glb(&character, &[], options, 30.0, path)
-                    };
+                    let result =
+                        crate::asset::write_glb(&character, &[], options, 30.0, std::path::Path::new(&out));
                     if let Err(error) = result {
                         eprintln!("export-asset failed: {error:#}");
                         std::process::exit(1);
@@ -854,13 +818,6 @@ impl VeloMocap {
         };
         let model = self.smplh_model.display().to_string();
         let fps = self.current_fps() as f32;
-        let mut extensions: Vec<&str> = Vec::new();
-        if self.export_format.glb() {
-            extensions.push("glb");
-        }
-        if self.export_format.fbx() {
-            extensions.push("fbx");
-        }
         let mut written = 0usize;
         let mut failures: Vec<String> = Vec::new();
         // Collect the paths first: the loop must not hold the people list while
@@ -891,20 +848,18 @@ impl VeloMocap {
             } else {
                 typed
             };
-            for extension in &extensions {
-                let out = folder.join(format!("{stem}.{extension}"));
-                let result = crate::probe::export_animation(
-                    &model,
-                    &path.display().to_string(),
-                    &project.display().to_string(),
-                    &out.display().to_string(),
-                    options,
-                    fps,
-                );
-                match result {
-                    Ok(()) => written += 1,
-                    Err(error) => failures.push(format!("{stem}.{extension}: {error:#}")),
-                }
+            let out = folder.join(format!("{stem}.glb"));
+            let result = crate::probe::export_animation(
+                &model,
+                &path.display().to_string(),
+                &project.display().to_string(),
+                &out.display().to_string(),
+                options,
+                fps,
+            );
+            match result {
+                Ok(()) => written += 1,
+                Err(error) => failures.push(format!("{stem}: {error:#}")),
             }
         }
         for failure in failures {
@@ -1685,11 +1640,6 @@ impl VeloMocap {
         }
         self.scale_width = settings.scale_width;
         self.max_frames = settings.max_frames;
-        self.export_format = match settings.asset_format.as_str() {
-            "glb" => AssetFormat::Glb,
-            "fbx" => AssetFormat::Fbx,
-            _ => AssetFormat::Both,
-        };
         self.asset_skin = settings.asset_skin;
         self.asset_materials = settings.asset_materials;
         self.asset_animation = settings.asset_animation;

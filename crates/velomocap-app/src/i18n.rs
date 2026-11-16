@@ -212,7 +212,7 @@ pub fn t(english: &'static str) -> &'static str {
         "Keyboard shortcuts" => "键盘快捷键",
         "Console" => "控制台",
         "Language / 语言" => "语言 / Language",
-        "Motion Workspace   |" => "动作工作台   |",
+        "Motion Workspace" => "动作工作台",
         "Open a video or drop it into the workspace" => "打开视频，或把视频拖进工作区",
         "Ready. Open a video or a project." => "就绪。打开视频或工程开始。",
 
