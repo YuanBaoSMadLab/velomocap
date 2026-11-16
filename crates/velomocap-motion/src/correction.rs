@@ -1266,65 +1266,109 @@ fn leg_ik(
                     // is left alone rather than levering the body again here.
                     continue;
                 }
-                // Clamp the *target* instead of rejecting the frame: a frame that
-                // is corrected next to a frame that is not is exactly what reads
-                // as a twitch, so the correction always ramps with distance.
-                let mut want = [
-                    (target[0] - current[0] as f64) * weight as f64,
-                    (target[1] - current[1] as f64) * weight as f64,
-                    (target[2] - current[2] as f64) * weight as f64,
-                ];
-                let length = (want[0] * want[0] + want[1] * want[1] + want[2] * want[2]).sqrt();
-                if length > cap && length > 0.0 {
-                    want[0] *= cap / length;
-                    want[1] *= cap / length;
-                    want[2] *= cap / length;
-                }
-                if want[0].abs() + want[1].abs() + want[2].abs() < 1e-5 {
-                    continue;
-                }
-                // The solve runs against the *clamped* displacement, not the raw
-                // target: the cap above is what stops one frame from yanking the
-                // ankle across, and it used to be computed and then not used.
-                let solved = [
-                    current[0] as f64 + want[0],
-                    current[1] as f64 + want[1],
-                    current[2] as f64 + want[2],
-                ];
-                let source = clip.poses[index].clone();
-                let (world, positions) = crate::anatomical::forward(body, &clip.poses[index], &rest);
-                if let Some(anatomy) = crate::anatomical::solve_leg(
-                    body,
-                    &mut clip.poses[index],
-                    &rest,
-                    &world,
-                    &positions,
-                    hip,
-                    knee,
-                    ankle,
-                    solved,
-                ) {
-                    // An off-axis knee would mean the anatomical constraint
-                    // broke: keep the source pose rather than ship it.
-                    if anatomy.off_axis_deg < 1e-4 {
-                        scale_chain_towards_source(
-                            body,
-                            &mut clip.poses[index],
-                            &rest,
-                            &source,
-                            &[hip, knee],
-                            1.0,
-                        );
-                        clip.skeletons[index] = body.forward_joints(&clip.poses[index]);
-                        report.ik_frames += 1;
-                    } else {
-                        clip.poses[index] = source;
-                    }
-                }
+                apply_leg_pin(
+                    body, clip, &rest, hip, knee, ankle, index, target, weight, cap, report,
+                );
             }
+        }
+
+        // Release and approach frames: the offset stored by `add_transitions` is
+        // already the faded correction, so no hold and no floor lift are applied
+        // here — this only carries the leg out of the stance and back into the
+        // next one instead of dropping the correction at the contact edge.
+        for index in 0..count {
+            if !foot.pinned[index][foot_index] || foot.support[index][foot_index] {
+                continue;
+            }
+            let offset = foot.offsets[index][foot_index];
+            if offset[0].abs() + offset[1].abs() + offset[2].abs() < 1e-6 {
+                continue;
+            }
+            let current = joint(&clip.skeletons[index], ankle);
+            let target = [
+                current[0] as f64 + offset[0] as f64,
+                current[1] as f64 + offset[1] as f64,
+                current[2] as f64 + offset[2] as f64,
+            ];
+            let hip_f = joint(&clip.skeletons[index], hip).map(|value| value as f64);
+            if distance3(target, hip_f) < min_reach * 1.0005 {
+                continue;
+            }
+            let weight = reach_falloff(target, hip_f, max_reach) as f32;
+            if weight <= 0.02 {
+                continue;
+            }
+            apply_leg_pin(
+                body, clip, &rest, hip, knee, ankle, index, target, weight, cap, report,
+            );
         }
     }
 
+}
+
+/// Solve one leg pin at one frame and publish it, if the anatomical constraint
+/// still holds. The displacement is weighted and capped **before** the solve, so
+/// the cap is what the solve is asked for — not a number computed and ignored.
+#[allow(clippy::too_many_arguments)]
+fn apply_leg_pin(
+    body: &BodyModel,
+    clip: &mut FlowClip,
+    rest: &[f32],
+    hip: usize,
+    knee: usize,
+    ankle: usize,
+    index: usize,
+    target: [f64; 3],
+    weight: f32,
+    cap: f64,
+    report: &mut CorrectionReport,
+) {
+    let current = joint(&clip.skeletons[index], ankle);
+    // Clamp the *target* instead of rejecting the frame: a frame that is
+    // corrected next to a frame that is not is exactly what reads as a twitch,
+    // so the correction always ramps with distance.
+    let mut want = [
+        (target[0] - current[0] as f64) * weight as f64,
+        (target[1] - current[1] as f64) * weight as f64,
+        (target[2] - current[2] as f64) * weight as f64,
+    ];
+    let length = (want[0] * want[0] + want[1] * want[1] + want[2] * want[2]).sqrt();
+    if length > cap && length > 0.0 {
+        want[0] *= cap / length;
+        want[1] *= cap / length;
+        want[2] *= cap / length;
+    }
+    if want[0].abs() + want[1].abs() + want[2].abs() < 1e-5 {
+        return;
+    }
+    let solved = [
+        current[0] as f64 + want[0],
+        current[1] as f64 + want[1],
+        current[2] as f64 + want[2],
+    ];
+    let source = clip.poses[index].clone();
+    let (world, positions) = crate::anatomical::forward(body, &clip.poses[index], rest);
+    if let Some(anatomy) = crate::anatomical::solve_leg(
+        body,
+        &mut clip.poses[index],
+        rest,
+        &world,
+        &positions,
+        hip,
+        knee,
+        ankle,
+        solved,
+    ) {
+        // An off-axis knee would mean the anatomical constraint broke: keep the
+        // source pose rather than ship it.
+        if anatomy.off_axis_deg < 1e-4 {
+            scale_chain_towards_source(body, &mut clip.poses[index], rest, &source, &[hip, knee], 1.0);
+            clip.skeletons[index] = body.forward_joints(&clip.poses[index]);
+            report.ik_frames += 1;
+        } else {
+            clip.poses[index] = source;
+        }
+    }
 }
 
 /// The ankle target that lands the sole's support point on the contact anchor.
@@ -1610,6 +1654,13 @@ pub struct FootPass {
     /// straight look like it had room to straighten further, so no drop was ever
     /// requested and the sole stayed in the air.
     pub targets: Vec<[[f32; 3]; 2]>,
+    /// Per frame, per foot: a **release or approach** frame. The correction is
+    /// carried out of a stance and back in over 0.12–0.5 s (`contact_offsets`'),
+    /// so a foot does not snap at the edge of its contact. `support` stays
+    /// stance-only: the release frames are corrected, not locked.
+    pub pinned: Vec<[bool; 2]>,
+    /// Per frame, per foot: the 3D offset applied on those release frames.
+    pub offsets: Vec<[[f32; 3]; 2]>,
 }
 
 impl FootPass {
@@ -1618,6 +1669,8 @@ impl FootPass {
             support: vec![[false; 2]; frames],
             holds: vec![[0.0; 2]; frames],
             targets: vec![[[0.0; 3]; 2]; frames],
+            pinned: vec![[false; 2]; frames],
+            offsets: vec![[[0.0; 3]; 2]; frames],
         }
     }
 }
@@ -1792,13 +1845,155 @@ fn foot_lock(
             clip.poses[index].translation[axis] += delta as f32;
         }
     }
+    // Release and approach frames, on the shifted clip: the residual the stance
+    // still owed is what the ramp unwinds.
+    add_transitions(&mut pass, clip, detection);
     pass
+}
+
+/// `contact_offsets`' release and approach ramps: carry the correction out of a
+/// stance (and back into the next one) over a bounded number of frames instead of
+/// stopping dead at the contact edge.
+///
+/// The reference's `extent` is `clamp(ceil(|offset|·fps/0.8), 0.12 s, 0.5 s)`
+/// frames — a longer correction needs more time to unwind, at a speed of about
+/// 0.8 m/s. Two stances separated by a short gap get one Hermite between their
+/// offsets; otherwise each side decays to zero independently, and a clip that
+/// starts or ends mid-swing decays from (or to) the stance at the edge.
+///
+/// These frames are **not** contacts: `support` stays stance-only, so the
+/// grounding, the reach passes and the foot metrics never see them.
+fn add_transitions(pass: &mut FootPass, clip: &FlowClip, detection: &Detection) {
+    let count = clip.skeletons.len();
+    if count < 3 {
+        return;
+    }
+    let fps = clip.fps.max(1.0);
+    let minimum = ((fps * 0.12).round() as usize).max(2);
+    let maximum = ((fps * 0.5).round() as usize).max(2);
+    let extent = |value: [f32; 3]| {
+        let length = (value[0] * value[0] + value[1] * value[1] + value[2] * value[2]).sqrt();
+        let frames = (length * fps / 0.8).ceil() as usize;
+        frames.clamp(minimum, maximum)
+    };
+    for (foot_index, (ankle, _toe)) in [(LEFT_ANKLE, LEFT_FOOT), (RIGHT_ANKLE, RIGHT_FOOT)]
+        .into_iter()
+        .enumerate()
+    {
+        let stances = foot_runs(&pass.support, foot_index);
+        if stances.is_empty() {
+            continue;
+        }
+        // The correction still owed at each stance frame, in the shifted clip.
+        let mut residual = vec![[0.0f32; 3]; count];
+        for (begin, end) in &stances {
+            for index in *begin..*end {
+                let current = joint(&clip.skeletons[index], ankle);
+                let target = pass.targets[index][foot_index];
+                residual[index] = [
+                    target[0] - current[0],
+                    target[1] - current[1],
+                    target[2] - current[2],
+                ];
+            }
+        }
+        let flight = |frame: usize| detection.prepared.flight.get(frame).copied().unwrap_or(false);
+        let mut frame = 0usize;
+        while frame < count {
+            if pass.support[frame][foot_index] || flight(frame) {
+                frame += 1;
+                continue;
+            }
+            let first = frame;
+            while frame < count && !pass.support[frame][foot_index] && !flight(frame) {
+                frame += 1;
+            }
+            let end = frame;
+            let gap = end - first;
+            let left = first > 0 && pass.support[first - 1][foot_index];
+            let right = end < count && pass.support[end][foot_index];
+            if !left && !right {
+                continue;
+            }
+            let zero = [0.0f32; 3];
+            let lvalue = if left { residual[first - 1] } else { zero };
+            let rvalue = if right { residual[end] } else { zero };
+            let lextent = if left { extent(lvalue) } else { 0 };
+            let rextent = if right { extent(rvalue) } else { 0 };
+            let lcount = gap.min(lextent);
+            let rcount = gap.min(rextent);
+            let lv = if first >= 2 {
+                sub3f(residual[first - 1], residual[first - 2])
+            } else {
+                zero
+            };
+            let rv = if end + 1 < count {
+                sub3f(residual[end + 1], residual[end])
+            } else {
+                zero
+            };
+            if left && right && lcount + rcount >= gap {
+                // One Hermite across the whole gap: the foot leaves one stance
+                // heading where it was and arrives at the next one smoothly.
+                for (slot, index) in (first..end).enumerate() {
+                    let value = interp_hermite(lvalue, lv, rvalue, rv, gap, slot);
+                    pass.offsets[index][foot_index] = value;
+                    pass.pinned[index][foot_index] = true;
+                }
+            } else {
+                if left {
+                    // End-of-clip is not evidence that the foot returned to the
+                    // raw trajectory: truncate a normal-duration release instead.
+                    let duration = if end == count { lextent } else { lcount };
+                    for slot in 0..lcount {
+                        let value = interp_hermite(lvalue, lv, zero, zero, duration, slot);
+                        pass.offsets[first + slot][foot_index] = value;
+                        pass.pinned[first + slot][foot_index] = true;
+                    }
+                }
+                if right {
+                    let duration = if first == 0 { rextent } else { rcount };
+                    let start = end.saturating_sub(rcount);
+                    for slot in 0..rcount {
+                        let value = interp_hermite(zero, zero, rvalue, rv, duration, slot + (duration - rcount));
+                        pass.offsets[start + slot][foot_index] = value;
+                        pass.pinned[start + slot][foot_index] = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn sub3f(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+/// Interior sample `slot` of a cubic whose endpoints are `a`/`b` with velocities
+/// `va`/`vb`, over `count` frames. Mirrors `contact_trajectory._hermite`.
+fn interp_hermite(
+    a: [f32; 3],
+    va: [f32; 3],
+    b: [f32; 3],
+    vb: [f32; 3],
+    count: usize,
+    slot: usize,
+) -> [f32; 3] {
+    let duration = (count + 1) as f32;
+    let t = (slot + 1) as f32 / duration;
+    let mut out = [0.0f32; 3];
+    for axis in 0..3 {
+        out[axis] = (2.0 * t.powi(3) - 3.0 * t.powi(2) + 1.0) * a[axis]
+            + (t.powi(3) - 2.0 * t.powi(2) + t) * duration * va[axis]
+            + (-2.0 * t.powi(3) + 3.0 * t.powi(2)) * b[axis]
+            + (t.powi(3) - t.powi(2)) * duration * vb[axis];
+    }
+    out
 }
 
 /// `np.interp(arange(count), frames, values)`: linear between the known frames,
 /// held at both ends.
-pub(crate) fn interpolate(values: &[f64], frames: &[usize], count: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; count];
+pub(crate) fn interpolate(values: &[f64], frames: &[usize], count: usize) -> Vec<f32> {    let mut out = vec![0.0f32; count];
     if frames.is_empty() || count == 0 {
         return out;
     }
@@ -3178,3 +3373,4 @@ mod tests {
         assert!(drift < 1e-5, "hips drifted {drift}");
     }
 }
+

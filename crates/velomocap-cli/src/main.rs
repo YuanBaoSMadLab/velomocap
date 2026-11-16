@@ -1416,6 +1416,8 @@ fn flow_report(
         blank_tokens: blank,
         zero_noise,
         dump: dump.map(|p| p.to_path_buf()),
+        // A single clip has no other actor to agree with: shift it here.
+        defer_floor: false,
     };
     let started = Instant::now();
     let mut clip = velomocap_motion::generate_flow(track, &camera_track, &model, &config)?;

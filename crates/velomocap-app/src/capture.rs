@@ -559,29 +559,55 @@ fn run_flow(
             ..Default::default()
         },
         max_frames: settings.max_frames,
+        // The scene floor needs every actor's estimate, so generation leaves each
+        // clip in the network's datum and the shift happens once the median is in.
+        defer_floor: true,
         ..Default::default()
     };
 
-    let mut clips = Vec::new();
+    // Two passes over the people: generate every clip into the network's own
+    // datum first, then stand the whole take on one plane. `flow_floor.resolve`
+    // estimates a plane per actor and gives the scene the median, so two people
+    // never end up on two different floors — the per-actor shift the single-clip
+    // path applies would do exactly that.
+    let mut generated: Vec<(usize, velomocap_motion::FlowClip)> = Vec::new();
+    let sentinel = || {
+        if let Ok(state) = shared.lock() {
+            if state.progress.stage == CaptureStage::Failed {
+                return true;
+            }
+        }
+        false
+    };
     for (slot, person) in people.iter().enumerate() {
         report_stage(shared, 3, slot, people.len(), "flow");
-        let sentinel = || {
-            if let Ok(state) = shared.lock() {
-                if state.progress.stage == CaptureStage::Failed {
-                    return true;
-                }
-            }
-            false
-        };
-        let mut clip = match velomocap_motion::generate_flow(person, &camera, &model, &config) {
-            Ok(clip) => clip,
+        match velomocap_motion::generate_flow(person, &camera, &model, &config) {
+            Ok(clip) => generated.push((slot, clip)),
             Err(error) => {
                 if let Ok(mut state) = shared.lock() {
                     state.flow_note = format!("FlowHMR {}: {error}", person.name);
                 }
-                continue;
             }
-        };
+        }
+        if sentinel() {
+            break;
+        }
+    }
+    let estimates: Vec<f32> = generated
+        .iter()
+        .filter(|(_, clip)| clip.floor_from_contacts)
+        .map(|(_, clip)| clip.floor)
+        .collect();
+    let shared_floor = velomocap_motion::scene_floor(&estimates);
+    if let Some(floor) = shared_floor {
+        for (_, clip) in generated.iter_mut() {
+            velomocap_motion::shift_to_floor(clip, floor);
+        }
+    }
+
+    let mut clips = Vec::new();
+    for (slot, mut clip) in generated {
+        let person = &people[slot];
         // Contact correction runs on the generated clip, so the viewport and
         // every export see the same corrected motion. The user's lock tracks go
         // with it: an edited limb follows the drawing, the rest follows detection.
@@ -613,6 +639,12 @@ fn run_flow(
             }
         }
         let mut summary = velomocap_motion::summarise_flow(&clip);
+        if let Some(floor) = shared_floor {
+            summary.push(format!(
+                "scene floor {floor:+.3} m over {} actor(s)",
+                estimates.len()
+            ));
+        }
         summary.push(correction.line());
         let summary = summary.join("; ");
         let bvh = match velomocap_motion::prepare_bvh(&clip, &model, clip.fps as f64) {

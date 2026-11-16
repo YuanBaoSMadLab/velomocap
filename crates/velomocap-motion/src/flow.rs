@@ -74,6 +74,12 @@ pub struct FlowConfig {
     /// Diagnostic: write the exact tensors the graph saw (`feature.bin`,
     /// `cam.bin`, `noise.bin`, `latent.bin`, `dims.json`) into this folder.
     pub dump: Option<std::path::PathBuf>,
+    /// Leave the clip in the network's datum and only report the floor it would
+    /// have been shifted by. A multi-person take needs one plane for every actor
+    /// (`flow_floor.resolve` takes the median over actors), so the caller asks
+    /// for the estimate first and applies the shared number with
+    /// [`shift_to_floor`] afterwards.
+    pub defer_floor: bool,
 }
 
 impl Default for FlowConfig {
@@ -85,6 +91,7 @@ impl Default for FlowConfig {
             blank_tokens: false,
             zero_noise: false,
             dump: None,
+            defer_floor: false,
         }
     }
 }
@@ -132,6 +139,51 @@ impl FlowClip {
             .map(|skeleton: &Skeleton| skeleton.joint(0))
             .collect()
     }
+}
+
+/// Move a clip onto a plane: subtract `floor` from the root and every joint.
+///
+/// `flow_floor.resolve` shifts the whole take, so this is a rigid translation
+/// and nothing else — the relative motion, and therefore the correction, is
+/// untouched. A second call is a no-op (`clip.floor` is updated each time).
+pub fn shift_to_floor(clip: &mut FlowClip, floor: f32) {
+    let delta = floor - clip.floor;
+    if delta == 0.0 {
+        return;
+    }
+    for pose in clip.poses.iter_mut() {
+        pose.translation[1] -= delta;
+    }
+    for skeleton in clip.skeletons.iter_mut() {
+        for point in skeleton.positions.chunks_exact_mut(3) {
+            point[1] -= delta;
+        }
+    }
+    clip.floor = floor;
+}
+
+/// `flow_floor.resolve`'s equal-actor median: one plane for the whole take.
+///
+/// Every actor estimates the plane from its own planted soles (5 % quantile,
+/// see [`crate::floor`]); the scene uses the median of those estimates, so one
+/// actor's bad stance cannot tilt the whole scene and two actors never stand on
+/// two different planes. `None` when no actor produced a reliable estimate.
+pub fn scene_floor(estimates: &[f32]) -> Option<f32> {
+    let mut sorted: Vec<f32> = estimates
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let middle = sorted.len() / 2;
+    Some(if sorted.len() % 2 == 0 {
+        0.5 * (sorted[middle - 1] + sorted[middle])
+    } else {
+        sorted[middle]
+    })
 }
 
 /// Build the `3072`-wide feature rows for one person.
@@ -313,7 +365,7 @@ pub fn generate(
     let pelvis_rest = [rest[0], rest[1], rest[2]];
     let motion = generator.decode_latent(&latent, count, pelvis_rest)?;
 
-    finish(track, motion, frames, camera, body, fps)
+    finish(track, motion, frames, camera, body, fps, config.defer_floor)
 }
 
 /// Write the tensors the graph saw, so an independent implementation can
@@ -359,6 +411,7 @@ fn finish(
     camera: &CameraTrack,
     body: &BodyModel,
     fps: f32,
+    defer_floor: bool,
 ) -> Result<FlowClip> {
     let count = motion.frames();
     anyhow::ensure!(count > 0, "FlowHMR produced no frames");
@@ -444,7 +497,7 @@ fn finish(
             (low, false)
         }
     };
-    if floor != 0.0 {
+    if floor != 0.0 && !defer_floor {
         for pose in poses.iter_mut() {
             pose.translation[1] -= floor;
         }
@@ -1055,6 +1108,78 @@ pub fn summarise(clip: &FlowClip) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// A clip's own floor is not the scene's: `flow_floor.resolve` takes the
+    /// median over the actors, so one actor's bad stance cannot tilt the scene and
+    /// two actors never stand on two different planes.
+    #[test]
+    fn the_scene_floor_is_the_median_over_the_actors() {
+        assert_eq!(scene_floor(&[0.30]), Some(0.30));
+        assert_eq!(scene_floor(&[0.30, 0.10, 0.20]), Some(0.20));
+        assert_eq!(scene_floor(&[0.30, 0.10]), Some(0.20));
+        assert_eq!(scene_floor(&[]), None);
+        // A clip without a reliable estimate must not vote.
+        assert_eq!(scene_floor(&[f32::NAN, 0.20, f32::INFINITY]), Some(0.20));
+    }
+
+    /// Moving a clip onto another plane is a rigid translation: the root and every
+    /// joint move, the motion between them does not, and asking twice does
+    /// nothing.
+    #[test]
+    fn shifting_to_a_floor_moves_the_whole_take_once() {
+        let mut clip = scene_clip(&[1.0, 1.2, 1.4]);
+        shift_to_floor(&mut clip, 0.25);
+        assert_eq!(clip.floor, 0.25);
+        for (index, pose) in clip.poses.iter().enumerate() {
+            assert!((pose.translation[1] - ([1.0f32, 1.2, 1.4][index] - 0.25)).abs() < 1e-6);
+        }
+        for (index, skeleton) in clip.skeletons.iter().enumerate() {
+            let expected = [1.0f32, 1.2, 1.4][index] - 0.25;
+            for point in skeleton.positions.chunks_exact(3) {
+                assert!((point[1] - expected).abs() < 1e-6, "joint at {:.3}", point[1]);
+            }
+        }
+        // The relative motion is untouched: the root still rises 0.2 m per frame.
+        let roots: Vec<f32> = clip.poses.iter().map(|pose| pose.translation[1]).collect();
+        assert!(((roots[1] - roots[0]) - 0.2).abs() < 1e-6);
+        // A second call is a no-op.
+        let before: Vec<f32> = clip.poses.iter().map(|pose| pose.translation[1]).collect();
+        shift_to_floor(&mut clip, 0.25);
+        let after: Vec<f32> = clip.poses.iter().map(|pose| pose.translation[1]).collect();
+        assert_eq!(before, after);
+    }
+
+    /// A minimal clip standing at `heights` on its own datum, one joint per pose.
+    fn scene_clip(heights: &[f32]) -> FlowClip {
+        FlowClip {
+            fps: 30.0,
+            poses: heights
+                .iter()
+                .map(|height| {
+                    let mut pose = Pose::neutral(52, 16);
+                    pose.translation = [0.0, *height, 0.0];
+                    pose
+                })
+                .collect(),
+            skeletons: heights
+                .iter()
+                .map(|height| Skeleton {
+                    positions: vec![0.0, *height, 0.0],
+                    rotations: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                })
+                .collect(),
+            rot6d: Vec::new(),
+            trans: heights.iter().map(|height| [0.0, *height, 0.0]).collect(),
+            betas: vec![0.0; 16],
+            foot_contacts: Vec::new(),
+            floor: 0.0,
+            floor_from_contacts: true,
+            offset: [0.0; 3],
+            source_frames: (0..heights.len()).collect(),
+            anchors: 0,
+            anchor_residual: [0.0; 3],
+        }
+    }
+
     /// `flow_hand_sampling`: hand slots are taken on frames 0, 4, 8, … and the
     /// last one, and linearly interpolated in between; the body slot is never
     /// touched.
@@ -1141,3 +1266,4 @@ mod tests {
         assert_eq!(plain(&mut vec![4.0, 1.0]), 2.5);
     }
 }
+
