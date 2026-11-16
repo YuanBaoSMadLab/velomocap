@@ -249,6 +249,10 @@ pub struct FlowClipData {
     /// locks so an automatic track shows what it is following instead of the
     /// word "automatic".
     pub contacts: [Vec<[usize; 2]>; velomocap_motion::TRACK_COUNT],
+    /// The generated clip **before** the contact correction: the input an
+    /// "apply correction" run needs, so changing a preset or drawing a lock does
+    /// not have to re-run the model. A few hundred KB for a 90-frame take.
+    pub source: Arc<velomocap_motion::FlowClip>,
 }
 
 /// Where the motion models live, and how much of the clip to animate.
@@ -299,6 +303,68 @@ pub struct CaptureJob {
     pub handle: Option<JoinHandle<()>>,
     pub cancel: Arc<AtomicBool>,
     pub shared: Arc<Mutex<CaptureShared>>,
+}
+
+/// What "apply correction" needs to re-solve one take without the model.
+#[derive(Clone)]
+pub struct TakeSource {
+    pub name: String,
+    pub first_frame: usize,
+    /// The generated motion, before the contact correction.
+    pub source: Arc<velomocap_motion::FlowClip>,
+}
+
+/// Re-run the contact correction on already generated takes.
+///
+/// The reference's `Apply Correction` button: it starts from the motion the model
+/// produced and re-applies the current settings and the timeline's locks, so a
+/// preset change or a drawn lock costs the correction (and the skinning), not a
+/// full inference run. The SMPL-H model is loaded here and dropped again.
+pub fn recorrect(
+    takes: &[TakeSource],
+    body_path: &std::path::Path,
+    settings: &velomocap_motion::correction::CorrectionSettings,
+    locks: &velomocap_motion::ContactTracks,
+) -> anyhow::Result<Vec<FlowClipData>> {
+    let has_posedirs = velomocap_body::npz::members(body_path)
+        .map(|names| {
+            names
+                .iter()
+                .any(|name| name == "posedirs" || name.starts_with("posedirs."))
+        })
+        .unwrap_or(false);
+    let mut model = velomocap_body::BodyModel::load(body_path, 16)?;
+    if has_posedirs {
+        model = model.with_posedirs()?;
+    }
+    let mut out = Vec::with_capacity(takes.len());
+    for take in takes {
+        let mut clip = (*take.source).clone();
+        let correction = velomocap_motion::correction::apply_with_locks(
+            &mut clip, &model, settings, locks,
+        )?;
+        let mut bodies = Vec::with_capacity(clip.frames());
+        for pose in clip.poses.iter() {
+            match model.forward_mesh(pose) {
+                Ok((_, vertices)) => bodies.push(vertices),
+                Err(_) => bodies.push(Vec::new()),
+            }
+        }
+        let mut summary = velomocap_motion::summarise_flow(&clip);
+        summary.push(correction.line());
+        let bvh = velomocap_motion::prepare_bvh(&clip, &model, clip.fps as f64)?;
+        out.push(FlowClipData {
+            name: take.name.clone(),
+            first_frame: take.first_frame,
+            frames: Arc::new(bodies),
+            summary: summary.join("; "),
+            bvh: Arc::new(bvh),
+            skeletons: Arc::new(clip.skeletons.clone()),
+            contacts: correction.detected.clone(),
+            source: Arc::clone(&take.source),
+        });
+    }
+    Ok(out)
 }
 
 impl CaptureJob {
@@ -608,6 +674,10 @@ fn run_flow(
     let mut clips = Vec::new();
     for (slot, mut clip) in generated {
         let person = &people[slot];
+        // Keep the generated motion as it came out of the model: this is what an
+        // "apply correction" run starts from, so a settings or lock edit does not
+        // pay for inference again.
+        let source = Arc::new(clip.clone());
         // Contact correction runs on the generated clip, so the viewport and
         // every export see the same corrected motion. The user's lock tracks go
         // with it: an edited limb follows the drawing, the rest follows detection.
@@ -664,6 +734,7 @@ fn run_flow(
             bvh: Arc::new(bvh),
             skeletons: Arc::new(clip.skeletons.clone()),
             contacts: correction.detected.clone(),
+            source,
         });
         if sentinel() {
             break;
@@ -831,6 +902,81 @@ mod tests {
         eprintln!(
             "probe: {}x{}, {:.2} fps, {} frames",
             probe.frame.width, probe.frame.height, probe.fps, probe.frames
+        );
+    }
+
+    /// "Apply Correction" without the model: a take's source is re-solved, skinned
+    /// and baked into a complete take, and the source is left untouched so the
+    /// action can be repeated with a different preset.
+    #[test]
+    fn applying_correction_rebuilds_a_take_from_its_source() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/body_models/smplh/neutral/model.npz");
+        if !path.is_file() {
+            eprintln!("skipping: no SMPL-H model at {}", path.display());
+            return;
+        }
+        let frames = 18usize;
+        let body = velomocap_body::BodyModel::load(&path, 16).expect("body");
+        // A neutral body hovering 3 cm over the floor, both feet confidently
+        // planted: the correction has something to do, and it is cheap to build.
+        let mut pose = velomocap_body::Pose::neutral(body.num_joints, 16);
+        let flat = body.forward_joints(&pose);
+        let lowest = flat
+            .positions
+            .chunks_exact(3)
+            .map(|point| point[1])
+            .fold(f32::INFINITY, f32::min);
+        pose.translation = [0.0, 0.03 - lowest, 0.0];
+        let source = velomocap_motion::FlowClip {
+            fps: 30.0,
+            poses: vec![pose.clone(); frames],
+            skeletons: vec![body.forward_joints(&pose); frames],
+            rot6d: Vec::new(),
+            trans: vec![[0.0; 3]; frames],
+            betas: vec![0.0; 16],
+            foot_contacts: vec![[1.0f32; 4]; frames],
+            floor: 0.0,
+            floor_from_contacts: true,
+            offset: [0.0; 3],
+            source_frames: (0..frames).collect(),
+            anchors: 0,
+            anchor_residual: [0.0; 3],
+        };
+        let before = source.clone();
+        let takes = vec![TakeSource {
+            name: "Person 1".into(),
+            first_frame: 0,
+            source: Arc::new(source),
+        }];
+        let settings = velomocap_motion::correction::CorrectionSettings::default();
+        let locks = velomocap_motion::ContactTracks::automatic();
+        let rebuilt = recorrect(&takes, &path, &settings, &locks).expect("recorrect");
+        assert_eq!(rebuilt.len(), 1);
+        let take = &rebuilt[0];
+        assert_eq!(take.name, "Person 1");
+        assert_eq!(take.frames.len(), frames, "every frame is re-skinned");
+        assert!(
+            take.frames.iter().all(|vertices| !vertices.is_empty()),
+            "a skinned body is never empty"
+        );
+        assert_eq!(take.skeletons.len(), frames);
+        assert_eq!(take.bvh.frames(), frames, "the BVH is rebuilt too");
+        assert!(
+            take.summary.contains("correction:"),
+            "the summary carries the pass: {}",
+            take.summary
+        );
+        assert!(
+            take.summary.contains("ground"),
+            "the grounding shift is in the report: {}",
+            take.summary
+        );
+        // The solver input survives, so the action can be repeated.
+        assert_eq!(take.source.poses.len(), frames);
+        assert_eq!(
+            take.source.poses[0].translation, before.poses[0].translation,
+            "the source must not be corrected in place"
         );
     }
 }

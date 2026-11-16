@@ -57,7 +57,7 @@ const REACH_SIGMA: f64 = 0.0005;
 const ROOT_LIMIT: f64 = 0.02;
 
 /// Plan the root height. Returns one height per frame.
-pub fn plan(frames: &[Frame], floor: f64, fps: f64, flat: bool) -> Vec<f64> {
+pub fn plan(frames: &[Frame], floor: f64, fps: f64, _flat: bool) -> Vec<f64> {
     let count = frames.len();
     if count < 3 {
         return frames.iter().map(|frame| frame.base).collect();
@@ -243,5 +243,7 @@ mod tests {
         }
     }
 }
+
+
 
 

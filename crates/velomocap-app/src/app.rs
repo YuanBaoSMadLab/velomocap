@@ -89,6 +89,30 @@ fn is_builtin_path(path: &Path) -> bool {
     };
     path.parent() == Some(folder.as_path())
 }
+/// One "apply correction" run: the rebuilt takes, or why it failed.
+#[derive(Default)]
+pub struct RecorrectShared {
+    pub finished: bool,
+    pub error: Option<String>,
+    pub takes: Vec<crate::capture::FlowClipData>,
+    pub elapsed: f64,
+}
+
+/// The request itself lives in the app while the worker owns the model.
+pub struct RecorrectJob {
+    pub handle: Option<std::thread::JoinHandle<()>>,
+    pub shared: Arc<Mutex<RecorrectShared>>,
+}
+
+impl RecorrectJob {
+    pub fn is_running(&self) -> bool {
+        self.handle
+            .as_ref()
+            .map(|handle| !handle.is_finished())
+            .unwrap_or(false)
+    }
+}
+
 #[derive(Clone)]pub struct FlowBody {
     pub name: String,
         pub first_frame: usize,
@@ -98,7 +122,12 @@ fn is_builtin_path(path: &Path) -> bool {
     /// The clip's joint rotations per frame, for posing an imported character.
     pub skeletons: Arc<Vec<velomocap_body::Skeleton>>,
     /// Automatic contact runs per track, for the timeline's "automatic" rows.
-    pub contacts: [Vec<[usize; 2]>; velomocap_motion::TRACK_COUNT],}
+    pub contacts: [Vec<[usize; 2]>; velomocap_motion::TRACK_COUNT],
+    /// The generated motion before the contact correction, when this take was
+    /// generated in this session. `None` for a take loaded from a project: the
+    /// project stores the baked result, not the solver's input.
+    pub source: Option<Arc<velomocap_motion::FlowClip>>,
+}
 impl FlowBody {
         pub fn frame(&self, playhead: usize) -> Option<&[f32]> {
         let index = playhead.checked_sub(self.first_frame)?;
@@ -412,7 +441,12 @@ pub struct VeloMocap {
     pub asset_names: Vec<String>,
     pub tools_ok: bool,
     pub ort_path: Option<PathBuf>,
-    pub cuda_ok: bool,}
+    pub cuda_ok: bool,
+    /// The "apply correction" run in flight, if any.
+    pub recorrect: Option<RecorrectJob>,
+    /// What the last apply said, for the sidebar and the console.
+    pub recorrect_note: String,
+}
 impl VeloMocap {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         ui::configure(&cc.egui_ctx);
@@ -568,6 +602,8 @@ impl VeloMocap {
         asset_folder: String::new(),
         asset_status: String::new(),
         asset_names: Vec::new(),
+        recorrect: None,
+        recorrect_note: String::new(),
         };
         if let Some(out) = render_probe.clone() {
             let model = app.smplh_model.display().to_string();
@@ -2007,6 +2043,129 @@ impl VeloMocap {
             self.log("Cancellation requested.");
         }
     }
+
+    /// Whether "apply correction" has anything it can start from.
+    ///
+    /// A take loaded from a project has no solver input (`source`), and the run
+    /// needs the generated motion, not the baked one — regenerating is the only
+    /// way for those.
+    pub fn can_apply_correction(&self) -> bool {
+        self.capture.is_none()
+            && self.recorrect.is_none()
+            && self.flow.iter().any(|take| take.source.is_some())
+    }
+
+    /// The reference's "Apply Correction": re-solve the contact correction on the
+    /// takes already generated, with the current settings and locks.
+    pub fn apply_correction(&mut self) {
+        if !self.can_apply_correction() {
+            return;
+        }
+        let takes: Vec<capture::TakeSource> = self
+            .flow
+            .iter()
+            .filter_map(|take| {
+                Some(capture::TakeSource {
+                    name: take.name.clone(),
+                    first_frame: take.first_frame,
+                    source: take.source.clone()?,
+                })
+            })
+            .collect();
+        if takes.is_empty() {
+            return;
+        }
+        let body = self.smplh_model.clone();
+        let settings = self.correction.clone();
+        let locks = self.locks.clone();
+        let shared = Arc::new(Mutex::new(RecorrectShared::default()));
+        let worker = Arc::clone(&shared);
+        let started = Instant::now();
+        let handle = std::thread::Builder::new()
+            .name("velomocap-correction".into())
+            .spawn(move || {
+                let outcome = capture::recorrect(&takes, &body, &settings, &locks);
+                if let Ok(mut state) = worker.lock() {
+                    match outcome {
+                        Ok(takes) => state.takes = takes,
+                        Err(error) => state.error = Some(format!("{error:#}")),
+                    }
+                    state.elapsed = started.elapsed().as_secs_f64();
+                    state.finished = true;
+                }
+            })
+            .ok();
+        self.recorrect = Some(RecorrectJob { handle, shared });
+        self.recorrect_note = i18n::t("Applying correction…").into();
+        self.status = self.recorrect_note.clone();
+        self.log(format!(
+            "Apply Correction: {} take(s), preset {}, floor {:+.3} m, {} lock run(s).",
+            self.flow.len(),
+            match self.correction.preset {
+                velomocap_motion::correction::LockPreset::Tight => "tight",
+                velomocap_motion::correction::LockPreset::Normal => "normal",
+                velomocap_motion::correction::LockPreset::Loose => "loose",
+            },
+            self.correction.floor,
+            (0..velomocap_motion::TRACK_COUNT)
+                .map(|track| self.locks.track(track).map_or(0, <[_]>::len))
+                .sum::<usize>()
+        ));
+    }
+
+    /// Collect a finished "apply correction" run and put the takes back.
+    pub fn poll_recorrect(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.recorrect else { return };
+        if job.is_running() {
+            // The skinned meshes are rebuilt in the worker; keep painting.
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
+            return;
+        }
+        let (finished, error, takes, elapsed) = {
+            let state = job.shared.lock().unwrap();
+            (
+                state.finished,
+                state.error.clone(),
+                state.takes.clone(),
+                state.elapsed,
+            )
+        };
+        if !finished {
+            return;
+        }
+        self.recorrect = None;
+        if let Some(error) = error {
+            self.recorrect_note = format!("{}: {error}", i18n::t("Correction failed"));
+            self.error = Some(format!("{}: {error}", i18n::t("Apply Correction")));
+            self.log(format!("Apply Correction failed: {error}"));
+            return;
+        }
+        // Replace by name: the order the worker returns is the order it was given.
+        for rebuilt in takes {
+            if let Some(take) = self
+                .flow
+                .iter_mut()
+                .find(|take| take.name == rebuilt.name)
+            {
+                take.frames = rebuilt.frames;
+                take.summary = rebuilt.summary.clone();
+                take.bvh = rebuilt.bvh;
+                take.skeletons = rebuilt.skeletons;
+                take.contacts = rebuilt.contacts;
+            }
+            self.log(format!(
+                "correction applied to {} in {:.1} s: {}",
+                rebuilt.name, elapsed, rebuilt.summary
+            ));
+        }
+        self.recorrect_note = format!(
+            "{} {:.1} s",
+            i18n::t("Correction applied in"),
+            elapsed
+        );
+        self.status = self.recorrect_note.clone();
+        self.locks_dirty = false;
+    }
     /// Where the hand-drawn contact timing of this clip lives.
     pub fn locks_path(&self) -> Option<PathBuf> {
         self.video
@@ -2268,6 +2427,7 @@ impl VeloMocap {
                         bvh: clip.bvh,
                         skeletons: clip.skeletons,
                         contacts: clip.contacts,
+                        source: Some(clip.source),
                     })
                     .collect();
                                                                 self.orbit.framed = false;
@@ -2873,6 +3033,7 @@ impl eframe::App for VeloMocap {
         self.poll(ctx);
         self.poll_detection(ctx);
         self.poll_capture(ctx);
+        self.poll_recorrect(ctx);
         self.poll_stream(ctx);
         self.poll_asset_export(ctx);
         self.shortcuts(ctx);

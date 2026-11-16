@@ -2536,6 +2536,37 @@ fn correction_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
                         .suffix(" m"),
                 );
             });
+            ui.add_space(4.0);
+            // `Apply Correction`: re-solve the contact correction on the takes
+            // already generated, with these settings and the timeline's locks —
+            // no inference. The reference puts the same button here.
+            let enabled = app.can_apply_correction();
+            let label = egui::RichText::new(i18n::t("Apply Correction")).size(11.0);
+            if ui
+                .add_enabled(enabled, egui::Button::new(label).min_size(egui::vec2(0.0, 22.0)))
+                .on_hover_text(i18n::t(
+                    "Re-solve the contacts with these settings and the timeline's locks, without running the model again",
+                ))
+                .on_disabled_hover_text(i18n::t(
+                    "Generate a motion first: a take loaded from a project has no saved solver input",
+                ))
+                .clicked()
+            {
+                app.apply_correction();
+            }
+            if !app.recorrect_note.is_empty() {
+                ui.label(
+                    egui::RichText::new(&app.recorrect_note)
+                        .size(9.5)
+                        .color(MUTED),
+                );
+            } else if app.locks_dirty {
+                ui.label(
+                    egui::RichText::new(i18n::t("Locks edited — apply to update the motion"))
+                        .size(9.5)
+                        .color(MUTED),
+                );
+            }
         });
     });
 }

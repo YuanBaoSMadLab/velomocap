@@ -734,6 +734,9 @@ pub fn clip(state: &ClipState, numbers: &Viewed<'_>) -> FlowBody {
         }),
         skeletons: Arc::new(skeletons),
         contacts: state.contacts.clone(),
+        // A project stores the baked take, not the solver's input: "apply
+        // correction" needs a regeneration first (the console says so).
+        source: None,
     }
 }
 

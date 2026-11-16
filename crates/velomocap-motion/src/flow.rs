@@ -97,6 +97,7 @@ impl Default for FlowConfig {
 }
 
 /// A generated clip, already decoded and placed.
+#[derive(Clone)]
 pub struct FlowClip {
     /// Frames per second the motion was generated at.
     pub fps: f32,
@@ -1266,4 +1267,5 @@ mod tests {
         assert_eq!(plain(&mut vec![4.0, 1.0]), 2.5);
     }
 }
+
 
