@@ -42,6 +42,9 @@ pub struct Texture {
     pub height: usize,
     /// RGBA8, row-major, top row first.
     pub rgba: Vec<u8>,
+    /// FBX puts (0, 0) at the bottom left; glTF and PMX put it at the top left.
+    /// Sampling has to know which, or a model's own image lands mirrored.
+    pub flip_v: bool,
 }
 
 impl Texture {
@@ -51,16 +54,23 @@ impl Texture {
             width: image.width() as usize,
             height: image.height() as usize,
             rgba: image.into_raw(),
+            flip_v: false,
         })
     }
 
-    /// Bilinear sample in glTF's UV convention (v up).
+    pub fn flipped(mut self) -> Texture {
+        self.flip_v = true;
+        self
+    }
+
+    /// Bilinear sample.
     pub fn sample(&self, u: f32, v: f32) -> [f32; 3] {
         if self.width == 0 || self.height == 0 || self.rgba.len() < self.width * self.height * 4 {
             return [1.0; 3];
         }
+        let v = if self.flip_v { 1.0 - v } else { v };
         let x = u.fract().rem_euclid(1.0) * self.width as f32 - 0.5;
-        let y = (1.0 - v).fract().rem_euclid(1.0) * self.height as f32 - 0.5;
+        let y = v.fract().rem_euclid(1.0) * self.height as f32 - 0.5;
         let (x0, y0) = (x.floor(), y.floor());
         let (fx, fy) = (x - x0, y - y0);
         let at = |px: f32, py: f32| -> [f32; 3] {
@@ -162,7 +172,7 @@ impl Character {
         let mut cursor = Cursor { data: bytes, offset: 0 };
         anyhow::ensure!(bytes.starts_with(b"PMX "), "not a PMX file");
         cursor.offset = 4;
-        let _version = cursor.f32();
+        let version = cursor.f32();
         let settings = cursor.u8() as usize;
         let settings_start = cursor.offset;
         let encoding = cursor.u8();
@@ -180,6 +190,13 @@ impl Character {
 
         let vertices = cursor.i32();
         anyhow::ensure!(vertices > 0, "the PMX has no vertices");
+        let debug = std::env::var_os("VELOMOCAP_DEBUG_PMX").is_some();
+        if debug {
+            eprintln!(
+                "pmx: version {version} settings {settings} encoding {encoding} extra_uvs {extra_uvs} vertex_idx {vertex_index_size} texture_idx {texture_index_size} bone_idx {bone_index_size}, vertices {vertices} at {}",
+                cursor.offset
+            );
+        }
         let mut rest = Vec::with_capacity(vertices as usize * 3);
         let mut uv: Vec<[f32; 2]> = Vec::with_capacity(vertices as usize);
         let mut joints: Vec<[u16; 4]> = Vec::with_capacity(vertices as usize);
@@ -240,6 +257,9 @@ impl Character {
 
         let indices = cursor.i32();
         anyhow::ensure!(indices > 0, "the PMX has no faces");
+        if debug {
+            eprintln!("pmx: {indices} indices at {:#x}", cursor.offset);
+        }
         let mut faces = Vec::with_capacity(indices as usize / 3);
         for _ in 0..indices {
             let index = match vertex_index_size {
@@ -255,11 +275,27 @@ impl Character {
         for _ in 0..textures.max(0) {
             texture_paths.push(cursor.text(encoding));
         }
+        if debug {
+            eprintln!(
+                "pmx: {textures} textures ({:?}) at {:#x}",
+                texture_paths.iter().take(2).collect::<Vec<_>>(),
+                cursor.offset
+            );
+        }
         let mut first_texture: Option<usize> = None;
         let materials = cursor.i32();
-        for _ in 0..materials.max(0) {
-            for _ in 0..4 {
+        if debug {
+            eprintln!("pmx: {materials} materials at {:#x}", cursor.offset);
+        }
+        for index in 0..materials.max(0) {
+            // Name and English name; the memo is at the end of the record. Four
+            // texts here read the diffuse colour as a length and walked the
+            // cursor out of the material list entirely.
+            for _ in 0..2 {
                 let _ = cursor.text(encoding);
+            }
+            if debug && index < 2 {
+                eprintln!("pmx: material {index} names end at {:#x}", cursor.offset);
             }
             // Diffuse 4, specular 3, specular strength 1, ambient 3.
             for _ in 0..11 {
@@ -272,12 +308,32 @@ impl Character {
             let texture = cursor.index(texture_index_size);
             let _sphere = cursor.index(texture_index_size);
             cursor.u8(); // sphere mode
+            if debug && index < 2 {
+                eprintln!("pmx: material {index} colour end at {:#x}", cursor.offset);
+            }
             if cursor.u8() == 0 {
                 let _ = cursor.index(texture_index_size);
             } else {
                 cursor.u8();
             }
+            if debug && index < 2 {
+                eprintln!("pmx: material {index} toon end at {:#x}", cursor.offset);
+            }
             let _ = cursor.text(encoding);
+            // Some exporters append one more i32 after the memo (the MMD model
+            // reported as "the PMX has no bones" writes a per-material number
+            // there — 10644 for its first material). Peek at the next record's
+            // name length instead of trusting the layout: a real length is small
+            // and is followed by decodable text.
+            if index + 1 < materials {
+                let here = cursor.offset;
+                if !Cursor::looks_like_text(bytes, here, encoding) {
+                    cursor.offset = here + 4;
+                }
+                if debug && index < 2 {
+                    eprintln!("pmx: material {index} next record at {:#x}", cursor.offset);
+                }
+            }
             // The first material's base-colour texture is the model's skin.
             if first_texture.is_none() && texture >= 0 {
                 first_texture = Some(texture as usize);
@@ -285,6 +341,9 @@ impl Character {
         }
 
         let bone_count = cursor.i32();
+        if debug {
+            eprintln!("pmx: {bone_count} bones at {:#x}", cursor.offset);
+        }
         anyhow::ensure!(bone_count > 0, "the PMX has no bones");
         let mut bones = Vec::with_capacity(bone_count as usize);
         for _ in 0..bone_count {
@@ -363,7 +422,7 @@ impl Character {
             .collect();
         let texture = first_texture
             .and_then(|index| texture_paths.get(index))
-            .and_then(|reference| load_texture(folder, reference));
+            .and_then(|reference| load_texture(folder, reference, false));
         Ok(finalize(
             name, bones, rest, joints, weights, faces, uv, texture,
         ))
@@ -639,7 +698,7 @@ impl Character {
                 .and_then(|name| name.props.first())
                 .and_then(|prop| prop.as_str().map(|value| value.to_string()))
                 .or_else(|| node.str_at(1).map(|value| value.to_string()))
-                .and_then(|reference| load_texture(folder, &reference))
+                .and_then(|reference| load_texture(folder, &reference, true))
         });
         Ok(finalize(name, bones, rest, joints, weights, faces, uv, texture))
     }
@@ -996,6 +1055,37 @@ impl<'a> Cursor<'a> {
             String::from_utf8_lossy(bytes).to_string()
         }
     }
+
+    /// Whether a PMX text record starts here: a short length followed by
+    /// decodable characters. Used to step over the extra i32 some exporters add.
+    fn looks_like_text(data: &[u8], at: usize, encoding: u8) -> bool {
+        let Some(raw) = data.get(at..at + 4) else {
+            return false;
+        };
+        let length = i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        if length < 0 || length > 512 {
+            return false;
+        }
+        let start = at + 4;
+        let end = start + length as usize;
+        let Some(text) = data.get(start..end) else {
+            return false;
+        };
+        if length == 0 {
+            return true;
+        }
+        if encoding == 0 {
+            if text.len() % 2 != 0 {
+                return false;
+            }
+            text.chunks_exact(2).all(|pair| {
+                let unit = u16::from_le_bytes([pair[0], pair[1]]);
+                unit == 0 || (unit >= 0x20 && unit != 0x7f)
+            })
+        } else {
+            std::str::from_utf8(text).is_ok()
+        }
+    }
 }
 
 /// Bring an imported character to human size and wrap it up.
@@ -1065,7 +1155,7 @@ fn finalize(
 ///
 /// MMD and FBX write Windows paths, sometimes with a subfolder that the export
 /// dropped, so a few spellings are tried before giving up.
-fn load_texture(folder: &Path, reference: &str) -> Option<Texture> {
+fn load_texture(folder: &Path, reference: &str, flip_v: bool) -> Option<Texture> {
     let normalised = reference.replace('\\', "/");
     let mut candidates = vec![folder.join(&normalised)];
     if let Some(name) = Path::new(&normalised).file_name() {
@@ -1076,7 +1166,7 @@ fn load_texture(folder: &Path, reference: &str) -> Option<Texture> {
     for candidate in candidates {
         if let Ok(bytes) = std::fs::read(&candidate) {
             if let Some(texture) = Texture::from_bytes(&bytes) {
-                return Some(texture);
+                return Some(if flip_v { texture.flipped() } else { texture });
             }
         }
     }
@@ -1451,7 +1541,7 @@ impl Gltf {
         if uri.starts_with("data:") {
             return None;
         }
-        load_texture(folder, uri)
+        load_texture(folder, uri, false)
     }
 
     fn read_vec2(&self, accessor: usize) -> Result<Vec<[f32; 2]>> {

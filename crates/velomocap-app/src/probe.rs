@@ -200,6 +200,7 @@ pub fn render_character(character_path: &str, out: &str) -> anyhow::Result<()> {
             width: size,
             height: size,
             rgba,
+            flip_v: false,
         }
     });
     let texture = checker.as_ref().or(character.texture.as_deref());
