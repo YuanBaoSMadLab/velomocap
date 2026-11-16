@@ -61,6 +61,17 @@ pub fn t(english: &'static str) -> &'static str {
         "Open video…" => "打开视频…",
         "Import video…" => "导入视频…",
         "Import character…" => "导入角色…",
+        "Open project…" => "打开工程…",
+        "Save project…" => "保存工程…",
+        "Open project" => "打开工程",
+        "Save project" => "保存工程",
+        "VeloMocap project" => "VeloMocap 工程",
+        "Load a .vp project: the video, the people, the motion, the avatars and the locks" => {
+            "读取 .vp 工程：视频、人物、动作、角色模型和锁定一起回来"
+        }
+        "Write the whole workspace to a .vp file, so reopening it does not run the reconstruction again" => {
+            "把整个工作区写进一个 .vp 文件，重新打开时不用再跑一遍重建"
+        }
         "Import a VRM / glTF humanoid and play the motion on it" => {
             "导入 VRM / glTF 人物，用它播放这段动作"
         }

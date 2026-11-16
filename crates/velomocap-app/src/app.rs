@@ -219,6 +219,12 @@ pub struct LockDrag {
 }
 pub struct VeloMocap {
     pub video: Option<PathBuf>,
+    /// The `.vp` this workspace was saved to or opened from, for the title and
+    /// for "save" without asking again.
+    pub project_path: Option<PathBuf>,
+    /// `--save-project`: write the workspace once the capture finishes, then
+    /// leave. Used to verify the round trip without a GUI.
+    pub save_after_capture: Option<PathBuf>,
     pub detector: PathBuf,
     pub sam3d_dir: PathBuf,
     pub params_dir: PathBuf,
@@ -364,6 +370,8 @@ impl VeloMocap {
             select,
             play_check,
             render_probe,
+            save_project,
+            open_project,
         } = cli_args();
         let tools_ok = velomocap_video::Tools::discover().is_ok();
         let ort_path = velomocap_infer::find_runtime_library();
@@ -427,6 +435,8 @@ impl VeloMocap {
             video_fps: 0.0,
             video_frames: 0,
             first_frame: None,
+            project_path: None,
+            save_after_capture: save_project.clone(),
             stream: crate::stream::VideoStream::spawn(),
             play_from: None,
             framed_selected: 0,
@@ -511,7 +521,37 @@ impl VeloMocap {
                 memory_mode.label()
             )),
         }
-        if let Some(path) = app.video.clone() {
+        if let Some(path) = open_project.clone() {
+            // A saved workspace brings its own video and clips; the argument is
+            // only used when there is no project to restore.
+            app.open_project(path);
+            // Re-saving a workspace that was just opened is the cheapest proof
+            // that a project round-trips without running anything again.
+            if let Some(out) = save_project.clone() {
+                app.save_project(out.clone());
+                let saved = app.error.is_none();
+                eprintln!(
+                    "project: {} {}",
+                    if saved { "saved" } else { "failed" },
+                    out.display()
+                );
+                std::process::exit(if saved { 0 } else { 1 });
+            }
+            if export || export_fbx {
+                app.export_bvh();
+                if export_fbx {
+                    app.export_fbx();
+                }
+                match &app.export_note {
+                    Some(note) => eprintln!("export: {note}"),
+                    None => eprintln!(
+                        "export: failed — {}",
+                        app.error.clone().unwrap_or_else(|| "unknown".into())
+                    ),
+                }
+                std::process::exit(if app.error.is_some() { 1 } else { 0 });
+            }
+        } else if let Some(path) = app.video.clone() {
             app.load_video(path);
                         app.playing = play;
         }
@@ -917,6 +957,300 @@ impl VeloMocap {
         } else {
             self.video_frames.max(1)
         }
+    }
+
+    /// Save the whole workspace — video, tracked bodies, baked clips, avatars,
+    /// locks and settings — to one `.vp` file.
+    pub fn save_project(&mut self, path: PathBuf) {
+        let path = if path.extension().is_none() {
+            path.with_extension(crate::project::EXTENSION)
+        } else {
+            path
+        };
+        let started = Instant::now();
+        let project = crate::project::Project::capture(self);
+        match project.save(&path) {
+            Ok(bytes) => {
+                let note = i18n::zh_en(
+                    &format!(
+                        "已保存 {}（{:.1} MB，{:.1} 秒）",
+                        path.display(),
+                        bytes as f64 / 1.0e6,
+                        started.elapsed().as_secs_f32()
+                    ),
+                    &format!(
+                        "Saved {} ({:.1} MB, {:.1} s)",
+                        path.display(),
+                        bytes as f64 / 1.0e6,
+                        started.elapsed().as_secs_f32()
+                    ),
+                );
+                self.log(note.clone());
+                self.status = note;
+                self.project_path = Some(path);
+            }
+            Err(error) => {
+                let note = format!("{error:#}");
+                self.log(i18n::zh_en(
+                    &format!("工程保存失败：{note}"),
+                    &format!("Could not save the project: {note}"),
+                ));
+                self.error = Some(note);
+            }
+        }
+    }
+
+    pub fn save_project_dialog(&mut self) {        let mut dialog = rfd::FileDialog::new()
+            .add_filter(i18n::t("VeloMocap project"), &[crate::project::EXTENSION])
+            .set_title(i18n::t("Save project"));
+        let stem = self
+            .video
+            .as_ref()
+            .and_then(|video| video.file_stem())
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "project".to_string());
+        if let Some(folder) = self.video.as_ref().and_then(|video| video.parent()) {
+            dialog = dialog.set_directory(folder);
+        }
+        let Some(path) = dialog
+            .set_file_name(format!("{stem}.{}", crate::project::EXTENSION))
+            .save_file()
+        else {
+            return;
+        };
+        self.save_project(path);
+    }
+
+    /// Ctrl+S: write over the file this workspace came from, or ask once.
+    pub fn save_project_here(&mut self) {
+        match self.project_path.clone() {
+            Some(path) => self.save_project(path),
+            None => self.save_project_dialog(),
+        }
+    }
+
+    pub fn open_project_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(i18n::t("VeloMocap project"), &[crate::project::EXTENSION])
+            .set_title(i18n::t("Open project"))
+            .pick_file()
+        else {
+            return;
+        };
+        self.open_project(path);
+    }
+
+    pub fn open_project(&mut self, path: PathBuf) {
+        match crate::project::Project::load(&path) {
+            Ok(project) => {
+                let (people, clips) = (project.document.people.len(), project.document.flow.len());
+                self.restore_project(&project);
+                let note = i18n::zh_en(
+                    &format!("已打开工程 {}（{people} 人，{clips} 条动作）", path.display()),
+                    &format!(
+                        "Opened {} ({people} people, {clips} motion clips)",
+                        path.display()
+                    ),
+                );
+                self.log(note.clone());
+                self.status = note;
+                self.project_path = Some(path);
+            }
+            Err(error) => {
+                let note = format!("{error:#}");
+                self.log(i18n::zh_en(
+                    &format!("工程读取失败：{note}"),
+                    &format!("Could not open the project: {note}"),
+                ));
+                self.error = Some(note);
+            }
+        }
+    }
+
+    /// Put a loaded project back on screen: the same take, the same bodies, the
+    /// same locks, without touching the reconstruction.
+    pub fn restore_project(&mut self, project: &crate::project::Project) {
+        let document = &project.document;
+        // Anything live from the previous workspace stops now: a running capture
+        // would overwrite the clips this file just brought back.
+        if let Some(job) = self.capture.take() {
+            job.cancel();
+        }
+        self.capture_started = None;
+        self.detecting = false;
+        self.detect_rx = None;
+        self.capture_live = false;
+        self.stream.restart();
+        self.play_from = None;
+        self.playing = false;
+        self.play_anchor = None;
+        self.exported = false;
+        self.export_note = None;
+        self.error = None;
+        self.preview = None;
+        self.preview_frame = usize::MAX;
+        self.first_frame = None;
+
+        match &document.video {
+            Some(video) => {
+                self.video = Some(video.path.clone());
+                self.video_fps = video.fps;
+                self.video_frames = video.frames;
+                self.video_size = (video.width, video.height);
+                self.capture_fps = video.capture_fps;
+                self.floor = video.floor;
+                // Only the idle preview needs decoding, and it is one frame: the
+                // same thread `load_video` uses, without starting a detection.
+                let slot: Arc<Mutex<Option<Result<capture::Probe, String>>>> =
+                    Arc::new(Mutex::new(None));
+                self.first_frame = Some(Arc::clone(&slot));
+                let path = video.path.clone();
+                std::thread::spawn(move || {
+                    let result =
+                        capture::probe_frame(&path, 640).map_err(|error| format!("{error:#}"));
+                    if let Ok(mut slot) = slot.lock() {
+                        *slot = Some(result);
+                    }
+                });
+            }
+            None => {
+                self.video = None;
+                self.video_fps = 0.0;
+                self.video_frames = 0;
+                self.video_size = (0, 0);
+                self.capture_fps = 0.0;
+            }
+        }
+
+        let numbers = project.view();
+        let mut notes: Vec<String> = Vec::new();
+        let people: Vec<PersonView> = document
+            .people
+            .iter()
+            .map(|state| {
+                let mut person = crate::project::person(state, &numbers);
+                if let Some(path) = &state.character {
+                    match crate::character::Character::load(path) {
+                        Ok(character) => {
+                            person.character = Some(AssignedCharacter {
+                                path: path.clone(),
+                                character: Arc::new(character),
+                            })
+                        }
+                        Err(error) => {
+                            notes.push(format!("{}: {error:#}", path.display()));
+                        }
+                    }
+                }
+                person
+            })
+            .collect();
+        self.people = people;
+        // An avatar is posed against the body model's rest pose; take it once if
+        // this workspace has one at all.
+        if self.people.iter().any(|person| person.character.is_some())
+            && self.character_rest.is_none()
+        {
+            let (rotations, positions) = self.rest_pose();
+            self.character_rest = rotations;
+            self.character_rest_positions = positions;
+        }
+        // The saved assignments are the truth from here on, not whatever the
+        // clip's sidecar would have restored.
+        self.characters_loaded = true;
+        self.flow = document
+            .flow
+            .iter()
+            .map(|state| crate::project::clip(state, &numbers))
+            .collect();
+        self.candidates = document
+            .candidates
+            .iter()
+            .map(crate::project::candidate)
+            .collect();
+        self.locks = document.locks.clone();
+        self.selected_lock = None;
+        self.lock_undo.clear();
+        self.lock_redo.clear();
+        self.lock_drag = None;
+        self.locks_pending = false;
+        self.locks_dirty = false;
+        self.flow_note = String::new();
+
+        let settings = &document.settings;
+        self.correction = settings.correction;
+        self.estimate_camera = settings.estimate_camera;
+        self.refine_camera = settings.refine_camera;
+        self.confidence = settings.confidence;
+        self.use_flow = settings.use_flow;
+        if let Some(mode) = crate::project::memory_mode_from_slug(&settings.memory_mode) {
+            self.memory_mode = mode;
+            self.gpu = mode.uses_gpu();
+        }
+        self.scale_width = settings.scale_width;
+        self.max_frames = settings.max_frames;
+        self.export_format = match settings.export_format.as_str() {
+            "bvh" => ExportFormat::Bvh,
+            "fbx" => ExportFormat::Fbx,
+            _ => ExportFormat::Both,
+        };
+        if let Some(rig) = velomocap_motion::retarget::Rig::from_slug(&settings.export_rig) {
+            self.export_rig = rig;
+        }
+        self.export_rest_correct = settings.export_rest_correct;
+        self.export_everyone = settings.export_everyone;
+        self.export_name = settings.export_name.clone();
+
+        let view = &document.view;
+        self.selected = view.selected.min(self.people.len().saturating_sub(1));
+        self.playhead = view.playhead.min(self.frame_count().saturating_sub(1));
+        self.play_speed = view.play_speed;
+        self.view_mode = view.mode;
+        self.layers = Layers {
+            bones: view.layers.bones,
+            grid: view.layers.grid,
+            motion_path: view.layers.motion_path,
+            names: view.layers.names,
+            follow: view.layers.follow,
+            overlays: view.layers.overlays,
+        };
+        self.orbit = Orbit {
+            yaw: view.orbit.yaw,
+            pitch: view.orbit.pitch,
+            distance: view.orbit.distance,
+            target: view.orbit.target,
+            framed: view.orbit.framed,
+        };
+        self.framed_selected = self.selected;
+        self.framed_after_capture = !self.flow.is_empty();
+
+        // Both topologies come with the models on disk, so they are rebuilt
+        // rather than saved: the file says which take this is, not which model
+        // build it was made with.
+        self.mesh = MeshTopology::load(&self.sam3d_dir)
+            .ok()
+            .map(Arc::new);
+        if self.smplh_faces.is_none() {
+            self.smplh_faces = self.body_faces();
+        }
+        self.view = crate::viewport::ViewportCache::default();
+        for note in notes {
+            self.log(i18n::zh_en(
+                &format!("角色没有载入：{note}"),
+                &format!("Character not loaded: {note}"),
+            ));
+        }
+    }
+
+    /// The SMPL-H triangle list, for drawing a baked clip's own body.
+    fn body_faces(&self) -> Option<Arc<Vec<[u32; 3]>>> {
+        let body = velomocap_body::BodyModel::load(&self.smplh_model, 16).ok()?;
+        Some(Arc::new(
+            body.faces
+                .chunks_exact(3)
+                .map(|face| [face[0], face[1], face[2]])
+                .collect(),
+        ))
     }
     pub fn current_fps(&self) -> f64 {
         if self.capture_fps > 0.0 {
@@ -1604,6 +1938,17 @@ impl VeloMocap {
                 ),
             }
         }
+        if finished && self.save_after_capture.is_some() {
+            let path = self.save_after_capture.take().unwrap();
+            self.save_project(path.clone());
+            let saved = self.error.is_none();
+            eprintln!(
+                "project: {} {}",
+                if saved { "saved" } else { "failed" },
+                path.display()
+            );
+            std::process::exit(if saved { 0 } else { 1 });
+        }
         if let Some(error) = failed {
                         eprintln!("capture failed: {error}");
             self.error = Some(error);
@@ -1869,6 +2214,20 @@ impl VeloMocap {
         if ctx.wants_keyboard_input() {
             return;
         }
+        let (save, open) = ctx.input(|input| {
+            (
+                input.modifiers.command && input.key_pressed(egui::Key::S),
+                input.modifiers.command && input.key_pressed(egui::Key::O),
+            )
+        });
+        if save {
+            self.save_project_here();
+            return;
+        }
+        if open {
+            self.open_project_dialog();
+            return;
+        }
         let (space, left, right, home, end, shift) = ctx.input(|input| {
             (
                 input.key_pressed(egui::Key::Space),
@@ -1991,6 +2350,8 @@ fn cli_args() -> CliArgs {
     let mut frame = 0usize;
     let mut export = false;
     let mut export_fbx = false;
+    let mut save_project = None;
+    let mut open_project = None;
     let mut detect_only = false;
     let mut play_check: Option<usize> = None;
     let mut render_probe: Option<String> = None;
@@ -2027,6 +2388,18 @@ fn cli_args() -> CliArgs {
                 }
             }
             "--export-fbx" => export_fbx = true,
+            // Headless project round-tripping: save after a capture, or open a
+            // saved workspace and leave without touching the GUI.
+            "--save-project" => {
+                if let Some(value) = args.next() {
+                    save_project = Some(PathBuf::from(value));
+                }
+            }
+            "--open-project" => {
+                if let Some(value) = args.next() {
+                    open_project = Some(PathBuf::from(value));
+                }
+            }
             other if !other.starts_with("--") => video = Some(PathBuf::from(other)),
             _ => {}
         }
@@ -2043,6 +2416,8 @@ fn cli_args() -> CliArgs {
         select,
         play_check,
         render_probe,
+        save_project,
+        open_project,
     }}
 struct CliArgs {
     video: Option<PathBuf>,
@@ -2056,6 +2431,8 @@ struct CliArgs {
     select: Option<usize>,
     play_check: Option<usize>,
     render_probe: Option<String>,
+    save_project: Option<PathBuf>,
+    open_project: Option<PathBuf>,
 }
 impl eframe::App for VeloMocap {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {

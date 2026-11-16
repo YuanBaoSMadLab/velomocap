@@ -82,7 +82,8 @@ const RIGHT_ELBOW: usize = 19;
 const LEFT_WRIST: usize = 20;
 const RIGHT_WRIST: usize = 21;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Kept in the project file, so it round-trips with the take's other settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CorrectionMode {
     /// Every foot is pinned to one ground height.
     Flat,
@@ -90,14 +91,14 @@ pub enum CorrectionMode {
     MultiLevel,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LockPreset {
     Tight,
     Normal,
     Loose,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CorrectionSettings {
     pub enabled: bool,
     pub mode: CorrectionMode,

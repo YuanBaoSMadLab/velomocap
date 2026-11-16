@@ -3387,6 +3387,7 @@ dependencies = [
  "anyhow",
  "eframe",
  "egui",
+ "flate2",
  "image",
  "rfd",
  "serde",

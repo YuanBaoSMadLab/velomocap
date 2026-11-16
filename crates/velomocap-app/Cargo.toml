@@ -18,6 +18,7 @@ velomocap-motion = { path = "../velomocap-motion" }
 velomocap-models = { path = "../velomocap-models" }
 velomocap-body = { path = "../velomocap-body" }
 anyhow.workspace = true
+flate2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 eframe = { version = "0.32", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }

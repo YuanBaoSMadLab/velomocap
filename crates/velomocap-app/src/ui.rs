@@ -182,6 +182,35 @@ fn menu_bar(app: &mut VeloMocap, ctx: &egui::Context) {
         .show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button(i18n::t("File"), |ui| {
+                    // The workspace goes first: a project is the document this
+                    // app edits, and everything else in this menu acts on it.
+                    if ui
+                        .add(
+                            egui::Button::new(i18n::t("Open project…"))
+                                .shortcut_text("Ctrl+O"),
+                        )
+                        .on_hover_text(i18n::t(
+                            "Load a .vp project: the video, the people, the motion, the avatars and the locks",
+                        ))
+                        .clicked()
+                    {
+                        ui.close();
+                        app.open_project_dialog();
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(i18n::t("Save project…"))
+                                .shortcut_text("Ctrl+S"),
+                        )
+                        .on_hover_text(i18n::t(
+                            "Write the whole workspace to a .vp file, so reopening it does not run the reconstruction again",
+                        ))
+                        .clicked()
+                    {
+                        ui.close();
+                        app.save_project_dialog();
+                    }
+                    ui.separator();
                     if ui.button(i18n::t("Import video…")).clicked() {
                         ui.close();
                         app.open_video_dialog();
