@@ -819,6 +819,7 @@ fn grounding_pass(
     let mut planted = vec![false; count];
     for frame in 0..count {
         let mut low = f32::MAX;
+        let mut any = false;
         for foot_index in 0..2 {
             if !foot.support[frame][foot_index] {
                 continue;
@@ -826,8 +827,14 @@ fn grounding_pass(
             let row = &detection.rows[frame][foot_index];
             // The lower of the two sole patches carries the weight.
             low = low.min(row[0][1]).min(row[1][1]);
+            any = true;
         }
-        if low.is_finite() {
+        // `any`, not `is_finite`: `f32::MAX` *is* finite, so a swing frame was
+        // being handed to the grounding curve as "planted at 3.4e38 m". The
+        // desired shift for it clamps to -0.75 m and the smoothed curve dragged
+        // the whole body to the floor — which is how a jump ended up pinned to
+        // the ground.
+        if any {
             height[frame] = low;
             planted[frame] = true;
         }
@@ -835,6 +842,7 @@ fn grounding_pass(
     if !planted.iter().any(|hit| *hit) {
         return;
     }
+
     let shift = crate::root_height::grounding(&height, &planted, settings.floor, clip.fps);
     let mut moved = 0.0f32;
     for frame in 0..count {
@@ -3543,6 +3551,8 @@ mod tests {
         assert!(drift < 1e-5, "hips drifted {drift}");
     }
 }
+
+
 
 
 
