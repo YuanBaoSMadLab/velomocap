@@ -392,6 +392,7 @@ impl VeloMocap {
             play_check,
             render_probe,
             render_character,
+            render_pose,
             save_project,
             open_project,
             storage_precision,
@@ -541,6 +542,14 @@ impl VeloMocap {
         if let Some((file, out)) = render_character.clone() {
             if let Err(error) = crate::probe::render_character(&file, &out) {
                 eprintln!("render-character failed: {error:#}");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+        if let Some((file, project, frame, out)) = render_pose.clone() {
+            let model = app.smplh_model.display().to_string();
+            if let Err(error) = crate::probe::render_pose(&model, &file, &project, frame, &out) {
+                eprintln!("render-pose failed: {error:#}");
                 std::process::exit(1);
             }
             std::process::exit(0);
@@ -2581,6 +2590,7 @@ fn cli_args() -> CliArgs {
     let mut play_check: Option<usize> = None;
     let mut render_probe: Option<String> = None;
     let mut render_character: Option<(String, String)> = None;
+    let mut render_pose: Option<(String, String, usize, String)> = None;
     let mut select: Option<usize> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -2606,6 +2616,17 @@ fn cli_args() -> CliArgs {
             "--render-character" => {
                 if let (Some(file), Some(out)) = (args.next(), args.next()) {
                     render_character = Some((file, out));
+                }
+            }
+            "--render-pose" => {
+                let file = args.next();
+                let project = args.next();
+                let frame = args.next().and_then(|value| value.parse().ok());
+                let out = args.next();
+                if let (Some(file), Some(project), Some(frame), Some(out)) =
+                    (file, project, frame, out)
+                {
+                    render_pose = Some((file, project, frame, out));
                 }
             }
             "--play-check" => {
@@ -2670,6 +2691,7 @@ fn cli_args() -> CliArgs {
         play_check,
         render_probe,
         render_character,
+        render_pose,
         save_project,
         open_project,
         storage_precision,
@@ -2688,6 +2710,7 @@ struct CliArgs {
     play_check: Option<usize>,
     render_probe: Option<String>,
     render_character: Option<(String, String)>,
+    render_pose: Option<(String, String, usize, String)>,
     save_project: Option<PathBuf>,
     open_project: Option<PathBuf>,
     storage_precision: Option<crate::project::Precision>,

@@ -7,6 +7,7 @@
 
 use std::io::Write;
 
+use anyhow::Context;
 use velomocap_body::{BodyModel, Pose};
 
 use crate::render::{self, Camera, Canvas};
@@ -140,6 +141,79 @@ pub fn render_character(character_path: &str, out: &str) -> anyhow::Result<()> {
     let character =
         crate::character::Character::load(std::path::Path::new(character_path))?;
     let verts = character.rest.clone();
+    rasterize(&character, &verts, out)
+}
+
+/// Render a character posed by a saved take's clip, so the viewport's actual
+/// result can be inspected off screen. `frame` is the clip's own frame index.
+pub fn render_pose(
+    model: &str,
+    character_path: &str,
+    project_path: &str,
+    frame: usize,
+    out: &str,
+) -> anyhow::Result<()> {
+    let character =
+        crate::character::Character::load(std::path::Path::new(character_path))?;
+    let project = crate::project::Project::load(std::path::Path::new(project_path))?;
+    let document = &project.document;
+    let clip = document.flow.first().context("the project has no clip")?;
+    let numbers = project.view();
+    let positions = numbers.f32s(&clip.positions);
+    let rotations = numbers.f32s(&clip.rotations);
+    let joints = clip.joints;
+    anyhow::ensure!(joints > 1 && clip.skeleton_count > 0, "the clip is empty");
+    let index = frame.min(clip.skeleton_count - 1);
+    let at = index * joints;
+    anyhow::ensure!(rotations.len() >= (at + joints) * 9, "the clip is short");
+    let world: Vec<[f32; 9]> = (0..joints)
+        .map(|joint| {
+            let mut rotation = [0.0f32; 9];
+            rotation.copy_from_slice(&rotations[(at + joint) * 9..(at + joint) * 9 + 9]);
+            rotation
+        })
+        .collect();
+    // The clip's rest pose, which turns a world rotation into a delta.
+    let body = velomocap_body::BodyModel::load(std::path::Path::new(model), 16)?;
+    let neutral = body.forward_joints(&velomocap_body::Pose::neutral(body.num_joints, 16));
+    let mut rest: Vec<[f32; 9]> = Vec::with_capacity(joints);
+    let mut rest_positions: Vec<[f32; 3]> = Vec::with_capacity(joints);
+    for joint in 0..joints {
+        let mut rotation = [0.0f32; 9];
+        rotation.copy_from_slice(&neutral.rotations[joint * 9..joint * 9 + 9]);
+        rest.push(rotation);
+        rest_positions.push([
+            neutral.positions[joint * 3],
+            neutral.positions[joint * 3 + 1],
+            neutral.positions[joint * 3 + 2],
+        ]);
+    }
+    let bind = character
+        .bones
+        .iter()
+        .find(|bone| bone.canonical == Some(0))
+        .or_else(|| character.bones.first())
+        .map(|bone| bone.bind)
+        .unwrap_or([0.0; 3]);
+    let translation = [
+        positions[at * 3] - bind[0],
+        positions[at * 3 + 1] - bind[1],
+        positions[at * 3 + 2] - bind[2],
+    ];
+    let verts = character.pose(&world, &rest, &rest_positions, &clip.bvh.names, translation);
+    eprintln!(
+        "render-pose: clip frame {index} of {}, {} joints",
+        clip.skeleton_count, joints
+    );
+    rasterize(&character, &verts, out)
+}
+
+fn rasterize(
+    character: &crate::character::Character,
+    verts: &[f32],
+    out: &str,
+) -> anyhow::Result<()> {
+    let verts = verts.to_vec();
     let faces = character.faces.clone();
     eprintln!(
         "render-character: {} — {} verts, {} faces, texture {:?}",

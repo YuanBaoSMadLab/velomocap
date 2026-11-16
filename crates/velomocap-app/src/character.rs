@@ -888,6 +888,11 @@ impl Character {
     fn bind_swing(&self, joint_of: &[usize; 52], rest_positions: &[[f32; 3]]) -> Vec<[f32; 9]> {
         use velomocap_motion::retarget::PARENTS;
         let mut swing = vec![identity(); self.bones.len()];
+        // `VELOMOCAP_NO_SWING=1` shows what the bind pose alone does, which is
+        // how the swing's cost at the shoulder can be measured.
+        if std::env::var_os("VELOMOCAP_NO_SWING").is_some() {
+            return swing;
+        }
         let mut primary = [usize::MAX; 52];
         for (child, parent) in PARENTS.iter().enumerate() {
             let Some(parent) = parent else {

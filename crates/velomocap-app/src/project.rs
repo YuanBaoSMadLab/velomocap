@@ -189,7 +189,7 @@ pub struct Viewed<'a> {
 }
 
 impl Viewed<'_> {
-    fn f32s(&self, slice: &Slice) -> Vec<f32> {
+    pub fn f32s(&self, slice: &Slice) -> Vec<f32> {
         let end = slice.offset.saturating_add(slice.count).min(self.single.len());
         self.single
             .get(slice.offset..end)
@@ -197,7 +197,7 @@ impl Viewed<'_> {
             .unwrap_or_default()
     }
 
-    fn f64s(&self, slice: &Slice) -> Vec<f64> {
+    pub fn f64s(&self, slice: &Slice) -> Vec<f64> {
         let end = slice.offset.saturating_add(slice.count).min(self.double.len());
         self.double
             .get(slice.offset..end)
