@@ -86,6 +86,16 @@ pub fn t(english: &'static str) -> &'static str {
         "Project storage" => "工程存储",
         "Precision" => "存储精度",
         "Compression" => "压缩算法",
+        "Settings" => "设置",
+        "Project storage" => "工程存储",
+        "Storage precision note" => "精度越高越还原，越低越省空间；下次保存工程时生效",
+        "Ultra (lossless)" => "最高（无损）",
+        "High (default)" => "高（默认）",
+        "Medium" => "中",
+        "Low" => "低",
+        "Fast" => "快",
+        "Balanced" => "均衡",
+        "Smallest" => "最小",
         "Storage note" => "存储说明",
         "Faces" => "面数",
         "Unmatched" => "未匹配",
@@ -428,5 +438,32 @@ mod tests {
         // Unknown strings must never blank a label.
         assert_eq!(t("Something we forgot"), "Something we forgot");
         set_lang(Lang::Zh);
+    }
+
+    /// The Settings window and its storage labels were falling back to English in
+    /// Chinese mode; a translation that is missing is invisible here because `t`
+    /// returns the key, so the keys are pinned explicitly.
+    #[test]
+    fn the_settings_window_is_translated() {
+        set_lang(Lang::Zh);
+        for key in [
+            "Settings",
+            "Project storage",
+            "Precision",
+            "Compression",
+            "Storage precision note",
+            "Ultra (lossless)",
+            "High (default)",
+            "Medium",
+            "Low",
+            "None",
+            "Fast",
+            "Balanced",
+            "Smallest",
+        ] {
+            assert_ne!(t(key), key, "{key} has no Chinese translation");
+        }
+        assert_eq!(t("Settings"), "设置");
+        set_lang(Lang::En);
     }
 }

@@ -33,7 +33,10 @@ const CARD_BG: egui::Color32 = egui::Color32::from_rgb(0x26, 0x26, 0x28);
 const SELECT_BG: egui::Color32 = egui::Color32::from_rgb(0x35, 0x35, 0x38);
 
 /// Where a missing model comes from, and where the project lives.
-const MODEL_DOWNLOAD_URL: &str = "https://github.com/YuanBaoSMadLab/velomocap/releases";
+/// Where a missing SMPL-H model comes from. This is the official Max Planck
+/// download page (registration required), not a mirror: the body model is not
+/// redistributed with the app.
+const MODEL_DOWNLOAD_URL: &str = "https://download.is.tue.mpg.de/";
 const REPOSITORY_URL: &str = "https://github.com/YuanBaoSMadLab/velomocap";
 const SPONSOR_URL: &str = "https://afdian.com/a/YuanBaoSMadLab";
 
@@ -456,8 +459,12 @@ fn footer(ui: &mut egui::Ui, left: impl FnOnce(&mut egui::Ui)) {
 
 fn movie_clip(app: &mut VeloMocap, ctx: &egui::Context) {
     egui::SidePanel::left("movie-clip")
-        .exact_width(CLIP_PANEL_WIDTH)
-        .resizable(false)
+        // Rubber-banded like the reference's workspace splitter: the source pane
+        // and the person list are the parts a user resizes most.
+        .resizable(true)
+        .default_width(CLIP_PANEL_WIDTH)
+        .min_width(300.0)
+        .max_width(760.0)
         .frame(egui::Frame::new().fill(WINDOW_BG).inner_margin(egui::Margin::same(6)))
         .show(ctx, |ui| {
             let available = ui.available_size();
@@ -1368,8 +1375,21 @@ fn footer_checks(app: &mut VeloMocap, ui: &mut egui::Ui) {
 }
 
 fn timeline(app: &mut VeloMocap, ctx: &egui::Context) {
+    // How tall the panel has to be for every row to be visible: header, clip
+    // label, ruler, one row per person and the four lock rows. The panel can be
+    // dragged taller, but it may not be dragged short enough to cut a row — a
+    // take with one person was already losing its fourth lock row.
+    let lock_rows = usize::from(!app.flow.is_empty() || !app.people.is_empty()) * 4;
+    let rows = 1 + app.people.len() + lock_rows;
+    let needed = (140.0 + rows as f32 * 19.0).min(380.0);
     egui::TopBottomPanel::bottom("timeline")
-        .exact_height(TIMELINE_HEIGHT)
+        // Resizable, like the reference's splitter: a take with several people
+        // needs more rows than the default, and the lock rows used to be clipped
+        // away entirely at the bottom of a fixed-height panel.
+        .resizable(true)
+        .default_height(TIMELINE_HEIGHT)
+        .min_height(needed)
+        .max_height(ctx.available_rect().height() * 0.7)
         .frame(egui::Frame::new().fill(WINDOW_BG).inner_margin(egui::Margin::same(6)))
         .show(ctx, |ui| {
             panel(ui, |ui| {
@@ -1444,7 +1464,15 @@ fn timeline(app: &mut VeloMocap, ctx: &egui::Context) {
                 ui.add_space(2.0);
                 frame_ruler(app, ui);
                 ui.add_space(4.0);
-                tracks(app, ui);
+                // The rows scroll instead of being cut off: a person row per actor
+                // plus the four lock rows already overflowed the old fixed height,
+                // and a take with several people overflowed it a lot.
+                egui::ScrollArea::vertical()
+                    .id_salt("timeline-tracks")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        tracks(app, ui);
+                    });
             });
         });
 }
@@ -1619,6 +1647,10 @@ fn track_frame(position: f32, rect: egui::Rect, frames: usize) -> usize {
 }
 
 fn tracks(app: &mut VeloMocap, ui: &mut egui::Ui) {
+    // Rows sit close together, like the reference's 26 px track height: the
+    // default spacing turned six rows into 24 px each, which pushed the fourth
+    // lock row out of the panel even at its default height.
+    ui.spacing_mut().item_spacing.y = 1.0;
     let frames = app.frame_count().max(1);
     // One row per person, plus the source video, like the Qt track list.
     let mut rows: Vec<(String, Option<egui::Color32>, Vec<bool>)> = Vec::new();
@@ -2082,7 +2114,7 @@ fn lock_rows(app: &mut VeloMocap, ui: &mut egui::Ui, frames: usize) {
     }
     if app.locks_dirty {
         ui.label(
-            egui::RichText::new(i18n::t("Locks edited — re-run to apply them"))
+            egui::RichText::new(i18n::t("Locks edited — apply to update the motion"))
                 .size(9.5)
                 .color(MUTED),
         );
@@ -2091,8 +2123,10 @@ fn lock_rows(app: &mut VeloMocap, ui: &mut egui::Ui, frames: usize) {
 
 fn sidebar(app: &mut VeloMocap, ctx: &egui::Context) {
     egui::SidePanel::right("sidebar")
-        .exact_width(SIDEBAR_WIDTH)
-        .resizable(false)
+        .resizable(true)
+        .default_width(SIDEBAR_WIDTH)
+        .min_width(240.0)
+        .max_width(470.0)
         .frame(egui::Frame::new().fill(WINDOW_BG).inner_margin(egui::Margin::same(6)))
         .show(ctx, |ui| {
             panel(ui, |ui| {
@@ -2785,8 +2819,8 @@ fn status_bar(app: &mut VeloMocap, ctx: &egui::Context) {
                                 .min_size(egui::vec2(78.0, 18.0)),
                             )
                             .on_hover_text(i18n::zh_en(
-                                "打开模型下载页（GitHub Releases）",
-                                "Open the model download page (GitHub Releases)",
+                                "打开 SMPL-H 官方下载页（download.is.tue.mpg.de，需注册）",
+                                "Open the official SMPL-H download page (download.is.tue.mpg.de, registration required)",
                             ))
                             .clicked()
                         {
