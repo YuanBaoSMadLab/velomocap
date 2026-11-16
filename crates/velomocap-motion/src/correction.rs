@@ -223,6 +223,10 @@ pub struct CorrectionReport {
     pub vertical_shift: f32,
     /// Largest shift the grounding step applied (`prepare_contacts`' floor shift).
     pub grounding: f32,
+    /// Free foot-frames the swing guard lifted out of the plane.
+    pub swing_frames: usize,
+    /// The deepest of those lifts, in metres.
+    pub swing_lift: f32,
     /// Largest pelvis drop needed to span a contact (`reachable_pelvis_drop`).
     pub pelvis_drop: f32,
     /// Largest pelvis lift needed to reach a contact (`reachable_pelvis_lift`).
@@ -312,6 +316,13 @@ impl CorrectionReport {
         }
         if self.no_contacts {
             out.push_str(" (no confident foot contacts: the source is kept)");
+        }
+        if self.swing_frames > 0 {
+            out.push_str(&format!(
+                "; swing guard lifted {} foot-frame(s), deepest {:.0} mm",
+                self.swing_frames,
+                self.swing_lift * 1000.0
+            ));
         }
         if !self.feet_before.empty() && !self.feet_after.empty() {
             out.push_str("; ");
@@ -1848,6 +1859,8 @@ fn foot_lock(
     // Release and approach frames, on the shifted clip: the residual the stance
     // still owed is what the ramp unwinds.
     add_transitions(&mut pass, clip, detection);
+    // And a free foot that would scrape the plane is lifted by its own leg.
+    add_swing_clearance(&mut pass, clip, settings, detection, report);
     pass
 }
 
@@ -1967,6 +1980,67 @@ fn add_transitions(pass: &mut FootPass, clip: &FlowClip, detection: &Detection) 
 
 fn sub3f(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+/// How far a **free** foot has to be lifted so it does not scrape the plane.
+///
+/// `contact_pose_plan`'s smooth unilateral form: nothing while the sole is more
+/// than 1 cm above the floor, the full gap once it is 1 cm below, and
+/// `(gap + 1 cm)² / 4 cm` in between, capped at the reference's 12 cm. The
+/// reference applies this to the swing foot's target; lifting the whole body for
+/// it — as this port used to — also lifts the foot that is planted.
+fn swing_lift(gap: f32) -> f32 {
+    let lift = if gap >= 0.01 {
+        gap
+    } else if gap <= -0.01 {
+        0.0
+    } else {
+        (gap + 0.01).powi(2) / 0.04
+    };
+    lift.clamp(0.0, 0.12)
+}
+
+/// Raise a free foot that would go through the floor.
+///
+/// Flat ground only (multi-level keeps the source elevation), never on a frame
+/// that is already pinned, and never on a detected flight frame: an airborne
+/// body is the root chain's business, not a foot's.
+fn add_swing_clearance(
+    pass: &mut FootPass,
+    clip: &FlowClip,
+    settings: &CorrectionSettings,
+    detection: &Detection,
+    report: &mut CorrectionReport,
+) {
+    if settings.mode != CorrectionMode::Flat || detection.rows.len() < clip.skeletons.len() {
+        return;
+    }
+    for frame in 0..clip.skeletons.len() {
+        if detection
+            .prepared
+            .flight
+            .get(frame)
+            .copied()
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        for foot_index in 0..2 {
+            if pass.pinned[frame][foot_index] {
+                continue;
+            }
+            let row = &detection.rows[frame][foot_index];
+            let sole = row[0][1].min(row[1][1]);
+            let lift = swing_lift(settings.floor - sole);
+            if lift <= 1e-5 {
+                continue;
+            }
+            pass.offsets[frame][foot_index] = [0.0, lift, 0.0];
+            pass.pinned[frame][foot_index] = true;
+            report.swing_frames += 1;
+            report.swing_lift = report.swing_lift.max(lift);
+        }
+    }
 }
 
 /// Interior sample `slot` of a cubic whose endpoints are `a`/`b` with velocities
@@ -2932,6 +3006,29 @@ mod tests {
         }
     }
 
+    /// The swing guard is a smooth unilateral form: nothing above the 1 cm
+    /// deadband, the full gap below it, a quadratic knee in between, and the
+    /// reference's 12 cm cap.
+    #[test]
+    fn the_swing_guard_is_smooth_and_bounded() {
+        assert_eq!(swing_lift(-0.05), 0.0, "a sole above the deadband is free");
+        assert_eq!(swing_lift(-0.01), 0.0, "the deadband edge is still free");
+        // At the knee the quadratic meets the linear branch: (0.02)^2/0.04 = 0.01.
+        assert!((swing_lift(0.01) - 0.01).abs() < 1e-6);
+        // Below the knee it is the full gap.
+        assert!((swing_lift(0.05) - 0.05).abs() < 1e-6);
+        // Never more than 12 cm, however deep the penetration.
+        assert!((swing_lift(0.40) - 0.12).abs() < 1e-6);
+        // Monotone, so a foot that sinks keeps rising.
+        let mut previous = -1.0;
+        for step in 0..40 {
+            let gap = -0.02 + step as f32 * 0.005;
+            let lift = swing_lift(gap);
+            assert!(lift >= previous, "not monotone at {gap:.3}");
+            previous = lift;
+        }
+    }
+
     /// The vertical half of the lock: the reference grounds the body on the plane
     /// before it pins anything (`prepare_contacts`' floor shift), and the leg IK's
     /// target carries the vertical component. A take whose soles hover 3 cm has to
@@ -3373,4 +3470,5 @@ mod tests {
         assert!(drift < 1e-5, "hips drifted {drift}");
     }
 }
+
 

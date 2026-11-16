@@ -9,7 +9,6 @@
 //! never ask a planted leg to over-reach  max(reach - high)   /0.5 mm
 //! never ask a planted leg to over-bend   min(reach - low)    /0.5 mm
 //! no root kick                          second difference    sigma 0.4 mm
-//! a free foot that would clip the floor is lifted (<= 12 cm)
 //! ```
 //!
 //! where `high` is `reach_lengths` and `low` is `minimum_reach_lengths`, the same
@@ -24,8 +23,10 @@
 //! * the warm start is the root our own ground pass already settled, where the
 //!   reference warm starts from `contact_temporal_root.optimise`.
 //!
-//! Everything else — the sigmas, the 12 cm clearance cap and the "hold every frame
-//! within 2 cm of the base" bound — is the reference's.
+//! A free foot that would clip the plane is **not** handled here: the reference
+//! lifts that foot's own target, and so does `correction::swing_lift`. This plan
+//! used to lift the body for it, which also moved the planted foot off its
+//! contact. `Frame::lowest` is kept for the caller's diagnostics.
 
 use crate::solver;
 
@@ -53,12 +54,7 @@ pub struct Frame {
 const ROOT_SIGMA: f64 = 0.01;
 const ROOT_ACCELERATION_SIGMA: f64 = 0.0004;
 const REACH_SIGMA: f64 = 0.0005;
-const CLEARANCE_SIGMA: f64 = 0.002;
-/// The reference's `target_limit`: no frame may move further than this.
 const ROOT_LIMIT: f64 = 0.02;
-const CLEARANCE_LIMIT: f64 = 0.12;
-/// Soft knee of the clearance term, from the reference's `(gap+.01)^2/.04`.
-const CLEARANCE_KNEE: f64 = 0.01;
 
 /// Plan the root height. Returns one height per frame.
 pub fn plan(frames: &[Frame], floor: f64, fps: f64, flat: bool) -> Vec<f64> {
@@ -120,24 +116,11 @@ pub fn plan(frames: &[Frame], floor: f64, fps: f64, flat: bool) -> Vec<f64> {
             let second = x[frame + 2] - 2.0 * x[frame + 1] + x[frame];
             out.push(second * rate * rate / ROOT_ACCELERATION_SIGMA);
         }
-        // A free foot that would clip through the floor lifts the body, smoothly
-        // and by at most 12 cm (the reference's swing guard).
-        for frame in 0..count {
-            let source = &frames[frame];
-            if !flat || source.flight || source.active[0] || source.active[1] {
-                continue;
-            }
-            let gap = floor - (source.lowest + (x[frame] - source.base));
-            let lift = if gap >= CLEARANCE_KNEE {
-                gap
-            } else if gap <= -CLEARANCE_KNEE {
-                0.0
-            } else {
-                (gap + CLEARANCE_KNEE).powi(2) / (4.0 * CLEARANCE_KNEE)
-            }
-            .min(CLEARANCE_LIMIT);
-            out.push((lift - (x[frame] - source.base)) / CLEARANCE_SIGMA);
-        }
+        // A free foot that would clip the floor is *the foot's* problem: the leg
+        // solve lifts it (`correction::swing_lift`, the reference's guard). This
+        // plan used to lift the whole body for it, which also moved the planted
+        // foot and broke its contact. `lowest` is kept in the frame struct because
+        // a future pass may want it, but the root does not react to it.
         out
     };
 
@@ -205,26 +188,26 @@ mod tests {
         assert!(reach <= 0.95 * 0.9995 + 2e-3, "reach still {reach:.3} m");
     }
 
-    /// A free foot under the floor raises the body instead of clipping.
+    /// A free foot under the floor does **not** raise the body: the reference puts
+    /// that guard on the foot's own target, and this plan only bounds the root
+    /// against the legs' reach. Lifting the body here would move the planted foot
+    /// off its contact, which is worse than the scrape it was trying to fix.
     #[test]
-    fn lifts_the_root_when_a_free_foot_would_clip() {
+    fn a_free_foot_under_the_floor_does_not_move_the_root() {
         let mut frames: Vec<Frame> = (0..12).map(|_| frame(0.9)).collect();
         for (index, source) in frames.iter_mut().enumerate() {
             source.active = [false, false];
-            // A landed step is not a support here: the sole is 4 cm under.
+            // A swing frame whose sole is 4 cm under the plane.
             source.lowest = if index == 6 { -0.04 } else { 0.0 };
         }
         let planned = plan(&frames, 0.0, 30.0, true);
-        let lifted = planned[6] - frames[6].base;
-        assert!(lifted > 0.005, "the root should have lifted: {lifted:.3} m");
-        // The body does not hop 4 cm for a single frame — the root-acceleration
-        // prior is there to stop exactly that. In the reference the clearance
-        // moves the *foot* goal, and our ground pass already feeds the same 12 cm
-        // bounded clearance target, so the root only has to help.
-        assert!(
-            lifted < CLEARANCE_LIMIT,
-            "lift went past the clearance cap: {lifted:.3} m"
-        );
+        for (index, value) in planned.iter().enumerate() {
+            assert!(
+                (value - frames[index].base).abs() < 1e-6,
+                "frame {index} moved {:.4} m",
+                value - frames[index].base
+            );
+        }
     }
 
     /// Nothing to fix means nothing moves, which keeps the default path stable.
@@ -260,3 +243,5 @@ mod tests {
         }
     }
 }
+
+
