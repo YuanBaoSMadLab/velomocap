@@ -1269,6 +1269,24 @@ impl Character {
             self.report_lowest(inherit);
         }
         if std::env::var_os("VELOMOCAP_DEBUG_HANDS").is_some() {
+            for canonical in [10usize, 13, 19, 22, 29, 32, 38, 41] {
+                let Some(slot) = self
+                    .bones
+                    .iter()
+                    .position(|bone| bone.canonical == Some(canonical))
+                else {
+                    eprintln!("finger: canonical {canonical} is not in this model");
+                    continue;
+                };
+                let skin = &skin[slot];
+                let trace = skin[0] + skin[5] + skin[10];
+                let angle = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0).acos().to_degrees();
+                eprintln!(
+                    "finger: canonical {canonical:2} {:>22} skin turns {angle:6.1}° at {:?}",
+                    self.bones[slot].name,
+                    [skin[3], skin[7], skin[11]]
+                );
+            }
             for joint in 0..names.len().min(world.len()).min(rest.len()) {
                 let canonical = velomocap_motion::retarget::from_export_name(&names[joint]);
                 let fk = multiply(&world[joint], &transpose(&rest[joint]));
