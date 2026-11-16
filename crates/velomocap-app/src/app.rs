@@ -2661,6 +2661,16 @@ impl VeloMocap {
         } else {
             self.seek_tries = 0;
         }
+        // One seek in flight at a time while paused. Each seek restarts ffmpeg
+        // and takes tens of milliseconds; sending one per paint made every
+        // decoded frame arrive after a newer request had superseded it, so the
+        // picture only moved when the drag ended. Waiting for the frame that is
+        // already in flight is what turns a drag into live scrubbing.
+        let overdue = self.seek_at.elapsed() > Duration::from_millis(200);
+        if !self.playing && self.stream.outstanding() && !overdue {
+            ctx.request_repaint_after(Duration::from_millis(30));
+            return;
+        }
         self.stream.request(
             &video,
             frame,

@@ -69,6 +69,11 @@ pub struct VideoStream {
     /// Bumped on every request: a frame decoded for an older request is stale
     /// and must not be painted over the newer one.
     serial: u64,
+    /// The serial of the newest frame that was painted. While a drag is running
+    /// the requests outpace the decoder, so "newer than the last request" would
+    /// discard every frame that arrives; "newer than the last one shown" paints
+    /// each decode as it lands, which is what makes scrubbing live.
+    shown: u64,
 }
 
 impl VideoStream {
@@ -90,6 +95,7 @@ impl VideoStream {
             generation: 0,
             asked: None,
             serial: 0,
+            shown: 0,
         }
     }
 
@@ -101,6 +107,18 @@ impl VideoStream {
             *slot = None;
         }
         self.seen = self.version.load(Ordering::Relaxed);
+        // Everything asked for so far belongs to the clip being dropped, so the
+        // new clip does not look like it owes a frame.
+        self.shown = self.serial;
+    }
+
+    /// A request has been sent and no frame for it has been shown yet.
+    ///
+    /// The UI uses this to keep one seek in flight instead of queueing one per
+    /// mouse move: a decode takes tens of milliseconds, and a request per paint
+    /// meant every decoded frame arrived already superseded and was discarded.
+    pub fn outstanding(&self) -> bool {
+        self.shown < self.serial
     }
 
     /// Ask for the frame the UI wants. Deduplicated, so calling it every frame
@@ -171,10 +189,13 @@ impl VideoStream {
         }
         self.seen = version;
         let slot = self.shared.lock().ok().and_then(|slot| slot.clone())?;
-        if slot.1 != self.serial {
-            // Decoded for a request the UI has already moved past.
+        // Only frames that are already on screen are dropped: a frame decoded for
+        // a request the pointer has moved past is still the newest picture there
+        // is, and showing it is what makes a drag show something at all.
+        if slot.1 <= self.shown {
             return None;
         }
+        self.shown = slot.1;
         Some((slot.0, slot.2))
     }
 }
@@ -447,6 +468,77 @@ mod tests {
         );
         let monotonic = seen.windows(2).all(|pair| pair[1].0 > pair[0].0);
         assert!(monotonic, "frame indices went backwards: {seen:?}");
+    }
+
+    /// Dragging the playhead sends a seek per mouse move, and a decode takes tens
+    /// of milliseconds. If a frame is dropped whenever a newer request exists, a
+    /// continuous drag shows nothing until it stops — which is exactly what it
+    /// did. Every decoded frame has to be painted.
+    #[test]
+    fn frames_are_painted_even_when_the_requests_outrun_the_decoder() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/media/test-clip.mp4");
+        if !path.is_file() || velomocap_video::Tools::discover().is_err() {
+            eprintln!("skipping: no sample clip or no ffmpeg");
+            return;
+        }
+        let mut stream = VideoStream::spawn();
+        // No throttle: a request every 16 ms, exactly what the old polling loop
+        // did while the pointer moved.
+        let started = Instant::now();
+        let mut playhead = 0usize;
+        let mut next_request = Instant::now();
+        let mut painted: Vec<usize> = Vec::new();
+        while started.elapsed() < Duration::from_secs(2) {
+            if let Some((_, frame)) = stream.poll() {
+                if painted.last() != Some(&frame.index) {
+                    painted.push(frame.index);
+                }
+            }
+            if Instant::now() >= next_request {
+                playhead = (playhead + 2) % 30;
+                stream.request(&path, playhead, false, 1.0, 240, 30.0);
+                next_request = Instant::now() + Duration::from_millis(16);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        eprintln!("painted {} frames while the pointer moved: {painted:?}", painted.len());
+        assert!(
+            painted.len() >= 3,
+            "a two-second drag painted only {} frame(s): {painted:?}",
+            painted.len()
+        );
+    }
+
+    /// One seek, one frame: a paused seek has to land and clear the debt, which
+    /// is the state the UI's "one seek in flight" gate reads.
+    #[test]
+    fn a_paused_seek_paints_and_clears_the_outstanding_request() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/media/test-clip.mp4");
+        if !path.is_file() || velomocap_video::Tools::discover().is_err() {
+            eprintln!("skipping: no sample clip or no ffmpeg");
+            return;
+        }
+        let mut stream = VideoStream::spawn();
+        stream.request(&path, 5, false, 1.0, 240, 30.0);
+        assert!(stream.outstanding(), "a fresh request must look outstanding");
+        let started = Instant::now();
+        let mut painted = None;
+        while started.elapsed() < Duration::from_secs(5) && painted.is_none() {
+            if let Some((_, frame)) = stream.poll() {
+                painted = Some(frame.index);
+            } else {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let index = painted.expect("the paused seek produced no frame");
+        assert!(
+            (index as i64 - 5).abs() <= 1,
+            "the seek to frame 5 showed frame {index}"
+        );
+        assert!(
+            !stream.outstanding(),
+            "the painted frame did not clear the outstanding request"
+        );
     }
 }
 
