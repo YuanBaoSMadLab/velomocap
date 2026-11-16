@@ -1036,7 +1036,6 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                 // clip's pelvis so it stands where the motion stands.
                 let character_rest = app.character_rest.as_deref();
                 let character_rest_positions = app.character_rest_positions.as_deref();
-                let character_rest_parents = app.character_rest_parents.as_deref();
                 let posed: Vec<Option<Vec<f32>>> = people
                     .iter()
                     .enumerate()
@@ -1044,7 +1043,6 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                         let assigned = person.character.as_ref()?;
                         let rest = character_rest?;
                         let rest_positions = character_rest_positions?;
-                        let clip_parents = character_rest_parents?;
                         let clip = flow.get(slot).filter(|clip| !clip.skeletons.is_empty())?;
                         let index = app
                             .playhead
@@ -1069,7 +1067,6 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                             &rotations,
                             rest,
                             rest_positions,
-                            clip_parents,
                             &clip.bvh.names,
                             translation,
                         ))

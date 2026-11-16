@@ -204,7 +204,6 @@ pub fn render_pose(
         &world,
         &rest,
         &rest_positions,
-        &body.parents,
         &clip.bvh.names,
         translation,
     );
