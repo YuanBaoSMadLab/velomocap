@@ -237,6 +237,39 @@ fn rasterize(
     if std::env::var_os("VELOMOCAP_DEBUG_NAMES").is_some() {
         eprintln!("render-character: unmatched {:?}", character.unmatched());
     }
+    if std::env::var_os("VELOMOCAP_DEBUG_FINGERS").is_some() {
+        // Which side is which. A model whose left hand sits at -X while facing
+        // +Z is mirrored, and every rotation applied to it bends the wrong way.
+        for (canonical, label) in [(9usize, "left hand"), (28, "right hand"), (47, "left toe")] {
+            let bone = character
+                .bones
+                .iter()
+                .find(|bone| bone.canonical == Some(canonical));
+            match bone {
+                Some(bone) => eprintln!(
+                    "finger: {label:<11} {} at x {:+.3} y {:+.3} z {:+.3}",
+                    bone.name, bone.bind[0], bone.bind[1], bone.bind[2]
+                ),
+                None => eprintln!("finger: {label} is not in this model"),
+            }
+        }
+        // Which bone claims each finger joint. A joint claimed by two bones is
+        // one the pose can only drive once, and a joint claimed by none is a
+        // finger segment that will never bend.
+        for canonical in 10..44 {
+            let names: Vec<&str> = character
+                .bones
+                .iter()
+                .filter(|bone| bone.canonical == Some(canonical))
+                .map(|bone| bone.name.as_str())
+                .collect();
+            match names.len() {
+                0 => eprintln!("finger: {canonical:2} unmapped"),
+                1 => eprintln!("finger: {canonical:2} <- {}", names[0]),
+                _ => eprintln!("finger: {canonical:2} <- {names:?}  (shared)"),
+            }
+        }
+    }
 
     let mut lo = [f32::INFINITY; 3];
     let mut hi = [f32::NEG_INFINITY; 3];

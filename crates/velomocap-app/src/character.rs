@@ -1053,13 +1053,36 @@ impl Character {
         // axes follow its bones — a PMX bone's local frame is world-aligned, so
         // a local deviation bends limbs that should be straight.
         let mut delta = [identity(); 52];
+        let finger_local = std::env::var_os("VELOMOCAP_FINGER_LOCAL").is_some();
         let mut mapped = [false; 52];
+        // The clip's deviation expressed in each joint's own rest frame. A
+        // finger is driven by this rather than by the world delta: the bend a
+        // finger needs is a rotation about *its* axes, and copying the clip's
+        // world orientation conjugates it through the model's bind, which turns
+        // a curl into a splay whenever the two rigs disagree about the hand's
+        // roll — an avatar's fingers then bend at a fraction of the angle.
+        let mut deviation = [identity(); 52];
         for canonical in 0..52 {
             let joint = joint_of[canonical];
             if joint == usize::MAX || joint >= world.len() || joint >= rest.len() {
                 continue;
             }
             delta[canonical] = multiply(&world[joint], &transpose(&rest[joint]));
+            // The clip's own parent of this joint, taken from the canonical
+            // tree: the joint that drives this bone's canonical parent.
+            let parent = velomocap_motion::retarget::PARENTS[canonical]
+                .map(|parent| joint_of[parent as usize])
+                .filter(|parent| *parent != usize::MAX)
+                .filter(|parent| *parent < world.len() && *parent < rest.len());
+            let local_rest = match parent {
+                Some(parent) => multiply(&transpose(&rest[parent]), &rest[joint]),
+                None => rest[joint],
+            };
+            let local_world = match parent {
+                Some(parent) => multiply(&transpose(&world[parent]), &world[joint]),
+                None => world[joint],
+            };
+            deviation[canonical] = multiply(&transpose(&local_rest), &local_world);
             mapped[canonical] = true;
         }
         // One clip joint may only drive one bone. An MMD model keeps helper
@@ -1168,7 +1191,17 @@ impl Character {
             };
             let mut local = match bone.canonical {
                 Some(canonical) if mapped[canonical] && owner[canonical] == index => {
-                    multiply(&transpose(&parent_rotation), &multiply(&delta[canonical], &aligned[index]))
+                    // A finger can be driven two ways. Copying the clip's world
+                    // orientation (the default) reproduces the clip exactly on a
+                    // rig whose hand axes match; bending about this model's own
+                    // finger axes (`VELOMOCAP_FINGER_LOCAL=1`) keeps the curl in
+                    // a rig whose hand roll differs, at the cost of no longer
+                    // matching the clip's world orientation.
+                    if finger_local && is_finger(canonical) {
+                        multiply(&local_rest, &deviation[canonical])
+                    } else {
+                        multiply(&transpose(&parent_rotation), &multiply(&delta[canonical], &aligned[index]))
+                    }
                 }
                 // A bone the clip cannot drive keeps its rest-relative pose and
                 // rides with its parent.
@@ -2024,8 +2057,12 @@ fn scale_rotation(m: &[f32; 9], weight: f32) -> [f32; 9] {
     ]
 }
 
-fn identity() -> [f32; 9] {    [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+/// Whether a canonical joint is one of the thirty finger phalanges.
+fn is_finger(canonical: usize) -> bool {
+    (10..25).contains(&canonical) || (29..44).contains(&canonical)
 }
+
+fn identity() -> [f32; 9] {    [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]}
 
 /// The rotation a bind matrix carries, with any scale divided out. Unreal
 /// exports its skeleton in centimetres, so a bind 3×3 is not a rotation.
