@@ -230,6 +230,31 @@ pub fn write_glb(
             }
         }
         let position_accessor = push_accessor(&mut bin, &mut accessors, positions, "VEC3", 5126, Some("ARRAY_BUFFER"));
+        // A POSITION accessor must carry its bounds; the spec requires them and a
+        // strict parser uses them to size the import.
+        {
+            let mut low = [f32::INFINITY; 3];
+            let mut high = [f32::NEG_INFINITY; 3];
+            let values = &accessors[position_accessor];
+            let view = values["bufferView"].as_u64().unwrap() as usize;
+            let count = values["count"].as_u64().unwrap() as usize;
+            let offset = bin.views[view]["byteOffset"].as_u64().unwrap() as usize;
+            for vertex in 0..count {
+                for axis in 0..3 {
+                    let at = offset + (vertex * 3 + axis) * 4;
+                    let value = f32::from_le_bytes([
+                        bin.bytes[at],
+                        bin.bytes[at + 1],
+                        bin.bytes[at + 2],
+                        bin.bytes[at + 3],
+                    ]);
+                    low[axis] = low[axis].min(value);
+                    high[axis] = high[axis].max(value);
+                }
+            }
+            accessors[position_accessor]["min"] = serde_json::json!(low);
+            accessors[position_accessor]["max"] = serde_json::json!(high);
+        }
         let normal_accessor = push_accessor(&mut bin, &mut accessors, vertex_normals, "VEC3", 5126, Some("ARRAY_BUFFER"));
         let mut attributes = serde_json::json!({
             "POSITION": position_accessor,
@@ -240,7 +265,20 @@ pub fn write_glb(
             attributes["TEXCOORD_0"] = serde_json::json!(uv_accessor);
         }
         if options.skin {
-            let joints_accessor = push_accessor(&mut bin, &mut accessors, joints, "VEC4", 5126, Some("ARRAY_BUFFER"));
+            // JOINTS_0 must be UNSIGNED_SHORT: a float attribute is invalid glTF
+            // and Unreal's Interchange parser asserts on it.
+            let mut joint_bytes = Vec::with_capacity(joints.len() * 2);
+            for joint in &joints {
+                joint_bytes.extend_from_slice(&(*joint as u16).to_le_bytes());
+            }
+            let joint_view = bin.push(&joint_bytes, Some("ARRAY_BUFFER"));
+            accessors.push(serde_json::json!({
+                "bufferView": joint_view,
+                "componentType": 5123,
+                "count": joints.len() / 4,
+                "type": "VEC4",
+            }));
+            let joints_accessor = accessors.len() - 1;
             let weights_accessor = push_accessor(&mut bin, &mut accessors, weights, "VEC4", 5126, Some("ARRAY_BUFFER"));
             attributes["JOINTS_0"] = serde_json::json!(joints_accessor);
             attributes["WEIGHTS_0"] = serde_json::json!(weights_accessor);
