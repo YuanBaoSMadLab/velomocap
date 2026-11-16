@@ -495,6 +495,22 @@ impl Character {
                 .filter(|link| link.translation)
                 .count();
             eprintln!("pmx: {links} 付与 links, {moving} of them carry translation");
+            // A model often carries helper bones that mean the same as a real
+            // bone (`足先EX` beside `つま先`, `右人指握` beside `右人指1`). Only
+            // one of them may be driven by the clip, or the helper adds the same
+            // rotation a second time and its geometry flies off.
+            let mut owners: std::collections::HashMap<usize, Vec<&str>> =
+                std::collections::HashMap::new();
+            for bone in &bones {
+                if let Some(canonical) = bone.canonical {
+                    owners.entry(canonical).or_default().push(bone.name.as_str());
+                }
+            }
+            let mut shared: Vec<_> = owners.iter().filter(|(_, names)| names.len() > 1).collect();
+            shared.sort_by_key(|(canonical, _)| **canonical);
+            for (canonical, names) in shared {
+                eprintln!("pmx: canonical {canonical} is claimed by {names:?}");
+            }
         }
         anyhow::ensure!(
             faces.len() % 3 == 0,
@@ -516,6 +532,110 @@ impl Character {
                 }
             })
             .collect();
+        // A part that MMD moves with rigid-body physics — a shoe sole, a hanging
+        // ornament — gets a bone with no parent at the origin, because the
+        // simulation supplies its whole transform and the bone has no rest
+        // placement of its own. Without a simulation those vertices stay at the
+        // bind position and the part looks like it flew off the character. Hang
+        // each such bone from the bone nearest to the mesh it owns, which is the
+        // foot for a sole, and give it that bone's pivot so it turns with it.
+        let mut centres: Vec<Option<[f32; 3]>> = vec![None; bones.len()];
+        let mut sums = vec![[0.0f64; 3]; bones.len()];
+        let mut counts = vec![0usize; bones.len()];
+        for (vertex, position) in rest.chunks_exact(3).enumerate() {
+            let mut best = usize::MAX;
+            let mut weight = 0.0f32;
+            for slot in 0..4 {
+                if weights[vertex][slot] > weight {
+                    weight = weights[vertex][slot];
+                    best = joints[vertex][slot] as usize;
+                }
+            }
+            if best < bones.len() {
+                sums[best][0] += position[0] as f64;
+                sums[best][1] += position[1] as f64;
+                sums[best][2] += position[2] as f64;
+                counts[best] += 1;
+            }
+        }
+        for (index, count) in counts.iter().enumerate() {
+            if *count > 0 {
+                centres[index] = Some([
+                    (sums[index][0] / *count as f64) as f32,
+                    (sums[index][1] / *count as f64) as f32,
+                    (sums[index][2] / *count as f64) as f32,
+                ]);
+            }
+        }
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); bones.len()];
+        for (index, bone) in bones.iter().enumerate() {
+            if let Some(parent) = bone.parent {
+                children[parent].push(index);
+            }
+        }
+        let mut adopted = 0usize;
+        for index in 0..bones.len() {
+            if bones[index].parent.is_some() || !bones[index].name.is_empty() {
+                continue;
+            }
+            let origin = bones[index].bind;
+            if origin[0] * origin[0] + origin[1] * origin[1] + origin[2] * origin[2] > 1e-6 {
+                continue;
+            }
+            let Some(centre) = centres[index] else { continue };
+            let mut best = usize::MAX;
+            let mut best_distance = f32::INFINITY;
+            for (candidate, bone) in bones.iter().enumerate() {
+                if bone.canonical.is_none() || candidate == index {
+                    continue;
+                }
+                let offset = [
+                    centre[0] - bone.bind[0],
+                    centre[1] - bone.bind[1],
+                    centre[2] - bone.bind[2],
+                ];
+                let distance = offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2];
+                if distance < best_distance {
+                    best_distance = distance;
+                    best = candidate;
+                }
+            }
+            if best == usize::MAX {
+                continue;
+            }
+            // Move the pivot onto its new parent's, and carry the whole subtree
+            // along so the mesh does not shift at rest.
+            let shift = [
+                bones[best].bind[0] - origin[0],
+                bones[best].bind[1] - origin[1],
+                bones[best].bind[2] - origin[2],
+            ];
+            let mut stack = vec![index];
+            while let Some(one) = stack.pop() {
+                bones[one].bind = [
+                    bones[one].bind[0] + shift[0],
+                    bones[one].bind[1] + shift[1],
+                    bones[one].bind[2] + shift[2],
+                ];
+                bones[one].inverse_bind = [
+                    1.0, 0.0, 0.0, -bones[one].bind[0],
+                    0.0, 1.0, 0.0, -bones[one].bind[1],
+                    0.0, 0.0, 1.0, -bones[one].bind[2],
+                    0.0, 0.0, 0.0, 1.0,
+                ];
+                stack.extend(children[one].iter().copied());
+            }
+            bones[index].parent = Some(best);
+            children[best].push(index);
+            adopted += 1;
+        }
+        if debug {
+            let unnamed = bones.iter().filter(|bone| bone.name.is_empty()).count();
+            eprintln!(
+                "pmx: {} bones, {unnamed} unnamed, {adopted} hung on the body",
+                bones.len()
+            );
+        }
         let mut character = finalize(
             name, bones, rest, joints, weights, faces, uv, textures, face_texture,
         );
@@ -854,6 +974,29 @@ impl Character {
             delta[canonical] = multiply(&world[joint], &transpose(&rest[joint]));
             mapped[canonical] = true;
         }
+        // One clip joint may only drive one bone. An MMD model keeps helper
+        // bones that mean the same as a real bone — `下半身` under `センター`, a
+        // `足先EX` beside `つま先`, a `右人指握` beside `右人指1` — and driving
+        // both adds the clip's rotation twice, which is what throws a costume
+        // part or a shoe off the body. The shallowest bone owns the joint; the
+        // helpers ride their parent.
+        let mut depth = vec![0usize; self.bones.len()];
+        for &index in &self.order {
+            if let Some(parent) = self.bones[index].parent {
+                depth[index] = depth[parent] + 1;
+            }
+        }
+        let mut owner = [usize::MAX; 52];
+        for (index, bone) in self.bones.iter().enumerate() {
+            let Some(canonical) = bone.canonical else { continue };
+            if canonical >= owner.len() {
+                continue;
+            }
+            let held = owner[canonical];
+            if held == usize::MAX || depth[index] < depth[held] {
+                owner[canonical] = index;
+            }
+        }
         let swing = self.bind_swing(&joint_of, rest_positions);
         let ground = self.ground_offset(&joint_of, rest_positions);
         // Where each bone sits with the clip at its rest pose: its bind
@@ -934,7 +1077,7 @@ impl Character {
                 None => aligned[index],
             };
             let mut local = match bone.canonical {
-                Some(canonical) if mapped[canonical] => {
+                Some(canonical) if mapped[canonical] && owner[canonical] == index => {
                     multiply(&transpose(&parent_rotation), &multiply(&delta[canonical], &aligned[index]))
                 }
                 // A bone the clip cannot drive keeps its rest-relative pose and
@@ -951,16 +1094,41 @@ impl Character {
                     local = multiply(&local, &scale_rotation(&local_delta[link.source], link.weight));
                 }
                 if link.translation {
-                    // The source's own movement, not the movement it shares with
-                    // this bone's parent: a link that copies the root would
-                    // otherwise move an ornament twice as far as the body.
-                    let base = bone.parent;
-                    for axis in 0..3 {
-                        let mut moved = position[link.source][axis] - rest_at[link.source][axis];
-                        if let Some(parent) = base {
-                            moved -= position[parent][axis] - rest_at[parent][axis];
+                    // saba adds the source's own *local* translation — its offset
+                    // from its parent, measured in the parent's frame, now minus
+                    // the same at rest — to this bone's local translation. Using
+                    // world deltas instead would carry the root's whole travel
+                    // into every ornament twice over.
+                    let source = link.source;
+                    let (shift_now, shift_at_rest) = match self.bones[source].parent {
+                        Some(source_parent) => {
+                            let offset = |from: [f32; 3], to: [f32; 3]| -> [f32; 3] {
+                                [to[0] - from[0], to[1] - from[1], to[2] - from[2]]
+                            };
+                            let now = offset(position[source_parent], position[source]);
+                            let at_rest = offset(rest_at[source_parent], rest_at[source]);
+                            (
+                                turn(&transpose(&rotation[source_parent]), now),
+                                turn(&transpose(&aligned[source_parent]), at_rest),
+                            )
                         }
-                        carry[axis] = link.weight * moved;
+                        None => (
+                            [position[source][0], position[source][1], position[source][2]],
+                            [rest_at[source][0], rest_at[source][1], rest_at[source][2]],
+                        ),
+                    };
+                    let moved = [
+                        shift_now[0] - shift_at_rest[0],
+                        shift_now[1] - shift_at_rest[1],
+                        shift_now[2] - shift_at_rest[2],
+                    ];
+                    let here_rotation = bone
+                        .parent
+                        .map(|parent| rotation[parent])
+                        .unwrap_or_else(identity);
+                    let carry_here = turn(&here_rotation, moved);
+                    for axis in 0..3 {
+                        carry[axis] = link.weight * carry_here[axis];
                     }
                 }
             }
@@ -1007,6 +1175,8 @@ impl Character {
         }
         if std::env::var_os("VELOMOCAP_DEBUG_POSE").is_some() {
             self.report_directions(&joint_of, &position, world, rest, rest_positions);
+            self.report_carries(&position, &rest_at, inherit);
+            self.report_lowest(inherit);
         }
         let mut out = vec![0.0f32; self.rest.len()];
         for vertex in 0..self.vertex_count() {
@@ -1077,6 +1247,98 @@ impl Character {
             pending = deferred;
         }
         sequence
+    }
+
+    /// Print the bones that own the lowest part of the bind mesh — the soles —
+    /// with their 付与 link. A shoe that hangs off its foot is bound to one of
+    /// these, and this says which.
+    fn report_lowest(&self, inherit: &[Option<Inherit>]) {
+        let mut low = f32::INFINITY;
+        for vertex in self.rest.chunks_exact(3) {
+            low = low.min(vertex[1]);
+        }
+        let mut tally = vec![0usize; self.bones.len()];
+        for (index, vertex) in self.rest.chunks_exact(3).enumerate() {
+            if vertex[1] > low + 0.04 {
+                continue;
+            }
+            let mut best = usize::MAX;
+            let mut weight = 0.0f32;
+            for slot in 0..4 {
+                if self.weights[index][slot] > weight {
+                    weight = self.weights[index][slot];
+                    best = self.joints[index][slot] as usize;
+                }
+            }
+            if best < tally.len() {
+                tally[best] += 1;
+            }
+        }
+        let mut ranked: Vec<(usize, usize)> = tally
+            .into_iter()
+            .enumerate()
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        for (index, count) in ranked.into_iter().take(8) {
+            let bone = &self.bones[index];
+            let link = match inherit.get(index).and_then(|link| *link) {
+                Some(link) => format!(
+                    "copies {} (weight {:.2}, rot {} trans {})",
+                    self.bones[link.source].name, link.weight, link.rotation, link.translation
+                ),
+                None => "no 付与".to_string(),
+            };
+            eprintln!(
+                "sole: #{index} {:>14} owns {count:6} low vertices at {:?}, parent {:?}, canonical {:?}, {link}",
+                bone.name,
+                bone.bind,
+                bone.parent.map(|parent| self.bones[parent].name.as_str()),
+                bone.canonical
+            );
+        }
+    }
+
+    /// Print the bones that have moved furthest from the body as a whole, which
+    /// is what a costume part flying off the character looks like from inside the
+    /// pose. The body's own movement is subtracted, so a walk does not drown the
+    /// signal.
+    fn report_carries(&self, position: &[[f32; 3]], rest_at: &[[f32; 3]], inherit: &[Option<Inherit>]) {
+        let root = self
+            .bones
+            .iter()
+            .position(|bone| bone.canonical == Some(0))
+            .unwrap_or(0);
+        let mut moved: Vec<(f32, usize)> = Vec::new();
+        for index in 0..self.bones.len() {
+            let distance = (0..3)
+                .map(|axis| {
+                    let we = position[index][axis] - rest_at[index][axis];
+                    let body = position[root][axis] - rest_at[root][axis];
+                    (we - body).powi(2)
+                })
+                .sum::<f32>()
+                .sqrt();
+            moved.push((distance, index));
+        }
+        moved.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for (distance, index) in moved.iter().take(12) {
+            let parent = self.bones[*index]
+                .parent
+                .map(|parent| self.bones[parent].name.as_str())
+                .unwrap_or("-");
+            let link = match inherit.get(*index).and_then(|link| *link) {
+                Some(link) => format!(
+                    "copies {} (weight {:.2}, rot {} trans {})",
+                    self.bones[link.source].name, link.weight, link.rotation, link.translation
+                ),
+                None => "no 付与".to_string(),
+            };
+            eprintln!(
+                "carry: {:>14} off the body by {:5.2} m, parent {parent}, {link}",
+                self.bones[*index].name, distance
+            );
+        }
     }
 
     /// Print, per limb segment, how far the posed character's bone direction
@@ -1554,6 +1816,15 @@ fn hierarchy_order(bones: &[Bone]) -> Vec<usize> {
 }
 
 fn transpose(m: &[f32; 9]) -> [f32; 9] {    [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]]
+}
+
+/// A row-major 3×3 rotation applied to a vector.
+fn turn(m: &[f32; 9], v: [f32; 3]) -> [f32; 3] {
+    [
+        m[0] * v[0] + m[1] * v[1] + m[2] * v[2],
+        m[3] * v[0] + m[4] * v[1] + m[5] * v[2],
+        m[6] * v[0] + m[7] * v[1] + m[8] * v[2],
+    ]
 }
 
 /// The same rotation, scaled: `weight` of the way from no rotation to `m`.
@@ -3014,10 +3285,13 @@ mod tests {
 
     /// MMD's 付与: a bone that copies another bone's movement, which is how an
     /// accessory, a strap or a ribbon follows the limb it hangs from without
-    /// being animated at all.
+    /// being animated at all. saba applies the link as `local * slerp(identity,
+    /// source, weight)` — the source's own turn, not the movement its parent
+    /// gives it — so the ornament below hangs from the hips and still turns with
+    /// the arm it copies.
     #[test]
-    fn an_inherited_bone_follows_the_bone_it_copies() {
-        let mut ornament = bound("挂饰", 0, Some(0), [0.0, -0.5, 0.0]);
+    fn an_inherited_bone_turns_with_the_bone_it_copies() {
+        let mut ornament = bound("挂饰", 0, Some(0), [0.0, 0.0, 0.0]);
         // Not a canonical bone: the clip cannot drive it, only the 付与 link can.
         ornament.canonical = None;
         let bones = vec![
@@ -3026,22 +3300,22 @@ mod tests {
             bound("LeftForeArm", 8, Some(1), [1.0, 0.0, 0.0]),
             ornament,
         ];
-        let mut character = handmade(bones, vec![0.0, -0.5, 0.0]);
+        // The ornament's mesh sits a metre out along +X.
+        let mut character = handmade(bones, vec![1.0, 0.0, 0.0]);
         character.joints[0][0] = 3;
-        // The ornament copies the forearm, which is a quarter turn away.
         character.inherit = vec![
             None,
             None,
             None,
             Some(Inherit {
-                source: 2,
+                source: 1,
                 weight: 1.0,
-                rotation: false,
-                translation: true,
+                rotation: true,
+                translation: false,
             }),
         ];
         let mut world = vec![neutral(); 52];
-        // A quarter turn about Z: the forearm's pivot swings from +X to +Y.
+        // A quarter turn about Z: the arm has swung up.
         world[7] = [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
         let rest = vec![neutral(); 52];
         let mut rest_positions = vec![[0.0f32; 3]; 52];
@@ -3050,10 +3324,8 @@ mod tests {
         let mut names = vec![String::new(); 52];
         names[7] = "LeftArm".to_string();
         let posed = character.pose(&world, &rest, &rest_positions, &names, [0.0; 3]);
-        // The forearm moved by (0, 1, 0) - (1, 0, 0), so the ornament, hanging
-        // half a metre below the hips, arrives a metre out and half a metre up.
-        assert!((posed[0] + 1.0).abs() < 1e-5, "{posed:?}");
-        assert!((posed[1] - 0.5).abs() < 1e-5, "{posed:?}");
+        assert!(posed[0].abs() < 1e-5, "{posed:?}");
+        assert!((posed[1] - 1.0).abs() < 1e-5, "{posed:?}");
     }
 
     #[test]
