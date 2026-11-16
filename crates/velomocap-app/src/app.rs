@@ -351,6 +351,8 @@ pub struct VeloMocap {
     /// The same rest pose's joint positions, which is what tells an imported
     /// character's bind pose how far it has to swing to match the clip.
     pub character_rest_positions: Option<Arc<Vec<[f32; 3]>>>,
+    /// The clip's joint parents, which make each joint's rotation local.
+    pub character_rest_parents: Option<Arc<Vec<i32>>>,
     /// The person whose character panel is open.
     pub person_panel: Option<usize>,
     /// Every character imported into this workspace (VRM / glTF / FBX / PMX),
@@ -518,6 +520,7 @@ impl VeloMocap {
             show_export: false,
             character_rest: None,
             character_rest_positions: None,
+            character_rest_parents: None,
             person_panel: None,
             characters: Vec::new(),
             character_panel: None,
@@ -731,9 +734,10 @@ impl VeloMocap {
         }
         let entry = self.characters[index].clone();
         if self.character_rest.is_none() {
-            let (rotations, positions) = self.rest_pose();
+            let (rotations, positions, parents) = self.rest_pose();
             self.character_rest = rotations;
             self.character_rest_positions = positions;
+            self.character_rest_parents = parents;
         }
         let bones = entry.character.bones.len();
         let vertices = entry.character.vertex_count();
@@ -861,9 +865,10 @@ impl VeloMocap {
             match crate::character::Character::load(&file) {
                 Ok(character) => {
                     if self.character_rest.is_none() {
-                        let (rotations, positions) = self.rest_pose();
+                        let (rotations, positions, parents) = self.rest_pose();
                         self.character_rest = rotations;
                         self.character_rest_positions = positions;
+                        self.character_rest_parents = parents;
                     }
                     self.people[index].character = Some(AssignedCharacter {
                         path: file,
@@ -877,9 +882,15 @@ impl VeloMocap {
 
     /// The body model's rest orientation and joint positions, which turn a clip
     /// rotation into the delta an imported character is posed with.
-    fn rest_pose(&self) -> (Option<Arc<Vec<[f32; 9]>>>, Option<Arc<Vec<[f32; 3]>>>) {
+    fn rest_pose(
+        &self,
+    ) -> (
+        Option<Arc<Vec<[f32; 9]>>>,
+        Option<Arc<Vec<[f32; 3]>>>,
+        Option<Arc<Vec<i32>>>,
+    ) {
         let Ok(body) = velomocap_body::BodyModel::load(&self.smplh_model, 16) else {
-            return (None, None);
+            return (None, None, None);
         };
         let pose = velomocap_body::Pose::neutral(body.num_joints, 16);
         let skeleton = body.forward_joints(&pose);
@@ -897,7 +908,7 @@ impl VeloMocap {
                 skeleton.positions[joint * 3 + 2],
             ]);
         }
-        (Some(Arc::new(rotations)), Some(Arc::new(positions)))
+        (Some(Arc::new(rotations)), Some(Arc::new(positions)), Some(Arc::new(body.parents.clone())))
     }
 
     pub fn open_video_dialog(&mut self) {        let Some(path) = rfd::FileDialog::new()
@@ -1372,9 +1383,10 @@ impl VeloMocap {
         if self.people.iter().any(|person| person.character.is_some())
             && self.character_rest.is_none()
         {
-            let (rotations, positions) = self.rest_pose();
+            let (rotations, positions, parents) = self.rest_pose();
             self.character_rest = rotations;
             self.character_rest_positions = positions;
+            self.character_rest_parents = parents;
         }
         // The saved assignments are the truth from here on, not whatever the
         // clip's sidecar would have restored.
@@ -2765,3 +2777,4 @@ mod tests {
         assert_eq!(playback_frame(5, f64::NAN, 30.0, 1.0, 10), 5);
     }
 }
+

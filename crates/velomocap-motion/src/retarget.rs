@@ -971,6 +971,12 @@ fn lookup(raw: &str) -> Option<usize> {
         .chars()
         .filter(|c| !c.is_whitespace() && !matches!(c, '-' | '_' | '.'))
         .flat_map(|c| c.to_lowercase())
+        // MMD writes its finger segments with full-width digits (`左人指１`).
+        .map(|c| match c {
+            '\u{ff10}'..='\u{ff19}' => char::from(b'0' + (c as u32 - 0xff10) as u8),
+            '\u{ff21}'..='\u{ff3a}' => char::from(b'a' + (c as u32 - 0xff21) as u8),
+            other => other,
+        })
         .collect();
     ALIASES
         .iter()

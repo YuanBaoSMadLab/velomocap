@@ -150,9 +150,10 @@ pub struct PersonDraw<'a> {
     /// Triangles for these vertices. Each body carries its own: the MHR mesh
     /// and the FlowHMR SMPL-H body have different topologies.
     pub faces: &'a [[u32; 3]],
-    /// Texture coordinates and the image they index, for an imported character.
+    /// Texture coordinates, the model's images and which one each face uses.
     pub uv: Option<&'a [[f32; 2]]>,
-    pub texture: Option<&'a Arc<crate::character::Texture>>,
+    pub textures: &'a [Arc<crate::character::Texture>],
+    pub face_texture: &'a [u16],
     pub selected: bool,
 }
 
@@ -324,7 +325,7 @@ pub fn show(
         // consistently wound, so a back-face test drops real geometry. The
         // z-buffer already resolves what is visible, and 147k triangles for
         // four bodies cost ~3 ms.
-        for triangle in person.faces {
+        for (face, triangle) in person.faces.iter().enumerate() {
             let (a, b, c) = (
                 vertex(person.verts, triangle[0]),
                 vertex(person.verts, triangle[1]),
@@ -335,11 +336,17 @@ pub fn show(
                 normals[triangle[1] as usize],
                 normals[triangle[2] as usize],
             ];
-            // An imported character brings its own image and coordinates; the
-            // built-in bodies are clay, tinted by the person's colour.
-            match (person.uv, person.texture) {
-                (Some(uv), Some(texture))
-                    if uv.len() >= person.verts.len() / 3 =>
+            // An imported character brings its own images and coordinates; the
+            // built-in bodies are clay, tinted by the person's colour. A face
+            // with no material texture falls back to the clay path.
+            let slot = person.face_texture.get(face).copied().unwrap_or(u16::MAX);
+            let image = if slot == u16::MAX {
+                None
+            } else {
+                person.textures.get(slot as usize)
+            };
+            match (person.uv, image) {
+                (Some(uv), Some(texture)) if uv.len() >= person.verts.len() / 3 =>
                 {
                     let coordinates = [
                         uv[triangle[0] as usize],
@@ -899,3 +906,4 @@ mod orbit_dump {
         }
     }
 }
+

@@ -88,7 +88,7 @@ fn draw(body: &BodyModel, verts: Vec<f32>, out: &str) -> anyhow::Result<()> {
     );
 
     let mut normals = vec![[0.0f32; 3]; verts.len() / 3];
-    for face in &faces {
+    for (face_index, face) in faces.iter().enumerate() {
         let a = vertex(&verts, face[0]);
         let b = vertex(&verts, face[1]);
         let c = vertex(&verts, face[2]);
@@ -105,7 +105,7 @@ fn draw(body: &BodyModel, verts: Vec<f32>, out: &str) -> anyhow::Result<()> {
     }
 
     let light = [0.35, 0.85, 0.4];
-    for face in &faces {
+    for (face_index, face) in faces.iter().enumerate() {
         let a = vertex(&verts, face[0]);
         let b = vertex(&verts, face[1]);
         let c = vertex(&verts, face[2]);
@@ -200,7 +200,14 @@ pub fn render_pose(
         positions[at * 3 + 1] - bind[1],
         positions[at * 3 + 2] - bind[2],
     ];
-    let verts = character.pose(&world, &rest, &rest_positions, &clip.bvh.names, translation);
+    let verts = character.pose(
+        &world,
+        &rest,
+        &rest_positions,
+        &body.parents,
+        &clip.bvh.names,
+        translation,
+    );
     eprintln!(
         "render-pose: clip frame {index} of {}, {} joints",
         clip.skeleton_count, joints
@@ -216,13 +223,14 @@ fn rasterize(
     let verts = verts.to_vec();
     let faces = character.faces.clone();
     eprintln!(
-        "render-character: {} — {} verts, {} faces, texture {:?}",
+        "render-character: {} — {} verts, {} faces, {} textures {:?}",
         character.name,
         verts.len() / 3,
         faces.len(),
+        character.textures.len(),
         character
-            .texture
-            .as_ref()
+            .textures
+            .first()
             .map(|texture| (texture.width, texture.height))
     );
 
@@ -246,7 +254,7 @@ fn rasterize(
     canvas.clear_gradient([0x22, 0x24, 0x28], [0x0e, 0x0f, 0x12]);
 
     let mut normals = vec![[0.0f32; 3]; verts.len() / 3];
-    for face in &faces {
+    for (face_index, face) in faces.iter().enumerate() {
         let a = vertex(&verts, face[0]);
         let b = vertex(&verts, face[1]);
         let c = vertex(&verts, face[2]);
@@ -277,12 +285,12 @@ fn rasterize(
             flip_v: false,
         }
     });
-    let texture = checker.as_ref().or(character.texture.as_deref());
+    let fallback = checker.as_ref();
     for normal in &mut normals {
         *normal = render::normalise(*normal);
     }
 
-    for face in &faces {
+    for (face_index, face) in faces.iter().enumerate() {
         let a = vertex(&verts, face[0]);
         let b = vertex(&verts, face[1]);
         let c = vertex(&verts, face[2]);
@@ -291,6 +299,7 @@ fn rasterize(
             normals[face[1] as usize],
             normals[face[2] as usize],
         ];
+        let texture = fallback.or_else(|| character.texture_of(face_index).map(|texture| texture.as_ref()));
         match texture {
             Some(texture) if character.uv.len() >= verts.len() / 3 => {
                 let uvs = [
@@ -315,3 +324,6 @@ fn rasterize(
     eprintln!("render-character: wrote {out}");
     Ok(())
 }
+
+
+

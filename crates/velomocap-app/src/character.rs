@@ -63,6 +63,17 @@ impl Texture {
         self
     }
 
+    /// A stand-in for a texture the file points at but we could not read, so a
+    /// material's index stays aligned with the file's texture table.
+    pub fn white() -> Texture {
+        Texture {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 255, 255, 255],
+            flip_v: false,
+        }
+    }
+
     /// Bilinear sample.
     pub fn sample(&self, u: f32, v: f32) -> [f32; 3] {
         if self.width == 0 || self.height == 0 || self.rgba.len() < self.width * self.height * 4 {
@@ -108,13 +119,25 @@ pub struct Character {
     pub faces: Vec<[u32; 3]>,
     /// Texture coordinates per vertex, when the file has them.
     pub uv: Vec<[f32; 2]>,
-    /// The model's base-colour image, when the file carried one.
-    pub texture: Option<Arc<Texture>>,
+    /// The model's base-colour images, in file order. A character is not one
+    /// texture: a face, a jacket and a pair of shoes are three materials with
+    /// three images and three sets of coordinates.
+    pub textures: Vec<Arc<Texture>>,
+    /// Which of `textures` each face is drawn with (`u16::MAX` = none).
+    pub face_texture: Vec<u16>,
     /// How much the bind space was scaled to bring the character to human size.
     pub scale: f32,
 }
 
 impl Character {
+    /// The image a face is drawn with, if it has one.
+    pub fn texture_of(&self, face: usize) -> Option<&Arc<Texture>> {
+        match self.face_texture.get(face) {
+            Some(slot) if *slot != u16::MAX => self.textures.get(*slot as usize),
+            _ => None,
+        }
+    }
+
     pub fn vertex_count(&self) -> usize {
         self.rest.len() / 3
     }
@@ -282,14 +305,14 @@ impl Character {
                 cursor.offset
             );
         }
-        let mut first_texture: Option<usize> = None;
+        let mut face_texture: Vec<u16> = Vec::new();
         let materials = cursor.i32();
         if debug {
             eprintln!("pmx: {materials} materials at {:#x}", cursor.offset);
         }
         for index in 0..materials.max(0) {
-            // Name and English name; the memo is at the end of the record. Four
-            // texts here read the diffuse colour as a length and walked the
+            // Name and English name; the meta data is at the end of the record.
+            // Four texts here read the diffuse colour as a length and walked the
             // cursor out of the material list entirely.
             for _ in 0..2 {
                 let _ = cursor.text(encoding);
@@ -308,35 +331,29 @@ impl Character {
             let texture = cursor.index(texture_index_size);
             let _sphere = cursor.index(texture_index_size);
             cursor.u8(); // sphere mode
-            if debug && index < 2 {
-                eprintln!("pmx: material {index} colour end at {:#x}", cursor.offset);
-            }
             if cursor.u8() == 0 {
                 let _ = cursor.index(texture_index_size);
             } else {
                 cursor.u8();
             }
+            let _ = cursor.text(encoding); // meta data
+            // The record ends with how many *surface indices* this material
+            // covers, and they are sequential: that is what says which texture
+            // each triangle uses, and it is why the reader needs it even though
+            // the value is never drawn.
+            let surface_count = cursor.i32().max(0) as usize;
             if debug && index < 2 {
-                eprintln!("pmx: material {index} toon end at {:#x}", cursor.offset);
+                eprintln!(
+                    "pmx: material {index} texture {texture}, {surface_count} indices, ends at {:#x}",
+                    cursor.offset
+                );
             }
-            let _ = cursor.text(encoding);
-            // Some exporters append one more i32 after the memo (the MMD model
-            // reported as "the PMX has no bones" writes a per-material number
-            // there — 10644 for its first material). Peek at the next record's
-            // name length instead of trusting the layout: a real length is small
-            // and is followed by decodable text.
-            if index + 1 < materials {
-                let here = cursor.offset;
-                if !Cursor::looks_like_text(bytes, here, encoding) {
-                    cursor.offset = here + 4;
-                }
-                if debug && index < 2 {
-                    eprintln!("pmx: material {index} next record at {:#x}", cursor.offset);
-                }
-            }
-            // The first material's base-colour texture is the model's skin.
-            if first_texture.is_none() && texture >= 0 {
-                first_texture = Some(texture as usize);
+            for _ in 0..surface_count / 3 {
+                face_texture.push(if texture >= 0 {
+                    texture as u16
+                } else {
+                    u16::MAX
+                });
             }
         }
 
@@ -353,15 +370,20 @@ impl Character {
             let parent = cursor.index(bone_index_size);
             let _layer = cursor.i32();
             let flags = cursor.u16();
+            // Bit 0 means the tail is a *bone index*; clear means it is a vec3.
+            // Reading that the wrong way round walked the cursor ten bytes per
+            // bone, so every name after the first came out shifted.
             if flags & 0x0001 != 0 {
+                let _ = cursor.index(bone_index_size);
+            } else {
                 for _ in 0..3 {
                     cursor.f32();
                 }
             }
-            if flags & 0x0002 != 0 {
-                let _ = cursor.index(bone_index_size);
-            }
-            if flags & 0x0100 != 0 {
+            // Bits 8 and 9 are "inherit rotation" and "inherit translation";
+            // both carry a parent index and an influence weight. Missing bit 9
+            // is what shifted every bone after the first breast bone.
+            if flags & 0x0300 != 0 {
                 let _ = cursor.index(bone_index_size);
                 cursor.f32();
             }
@@ -420,11 +442,20 @@ impl Character {
             .chunks_exact(3)
             .map(|face| [face[0], face[1], face[2]])
             .collect();
-        let texture = first_texture
-            .and_then(|index| texture_paths.get(index))
-            .and_then(|reference| load_texture(folder, reference, false));
+        // Each texture the material list names, loaded once and kept in file
+        // order so a material's texture index is still valid.
+        let textures: Vec<Texture> = texture_paths
+            .iter()
+            .map(|reference| {
+                if reference.is_empty() {
+                    Texture::white()
+                } else {
+                    load_texture(folder, reference, false).unwrap_or_else(Texture::white)
+                }
+            })
+            .collect();
         Ok(finalize(
-            name, bones, rest, joints, weights, faces, uv, texture,
+            name, bones, rest, joints, weights, faces, uv, textures, face_texture,
         ))
     }
 
@@ -692,15 +723,20 @@ impl Character {
         joints.truncate(vertex_count);
         weights.truncate(vertex_count);
         let _ = vertex_count;
-        // The skin is a material's base-colour texture in the file's folder.
-        let texture = objects.children_named("Texture").find_map(|node| {
-            node.child("RelativeFilename")
-                .and_then(|name| name.props.first())
-                .and_then(|prop| prop.as_str().map(|value| value.to_string()))
-                .or_else(|| node.str_at(1).map(|value| value.to_string()))
-                .and_then(|reference| load_texture(folder, &reference, true))
-        });
-        Ok(finalize(name, bones, rest, joints, weights, faces, uv, texture))
+        // Every texture the file points at, so a face can pick its own image.
+        let textures: Vec<Texture> = objects
+            .children_named("Texture")
+            .filter_map(|node| {
+                node.child("RelativeFilename")
+                    .and_then(|name| name.props.first())
+                    .and_then(|prop| prop.as_str().map(|value| value.to_string()))
+                    .or_else(|| node.str_at(1).map(|value| value.to_string()))
+                    .and_then(|reference| load_texture(folder, &reference, true))
+            })
+            .collect();
+        Ok(finalize(
+            name, bones, rest, joints, weights, faces, uv, textures, Vec::new(),
+        ))
     }
 
     /// Pose the mesh with the clip's joint rotations.
@@ -715,6 +751,7 @@ impl Character {
         world: &[[f32; 9]],
         rest: &[[f32; 9]],
         rest_positions: &[[f32; 3]],
+        clip_parents: &[i32],
         names: &[String],
         translation: [f32; 3],
     ) -> Vec<f32> {
@@ -737,45 +774,89 @@ impl Character {
                 }
             }
         }
-        // How far the clip has turned each bone from its own rest pose.
-        let mut delta = [identity(); 52];
+        // Each joint's own deviation from the clip's rest pose, expressed in its
+        // parent joint's moving frame: `rest_localᵀ · world_local`. Working in
+        // the joint's own frame is what makes a chain compose — the shoulder
+        // picks up the clavicle's turn, the elbow picks up both — and it is what
+        // a mature retargeter does.
+        let mut deviation = [identity(); 52];
         let mut mapped = [false; 52];
         for canonical in 0..52 {
             let joint = joint_of[canonical];
             if joint == usize::MAX || joint >= world.len() || joint >= rest.len() {
                 continue;
             }
-            delta[canonical] = multiply(&world[joint], &transpose(&rest[joint]));
+            let parent = clip_parents
+                .get(joint)
+                .copied()
+                .unwrap_or(-1);
+            let parent = if parent >= 0 && (parent as usize) < world.len() && (parent as usize) < rest.len() {
+                Some(parent as usize)
+            } else {
+                None
+            };
+            let local_rest = match parent {
+                Some(parent) => multiply(&transpose(&rest[parent]), &rest[joint]),
+                None => rest[joint],
+            };
+            let local_world = match parent {
+                Some(parent) => multiply(&transpose(&world[parent]), &world[joint]),
+                None => world[joint],
+            };
+            deviation[canonical] = multiply(&transpose(&local_rest), &local_world);
             mapped[canonical] = true;
         }
         let swing = self.bind_swing(&joint_of, rest_positions);
         let ground = self.ground_offset(&joint_of, rest_positions);
-        // Walk parents first: each bone's world rotation is the clip's own delta
-        // for that joint, and its pivot follows its parent's motion. Without the
-        // second half a raised arm would rotate about the bind elbow.
-        let mut effective = vec![identity(); self.bones.len()];
+        // Where each bone sits with the clip at its rest pose: its bind
+        // orientation, swung so an A-posed avatar matches the clip's rest. The
+        // bind matrix can carry scale (Unreal exports its skeleton in
+        // centimetres), so only its unit rotation takes part in the pose.
+        let units: Vec<[f32; 9]> = self
+            .bones
+            .iter()
+            .map(|bone| unit_rotation(&bone.bind_rot))
+            .collect();
+        let aligned: Vec<[f32; 9]> = self
+            .bones
+            .iter()
+            .enumerate()
+            .map(|(index, _)| multiply(&swing[index], &units[index]))
+            .collect();
+        // Walk parents first: a bone's world rotation is its parent's times its
+        // own rest-relative local rotation and the clip's deviation for that
+        // joint, and its pivot follows its parent.
+        let mut rotation = vec![identity(); self.bones.len()];
         let mut position = vec![[0.0f32; 3]; self.bones.len()];
         let mut skin = vec![[0.0f32; 16]; self.bones.len()];
         for &index in &self.order {
             let bone = &self.bones[index];
-            let carried = bone
+            let parent_rotation = bone
                 .parent
-                .map(|parent| effective[parent])
+                .map(|parent| rotation[parent])
                 .unwrap_or_else(identity);
-            let rotation = match bone.canonical {
-                Some(canonical) if mapped[canonical] => {
-                    multiply(&delta[canonical], &swing[index])
-                }
-                // A bone the clip cannot drive rides with its parent.
-                _ => carried,
+            let local_rest = match bone.parent {
+                Some(parent) => multiply(&transpose(&aligned[parent]), &aligned[index]),
+                None => aligned[index],
             };
+            let local = match bone.canonical {
+                Some(canonical) if mapped[canonical] => {
+                    multiply(&local_rest, &deviation[canonical])
+                }
+                // A bone the clip cannot drive keeps its rest-relative pose and
+                // rides with its parent.
+                _ => local_rest,
+            };
+            let here = multiply(&parent_rotation, &local);
             let at = match bone.parent {
                 Some(parent) => {
                     let from = self.bones[parent].bind;
+                    // R_parent · unit_bind_parentᵀ transports the parent's offset.
+                    let transport = multiply(&parent_rotation, &transpose(&units[parent]));
                     let mut at = position[parent];
                     for axis in 0..3 {
                         for axis_in in 0..3 {
-                            at[axis] += carried[axis * 3 + axis_in]
+                            at[axis] += transport[axis * 3 + axis_in]
                                 * (bone.bind[axis_in] - from[axis_in]);
                         }
                     }
@@ -787,15 +868,16 @@ impl Character {
                     bone.bind[2] + translation[2],
                 ],
             };
-            effective[index] = rotation;
+            rotation[index] = here;
             position[index] = at;
-            let rotation = multiply(&rotation, &bone.bind_rot);
-            // M = [R | pivot] * inverse_bind
+            // M = [R · unitᵀ · bind | pivot] * inverse_bind, which is exactly the
+            // bind transform when the pose has not moved.
+            let skin_rotation = multiply(&multiply(&here, &transpose(&units[index])), &bone.bind_rot);
             let world_matrix = multiply4(
                 &[
-                    rotation[0], rotation[1], rotation[2], at[0],
-                    rotation[3], rotation[4], rotation[5], at[1],
-                    rotation[6], rotation[7], rotation[8], at[2],
+                    skin_rotation[0], skin_rotation[1], skin_rotation[2], at[0],
+                    skin_rotation[3], skin_rotation[4], skin_rotation[5], at[1],
+                    skin_rotation[6], skin_rotation[7], skin_rotation[8], at[2],
                     0.0, 0.0, 0.0, 1.0,
                 ],
                 &bone.inverse_bind,
@@ -1107,7 +1189,8 @@ fn finalize(
     weights: Vec<[f32; 4]>,
     faces: Vec<[u32; 3]>,
     mut uv: Vec<[f32; 2]>,
-    texture: Option<Texture>,
+    textures: Vec<Texture>,
+    mut face_texture: Vec<u16>,
 ) -> Character {
     let mut height_min = f32::INFINITY;
     let mut height_max = f32::NEG_INFINITY;
@@ -1142,6 +1225,13 @@ fn finalize(
     }
     let order = hierarchy_order(&bones);
     uv.resize(rest.len() / 3, [0.0, 0.0]);
+    // Every face needs a slot, and a model with no textures gets MAX so a
+    // face that has no image is drawn as clay rather than as texture 0.
+    if textures.is_empty() {
+        face_texture = vec![u16::MAX; faces.len()];
+    } else if face_texture.len() < faces.len() {
+        face_texture.resize(faces.len(), u16::MAX);
+    }
     Character {
         name,
         bones,
@@ -1151,7 +1241,8 @@ fn finalize(
         weights,
         faces,
         uv,
-        texture: texture.map(Arc::new),
+        textures: textures.into_iter().map(Arc::new).collect(),
+        face_texture,
         scale,
     }
 }
@@ -1215,6 +1306,30 @@ fn transpose(m: &[f32; 9]) -> [f32; 9] {    [m[0], m[3], m[6], m[1], m[4], m[7],
 
 fn identity() -> [f32; 9] {
     [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+}
+
+/// The rotation a bind matrix carries, with any scale divided out. Unreal
+/// exports its skeleton in centimetres, so a bind 3×3 is not a rotation.
+fn unit_rotation(m: &[f32; 9]) -> [f32; 9] {
+    let row = |index: usize| -> Option<[f32; 3]> {
+        unit([m[index * 3], m[index * 3 + 1], m[index * 3 + 2]])
+    };
+    let (Some(x), Some(y), Some(z)) = (row(0), row(1), row(2)) else {
+        return identity();
+    };
+    let dot = x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+    let y = unit([y[0] - x[0] * dot, y[1] - x[1] * dot, y[2] - x[2] * dot]).unwrap_or(y);
+    let cross = [
+        x[1] * y[2] - x[2] * y[1],
+        x[2] * y[0] - x[0] * y[2],
+        x[0] * y[1] - x[1] * y[0],
+    ];
+    let cross = unit(cross).unwrap_or([z[0], z[1], z[2]]);
+    [
+        x[0], x[1], x[2],
+        y[0], y[1], y[2],
+        cross[0], cross[1], cross[2],
+    ]
 }
 
 fn unit(v: [f32; 3]) -> Option<[f32; 3]> {
@@ -1425,7 +1540,8 @@ impl Gltf {
         let mut joints: Vec<[u16; 4]> = Vec::new();
         let mut weights: Vec<[f32; 4]> = Vec::new();
         let mut faces: Vec<[u32; 3]> = Vec::new();
-        let mut texture: Option<Texture> = None;
+        let mut textures: Vec<Texture> = Vec::new();
+        let mut face_texture: Vec<u16> = Vec::new();
         let meshes = self
             .document
             .get("meshes")
@@ -1475,17 +1591,26 @@ impl Gltf {
                     Some(accessor) => self.read_indices(accessor as usize)?,
                     None => (0..positions.len() as u32 / 3).collect(),
                 };
+                // One material per primitive, so its triangles share one
+                // image; the coordinates come with the primitive above.
+                let slot = match primitive
+                    .get("material")
+                    .and_then(|value| value.as_u64())
+                    .and_then(|material| self.material_texture(material as usize, folder))
+                {
+                    Some(texture) => {
+                        textures.push(texture);
+                        (textures.len() - 1) as u16
+                    }
+                    None => u16::MAX,
+                };
                 for triangle in indices.chunks_exact(3) {
                     faces.push([
                         base + triangle[0],
                         base + triangle[1],
                         base + triangle[2],
                     ]);
-                }
-                if texture.is_none() {
-                    if let Some(material) = primitive.get("material").and_then(|v| v.as_u64()) {
-                        texture = self.material_texture(material as usize, folder);
-                    }
+                    face_texture.push(slot);
                 }
             }
         }
@@ -1495,7 +1620,7 @@ impl Gltf {
             "the mesh attributes disagree on the vertex count"
         );
         Ok(finalize(
-            name, bones, rest, joints, weights, faces, uv, texture,
+            name, bones, rest, joints, weights, faces, uv, textures, face_texture,
         ))
     }
 
@@ -1970,12 +2095,13 @@ mod tests {
             character.unmatched()
         );
         eprintln!(
-            "{}: {} texture coordinates, texture {:?}",
+            "{}: {} texture coordinates, {} textures {:?}",
             character.name,
             character.uv.len(),
+            character.textures.len(),
             character
-                .texture
-                .as_ref()
+                .textures
+                .first()
                 .map(|texture| (texture.width, texture.height))
         );
         let mut uv_lo = [f32::INFINITY; 2];
@@ -1992,6 +2118,15 @@ mod tests {
             uv_lo,
             uv_hi,
             &character.uv[..character.uv.len().min(4)]
+        );
+        eprintln!(
+            "{}: matched {:?}",
+            character.name,
+            character
+                .bones
+                .iter()
+                .filter_map(|bone| bone.canonical.map(|canonical| (canonical, bone.name.clone())))
+                .collect::<Vec<_>>()
         );
         // What the pose fix depends on: a hierarchy to carry motion down, and
         // the limb angles it has to swing away. A T-pose arm is level, an A-pose
@@ -2182,6 +2317,7 @@ mod tests {
             &world,
             &rest,
             &vec![[0.0f32; 3]; 52],
+            &[-1i32; 52],
             &names,
             [0.0; 3],
         );
@@ -2319,7 +2455,7 @@ mod tests {
         let mut names = vec![String::new(); 52];
         names[6] = "LeftCollar".to_string();
         names[7] = "LeftShoulder".to_string();
-        let posed = character.pose(&world, &rest, &rest_positions, &names, [0.0; 3]);
+        let posed = character.pose(&world, &rest, &rest_positions, &[-1i32; 52], &names, [0.0; 3]);
         // The shoulder joint stays where the model bound it.
         assert!((posed[1] - 1.436).abs() < 1e-4, "{posed:?}");
         assert!((posed[0] - 0.19).abs() < 1e-4, "{posed:?}");
@@ -2341,7 +2477,7 @@ mod tests {
         }
         let world = vec![neutral(); 52];
         let rest = vec![neutral(); 52];
-        let posed = character.pose(&world, &rest, &vec![[0.0f32; 3]; 52], &names, [0.0; 3]);
+        let posed = character.pose(&world, &rest, &vec![[0.0f32; 3]; 52], &[-1i32; 52], &names, [0.0; 3]);
         let mut worst = 0.0f32;
         for (rest, posed) in character.rest.chunks_exact(3).zip(posed.chunks_exact(3)) {
             for axis in 0..3 {
@@ -2542,6 +2678,10 @@ mod tests {
             out.extend_from_slice(&parent.to_le_bytes());
             out.extend_from_slice(&0i32.to_le_bytes()); // layer
             out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            // Flags clear, so the tail is a vec3 and has to be written.
+            for _ in 0..3 {
+                out.extend_from_slice(&0.0f32.to_le_bytes());
+            }
         };
         bone(&mut out, "Hips", [0.0, 1.0, 0.0], -1);
         bone(&mut out, "LeftUpLeg", [0.1, 1.0, 0.0], 0);
@@ -2592,7 +2732,7 @@ mod tests {
         // Only Hips (canonical 0) is named, and it is SMPL-H joint 0.
         let mut names = vec![String::new(); 52];
         names[0] = "Hips".to_string();
-        let posed = character.pose(&world, &rest, &rest_positions, &names, [0.0, 1.0, 0.0]);
+        let posed = character.pose(&world, &rest, &rest_positions, &[-1i32; 52], &names, [0.0, 1.0, 0.0]);
         // Vertex 0 is fully weighted to Hips, whose bind position is the origin.
         assert!((posed[1] - 1.0).abs() < 1e-5, "{posed:?}");
         // The translation is global: a vertex weighted to the other bone moves
@@ -2631,7 +2771,8 @@ mod tests {
             weights: vec![[1.0, 0.0, 0.0, 0.0]; count],
             faces: Vec::new(),
             uv: vec![[0.0, 0.0]; count],
-            texture: None,
+            textures: Vec::new(),
+            face_texture: Vec::new(),
             scale: 1.0,
         }
     }
@@ -2656,10 +2797,15 @@ mod tests {
         let mut names = vec![String::new(); 52];
         names[0] = "Hips".to_string();
         names[44] = "LeftUpLeg".to_string();
+        // The leg hangs from the hips: both turning by the same world rotation
+        // is the hips turning and the leg riding along.
+        let mut clip_parents = vec![-1i32; 52];
+        clip_parents[44] = 0;
         let posed = character.pose(
             &world,
             &rest,
             &vec![[0.0f32; 3]; 52],
+            &clip_parents,
             &names,
             [0.0, 0.0, 0.0],
         );
@@ -2688,7 +2834,7 @@ mod tests {
         let mut names = vec![String::new(); 52];
         names[7] = "LeftArm".to_string();
         names[8] = "LeftForeArm".to_string();
-        let posed = character.pose(&world, &rest, &rest_positions, &names, [0.0; 3]);
+        let posed = character.pose(&world, &rest, &rest_positions, &[-1i32; 52], &names, [0.0; 3]);
         // A quarter turn out of the bind, so the forearm joint ends up level.
         assert!((posed[0] - 1.0).abs() < 1e-5, "{posed:?}");
         assert!(posed[1].abs() < 1e-5, "{posed:?}");
@@ -2712,7 +2858,15 @@ mod tests {
         let mut names = vec![String::new(); 52];
         names[0] = "Hips".to_string();
         names[46] = "LeftFoot".to_string();
-        let posed = character.pose(&world, &rest, &rest_positions, &names, [0.0; 3]);
+        let posed = character.pose(&world, &rest, &rest_positions, &[-1i32; 52], &names, [0.0; 3]);
         assert!((posed[1] - 0.078).abs() < 1e-5, "{posed:?}");
     }
 }
+
+
+
+
+
+
+
+

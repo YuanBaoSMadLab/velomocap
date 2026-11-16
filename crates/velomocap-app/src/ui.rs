@@ -1036,6 +1036,7 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                 // clip's pelvis so it stands where the motion stands.
                 let character_rest = app.character_rest.as_deref();
                 let character_rest_positions = app.character_rest_positions.as_deref();
+                let character_rest_parents = app.character_rest_parents.as_deref();
                 let posed: Vec<Option<Vec<f32>>> = people
                     .iter()
                     .enumerate()
@@ -1043,6 +1044,7 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                         let assigned = person.character.as_ref()?;
                         let rest = character_rest?;
                         let rest_positions = character_rest_positions?;
+                        let clip_parents = character_rest_parents?;
                         let clip = flow.get(slot).filter(|clip| !clip.skeletons.is_empty())?;
                         let index = app
                             .playhead
@@ -1067,6 +1069,7 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                             &rotations,
                             rest,
                             rest_positions,
+                            clip_parents,
                             &clip.bvh.names,
                             translation,
                         ))
@@ -1087,7 +1090,8 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                                     keypoints: &[],
                                     faces: &assigned.character.faces,
                                     uv: Some(&assigned.character.uv),
-                                    texture: assigned.character.texture.as_ref(),
+                                    textures: &assigned.character.textures,
+                                    face_texture: &assigned.character.face_texture,
                                     selected: slot == selected,
                                 });
                             }
@@ -1105,7 +1109,8 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                                     keypoints: &[],
                                     faces,
                                     uv: None,
-                                    texture: None,
+                                    textures: &[],
+                                    face_texture: &[],
                                     selected: slot == selected,
                                 });
                             }
@@ -1119,7 +1124,8 @@ fn viewport_panel(app: &mut VeloMocap, ctx: &egui::Context) {    egui::CentralPa
                                 keypoints: &frame.keypoints,
                                 faces: mhr_faces,
                                 uv: None,
-                                texture: None,
+                                textures: &[],
+                                face_texture: &[],
                                 selected: slot == selected,
                             })
                     })
@@ -2996,3 +3002,6 @@ mod tests {
         assert_eq!(track_frame(100.0, rect, 1), 0, "a single-frame clip stays at 0");
     }
 }
+
+
+
