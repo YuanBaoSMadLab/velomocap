@@ -387,26 +387,30 @@ pub fn write_glb(
         let mut samplers: Vec<serde_json::Value> = Vec::new();
         let mut channels: Vec<serde_json::Value> = Vec::new();
         let times: Vec<f32> = (0..frames.len()).map(|frame| frame as f32 / 30.0).collect();
-        let time_accessor = push_accessor(&mut bin, &mut accessors, times, "SCALAR", 5126, None);
+        let time_accessor = push_accessor(&mut bin, &mut accessors, times.clone(), "SCALAR", 5126, None);
+        // An animation input accessor must carry its bounds, like POSITION.
+        accessors[time_accessor]["min"] = serde_json::json!([0.0]);
+        accessors[time_accessor]["max"] = serde_json::json!([times.last().copied().unwrap_or(0.0)]);
         for (index, bone) in bones.iter().enumerate() {
             let node = node_of[index];
-            // Translation: the bone's world position relative to its parent's
-            // world position, in the parent's rest frame.
+            // The animated transform of a node is its own, relative to its parent:
+            // glTF replaces the node's TRS, it does not take world matrices.
             let mut moves = Vec::with_capacity(frames.len() * 3);
             let mut turns = Vec::with_capacity(frames.len() * 4);
             for frame in frames {
                 let at = frame.positions.get(index).copied().unwrap_or(bone.bind);
-                let local = match bone.parent {
+                let turn_here = frame.rotations.get(index).copied().unwrap_or(IDENTITY);
+                let (local, rotation) = match bone.parent {
                     Some(parent) => {
                         let from = frame.positions.get(parent).copied().unwrap_or([0.0; 3]);
-                        let rotation = frame.rotations.get(parent).copied().unwrap_or([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+                        let parent_rotation = frame.rotations.get(parent).copied().unwrap_or(IDENTITY);
+                        let inverse = transpose(&parent_rotation);
                         let offset = [at[0] - from[0], at[1] - from[1], at[2] - from[2]];
-                        turn(&transpose(&rotation), offset)
+                        (turn(&inverse, offset), multiply(&inverse, &turn_here))
                     }
-                    None => at,
+                    None => (at, turn_here),
                 };
                 moves.extend_from_slice(&local);
-                let rotation = frame.rotations.get(index).copied().unwrap_or([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
                 turns.extend_from_slice(&quaternion(&rotation));
             }
             let translation = push_accessor(&mut bin, &mut accessors, moves, "VEC3", 5126, None);
@@ -415,6 +419,15 @@ pub fn write_glb(
             channels.push(serde_json::json!({ "sampler": samplers.len() - 1, "target": { "node": node, "path": "translation" } }));
             samplers.push(serde_json::json!({ "input": time_accessor, "output": rotation, "interpolation": "LINEAR" }));
             channels.push(serde_json::json!({ "sampler": samplers.len() - 1, "target": { "node": node, "path": "rotation" } }));
+            // The bind matrices carry scale (Unreal exports its skeleton in
+            // centimetres). An animation that only wrote translation and rotation
+            // would reset it to 1 and the model would come in a hundredth of its
+            // size, so the rest scale is written out as well.
+            let scale = column_length(&bone.bind_rot);
+            let values: Vec<f32> = std::iter::repeat_n(scale, frames.len() * 3).collect();
+            let accessor = push_accessor(&mut bin, &mut accessors, values, "VEC3", 5126, None);
+            samplers.push(serde_json::json!({ "input": time_accessor, "output": accessor, "interpolation": "LINEAR" }));
+            channels.push(serde_json::json!({ "sampler": samplers.len() - 1, "target": { "node": node, "path": "scale" } }));
         }
         animations.push(serde_json::json!({
             "name": "clip",
@@ -513,6 +526,25 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
         a[2] * b[0] - a[0] * b[2],
         a[0] * b[1] - a[1] * b[0],
     ]
+}
+
+const IDENTITY: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+
+/// The uniform scale a bind rotation carries, taken from its first column.
+fn column_length(m: &[f32; 9]) -> f32 {
+    (m[0] * m[0] + m[3] * m[3] + m[6] * m[6]).sqrt().max(1e-6)
+}
+
+fn multiply(a: &[f32; 9], b: &[f32; 9]) -> [f32; 9] {
+    let mut out = [0.0f32; 9];
+    for row in 0..3 {
+        for column in 0..3 {
+            out[row * 3 + column] = a[row * 3] * b[column]
+                + a[row * 3 + 1] * b[3 + column]
+                + a[row * 3 + 2] * b[6 + column];
+        }
+    }
+    out
 }
 
 fn transpose(m: &[f32; 9]) -> [f32; 9] {

@@ -1026,6 +1026,21 @@ impl Character {
         names: &[String],
         translation: [f32; 3],
     ) -> Vec<f32> {
+        self.pose_recording(world, rest, rest_positions, names, translation, None)
+    }
+
+    /// Pose the mesh and, when `record` is given, hand back each bone's world
+    /// rotation and position for that frame — what an exporter needs to write an
+    /// animation track, and what the viewport never asks for.
+    pub fn pose_recording(
+        &self,
+        world: &[[f32; 9]],
+        rest: &[[f32; 9]],
+        rest_positions: &[[f32; 3]],
+        names: &[String],
+        translation: [f32; 3],
+        mut record: Option<&mut Vec<([f32; 9], [f32; 3])>>,
+    ) -> Vec<f32> {
         // A character's bones carry canonical indices (Hips, LeftUpLeg …), the
         // clip's rotations are in its own joint order. Resolve once per pose.
         //
@@ -1290,6 +1305,12 @@ impl Character {
             local_delta[index] = multiply(&transpose(&local_rest), &local);
             rotation[index] = here;
             position[index] = at;
+            if let Some(buffer) = record.as_deref_mut() {
+                if buffer.len() < self.bones.len() {
+                    buffer.resize(self.bones.len(), (identity(), [0.0; 3]));
+                }
+                buffer[index] = (here, at);
+            }
             // M = [R · unitᵀ · bind | pivot] * inverse_bind, which is exactly the
             // bind transform when the pose has not moved.
             let skin_rotation = multiply(&multiply(&here, &transpose(&units[index])), &bone.bind_rot);
