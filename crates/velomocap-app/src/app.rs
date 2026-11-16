@@ -355,9 +355,12 @@ pub struct VeloMocap {
     pub character_rest_parents: Option<Arc<Vec<i32>>>,
     /// The person whose character panel is open.
     pub person_panel: Option<usize>,
-    /// Every character imported into this workspace (VRM / glTF / FBX / PMX),
-    /// whether or not a person is wearing it right now.
+    /// Every character imported into this machine's library (VRM / glTF / FBX /
+    /// PMX), whether or not a person is wearing it right now. The list lives
+    /// outside the project, so one import is available to every project.
     pub characters: Vec<LibraryCharacter>,
+    /// The shared library has been read from disk once.
+    pub library_loaded: bool,
     /// The library entry whose detail panel is open.
     pub character_panel: Option<usize>,
     /// Which page the movie-clip column shows: 0 people, 1 characters, 2 stream.
@@ -523,6 +526,7 @@ impl VeloMocap {
             character_rest_parents: None,
             person_panel: None,
             characters: Vec::new(),
+        library_loaded: false,
             character_panel: None,
             left_tab: 0,
             drop_hint: None,
@@ -717,6 +721,7 @@ impl VeloMocap {
                 });
                 let index = self.characters.len() - 1;
                 self.character_panel = Some(index);
+                self.save_library();
                 Some(index)
             }
             Err(error) => {
@@ -771,6 +776,7 @@ impl VeloMocap {
     pub fn remove_character(&mut self, index: usize) {
         if index < self.characters.len() {
             self.characters.remove(index);
+            self.save_library();
         }
         self.character_panel = match self.character_panel {
             Some(panel) if panel == index => None,
@@ -797,6 +803,77 @@ impl VeloMocap {
         self.video
             .as_ref()
             .map(|video| video.with_extension("characters.json"))
+    }
+
+    /// Where the character library lives.
+    ///
+    /// Not beside the clip: a model is imported once and every project can put it
+    /// on a person, so the path list is per machine rather than per project file.
+    fn library_path() -> Option<PathBuf> {
+        let base = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))?;
+        Some(base.join("VeloMocap").join("characters.json"))
+    }
+
+    /// Write the library's file list. The models themselves are never copied: a
+    /// 28 MB avatar is read from where the user put it.
+    pub fn save_library(&mut self) {
+        let Some(path) = Self::library_path() else {
+            return;
+        };
+        let entries: Vec<serde_json::Value> = self
+            .characters
+            .iter()
+            .map(|entry| serde_json::json!({ "file": entry.path.display().to_string() }))
+            .collect();
+        let document = serde_json::json!({ "version": 1, "characters": entries });
+        let written = serde_json::to_string_pretty(&document)
+            .map_err(|error| error.to_string())
+            .and_then(|text| {
+                if let Some(folder) = path.parent() {
+                    std::fs::create_dir_all(folder).map_err(|error| error.to_string())?;
+                }
+                std::fs::write(&path, text).map_err(|error| error.to_string())
+            });
+        if let Err(error) = written {
+            self.log(format!("characters: {error}"));
+        }
+    }
+
+    /// Read the library once, so every project starts with the same shelf.
+    pub fn load_library(&mut self) {
+        if self.library_loaded {
+            return;
+        }
+        self.library_loaded = true;
+        let Some(path) = Self::library_path() else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Ok(document) = serde_json::from_str::<serde_json::Value>(&text) else {
+            self.log(format!("characters: {} is not valid JSON", path.display()));
+            return;
+        };
+        let entries = document
+            .get("characters")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for entry in entries {
+            let Some(file) = entry.get("file").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let file = PathBuf::from(file);
+            if !file.is_file() {
+                self.log(format!("characters: {} is gone", file.display()));
+                continue;
+            }
+            self.add_character(file);
+        }
     }
 
     /// Save the per-person character choice beside the clip, so re-opening the
@@ -2730,6 +2807,7 @@ struct CliArgs {
 }
 impl eframe::App for VeloMocap {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.load_library();
         self.poll(ctx);
         self.poll_detection(ctx);
         self.poll_capture(ctx);

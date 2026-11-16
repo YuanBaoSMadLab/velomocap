@@ -475,6 +475,11 @@ fn people_column(app: &mut VeloMocap, ui: &mut egui::Ui, rect: egui::Rect) {
     // character page is where imported models live so one can be switched onto a
     // person without finding the file again.
     ui.horizontal(|ui| {
+        // The three tabs share the column's width. A fixed 54 px each ran past
+        // the edge of a narrow column and the third one was clipped, which read
+        // as a missing page.
+        let spacing = ui.spacing().item_spacing.x;
+        let width = ((ui.available_width() - spacing * 2.0) / 3.0).max(38.0);
         for (index, label) in [i18n::t("People"), i18n::t("Characters"), i18n::t("Stream")]
             .iter()
             .enumerate()
@@ -491,7 +496,7 @@ fn people_column(app: &mut VeloMocap, ui: &mut egui::Ui, rect: egui::Rect) {
                     1.0_f32,
                     if selected { ACCENT_DIM } else { BORDER },
                 ))
-                .min_size(egui::vec2(54.0, 20.0));
+                .min_size(egui::vec2(width, 20.0));
             if ui.add(button).clicked() {
                 app.left_tab = index;
             }
