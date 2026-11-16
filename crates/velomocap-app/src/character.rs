@@ -710,6 +710,15 @@ impl Character {
             let Some(canonical) = bone.canonical else {
                 continue;
             };
+            // Only the limb segments the bind pose actually disagrees about: a
+            // T-posed or A-posed arm, a bent elbow, a wide stance. A clavicle's
+            // direction is a rig convention rather than a pose — the clip's
+            // collar-to-shoulder line rises 18° while a Mixamo clavicle is level
+            // and Unreal's slopes down — so swinging it only lifts the shoulder
+            // pad into a shrug. The same goes for hands and fingers.
+            if !matches!(canonical, 7 | 8 | 26 | 27 | 44 | 45 | 48 | 49) {
+                continue;
+            }
             let Some(child) = primary.get(canonical).copied() else {
                 continue;
             };
@@ -1821,6 +1830,101 @@ mod tests {
             angle(at("left_shoulder"), at("left_elbow")).unwrap_or(0.0),
             angle(at("left_elbow"), at("left_wrist")).unwrap_or(0.0)
         );
+    }
+
+    /// The shoulders: the clip's clavicle direction against the model's. A large
+    /// difference is a swing that lifts the shoulder pad.
+    #[test]
+    fn a_real_character_reports_its_shoulders() {
+        let Some(model) = std::env::var_os("VELOMOCAP_SMPLH_MODEL") else {
+            return;
+        };
+        let body = velomocap_body::BodyModel::load(std::path::Path::new(&model), 16).expect("body");
+        let skeleton = body.forward_joints(&velomocap_body::Pose::neutral(body.num_joints, 16));
+        let at = |name: &str| {
+            velomocap_body::JOINT_NAMES
+                .iter()
+                .position(|joint| *joint == name)
+                .map(|joint| {
+                    [
+                        skeleton.positions[joint * 3],
+                        skeleton.positions[joint * 3 + 1],
+                        skeleton.positions[joint * 3 + 2],
+                    ]
+                })
+        };
+        let degrees = |a: [f32; 3], b: [f32; 3]| -> f32 {
+            let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let length = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            if length < 1e-6 {
+                return 0.0;
+            }
+            (d[1] / length).asin().to_degrees()
+        };
+        eprintln!(
+            "clip rest: neck {:?} collar {:?} shoulder {:?}",
+            at("neck"),
+            at("left_collar"),
+            at("left_shoulder")
+        );
+        if let (Some(collar), Some(shoulder)) = (at("left_collar"), at("left_shoulder")) {
+            eprintln!(
+                "clip rest: collar -> shoulder {:.1}° below level",
+                degrees(collar, shoulder)
+            );
+        }
+        let Some(path) = std::env::var_os("VELOMOCAP_CHARACTER") else {
+            return;
+        };
+        let character = Character::load(std::path::Path::new(&path)).expect("load");
+        let bind = |canonical: usize| {
+            character
+                .bones
+                .iter()
+                .find(|bone| bone.canonical == Some(canonical))
+                .map(|bone| bone.bind)
+        };
+        eprintln!(
+            "{}: neck {:?} clavicle {:?} upper arm {:?}",
+            character.name,
+            bind(4),
+            bind(6),
+            bind(7)
+        );
+        if let (Some(clavicle), Some(arm)) = (bind(6), bind(7)) {
+            eprintln!(
+                "{}: clavicle -> upper arm {:.1}° below level",
+                character.name,
+                degrees(clavicle, arm)
+            );
+        }
+    }
+
+    /// A clavicle is not re-posed: the clip's collar line rises while a model's
+    /// clavicle is level or sloping down, and swinging one into the other lifts
+    /// the shoulder pad into a shrug.
+    #[test]
+    fn a_clavicle_keeps_its_bind_direction() {
+        // Unreal's clavicle slopes down toward the shoulder.
+        let bones = vec![
+            bound("LeftShoulder", 6, None, [0.0, 1.463, 0.0]),
+            bound("LeftArm", 7, Some(0), [0.19, 1.436, 0.0]),
+        ];
+        let mut character = handmade(bones, vec![0.19, 1.436, 0.0]);
+        character.joints[0][0] = 1;
+        let world = vec![neutral(); 52];
+        let rest = vec![neutral(); 52];
+        // The clip's collar-to-shoulder line rises: (0.08, 0.195) -> (0.17, 0.226).
+        let mut rest_positions = vec![[0.0f32; 3]; 52];
+        rest_positions[6] = [0.081, 0.195, 0.0];
+        rest_positions[7] = [0.172, 0.226, 0.0];
+        let mut names = vec![String::new(); 52];
+        names[6] = "LeftCollar".to_string();
+        names[7] = "LeftShoulder".to_string();
+        let posed = character.pose(&world, &rest, &rest_positions, &names, [0.0; 3]);
+        // The shoulder joint stays where the model bound it.
+        assert!((posed[1] - 1.436).abs() < 1e-4, "{posed:?}");
+        assert!((posed[0] - 0.19).abs() < 1e-4, "{posed:?}");
     }
 
     /// The same real file, posed with a clip that has not moved: every joint's
