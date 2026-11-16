@@ -257,7 +257,7 @@ fn menu_bar(app: &mut VeloMocap, ctx: &egui::Context) {
                         .clicked()
                     {
                         ui.close();
-                        app.import_character_dialog(app.selected);
+                        app.import_character_dialog(Some(app.selected));
                     }
                     ui.separator();
                     // Everything a written file needs — its format, the bone
@@ -434,21 +434,243 @@ fn people_column(app: &mut VeloMocap, ui: &mut egui::Ui, rect: egui::Rect) {
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
     let ui = &mut ui;
-    // People | Stream tabs.
+    // People | Characters | Stream. These used to be two labels with the second
+    // one disabled, which read as a broken tab. All three are pages now, and the
+    // character page is where imported models live so one can be switched onto a
+    // person without finding the file again.
     ui.horizontal(|ui| {
-        for (index, label) in [i18n::t("People"), i18n::t("Stream")].iter().enumerate() {
-            let selected = index == 0;
-            let text = egui::RichText::new(*label)
-                .size(11.5)
-                .color(if selected { egui::Color32::WHITE } else { TEXT });
+        for (index, label) in [i18n::t("People"), i18n::t("Characters"), i18n::t("Stream")]
+            .iter()
+            .enumerate()
+        {
+            let selected = app.left_tab == index;
+            let text = egui::RichText::new(*label).size(11.5).color(if selected {
+                egui::Color32::WHITE
+            } else {
+                TEXT
+            });
             let button = egui::Button::new(text)
                 .fill(if selected { ACCENT } else { HEADER_BG })
-                .stroke(egui::Stroke::new(1.0_f32, if selected { ACCENT_DIM } else { BORDER }))
-                .min_size(egui::vec2(58.0, 20.0));
-            let _ = ui.add_enabled(index == 0, button);
+                .stroke(egui::Stroke::new(
+                    1.0_f32,
+                    if selected { ACCENT_DIM } else { BORDER },
+                ))
+                .min_size(egui::vec2(54.0, 20.0));
+            if ui.add(button).clicked() {
+                app.left_tab = index;
+            }
         }
     });
     ui.add_space(4.0);
+    match app.left_tab {
+        1 => characters_column(app, ui),
+        2 => stream_column(app, ui),
+        _ => people_list(app, ui),
+    }
+}
+
+/// The imported characters, one card each. Clicking a card opens its details on
+/// the right, where it can be put on the selected person.
+fn characters_column(app: &mut VeloMocap, ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(i18n::t("Characters")).size(11.5));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(egui::Button::new("?").min_size(egui::vec2(22.0, 18.0)))
+                .on_hover_text(i18n::t(
+                    "Import a VRM / glTF / FBX / PMX humanoid and it joins this list",
+                ))
+                .clicked()
+            {
+                app.show_guide = true;
+            }
+        });
+    });
+    let cards: Vec<(usize, String, String, usize, usize)> = app
+        .characters
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            (
+                index,
+                entry
+                    .path
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| entry.path.display().to_string()),
+                entry
+                    .path
+                    .extension()
+                    .map(|extension| extension.to_string_lossy().to_uppercase())
+                    .unwrap_or_default(),
+                entry.character.matched(),
+                entry.character.bones.len(),
+            )
+        })
+        .collect();
+    let mut remove: Option<usize> = None;
+    let mut select: Option<usize> = None;
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(0x24, 0x24, 0x24))
+        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+        .inner_margin(egui::Margin::same(3))
+        .show(ui, |ui| {
+            ui.set_min_height((ui.available_height() - 32.0).max(60.0));
+            ui.set_width(ui.available_width());
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if cards.is_empty() {
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(i18n::t("No characters imported yet"))
+                                .size(11.0)
+                                .color(MUTED),
+                        );
+                    }
+                    for (index, name, format, matched, bones) in &cards {
+                        let selected = app.character_panel == Some(*index);
+                        let worn_by = app
+                            .people
+                            .iter()
+                            .find(|person| {
+                                person
+                                    .character
+                                    .as_ref()
+                                    .map(|assigned| assigned.path == app.characters[*index].path)
+                                    .unwrap_or(false)
+                            })
+                            .map(|person| person.name.clone());
+                        let caption = match &worn_by {
+                            Some(person) => {
+                                format!("{format} · {matched}/{bones} · {person}")
+                            }
+                            None => format!("{format} · {matched}/{bones}"),
+                        };
+                        let row = egui::Frame::new()
+                            .fill(if selected {
+                                egui::Color32::from_rgb(0x2b, 0x36, 0x44)
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            })
+                            .stroke(egui::Stroke::new(
+                                1.0_f32,
+                                if selected {
+                                    ACCENT_DIM
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                },
+                            ))
+                            .inner_margin(egui::Margin::symmetric(4, 3))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(name).size(11.5).color(
+                                                if selected {
+                                                    egui::Color32::WHITE
+                                                } else {
+                                                    TEXT
+                                                },
+                                            ),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(caption).size(10.0).color(MUTED),
+                                        );
+                                    });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .add(
+                                                    egui::Button::new("×")
+                                                        .min_size(egui::vec2(16.0, 16.0)),
+                                                )
+                                                .on_hover_text(i18n::t("Remove from list"))
+                                                .clicked()
+                                            {
+                                                remove = Some(*index);
+                                            }
+                                        },
+                                    );
+                                });
+                            })
+                            .response;
+                        let row = row.interact(egui::Sense::click());
+                        if row.clicked() {
+                            select = Some(*index);
+                        }
+                        row.on_hover_text(i18n::t(
+                            "Click for this model's details, then put it on the selected person",
+                        ));
+                    }
+                });
+        });
+    if let Some(index) = remove {
+        app.remove_character(index);
+    } else if let Some(index) = select {
+        app.character_panel = Some(index);
+    }
+    ui.add_space(4.0);
+    if ui
+        .add(
+            egui::Button::new(i18n::t("Import character…"))
+                .min_size(egui::vec2(ui.available_width(), 22.0)),
+        )
+        .clicked()
+    {
+        let person = if app.people.is_empty() {
+            None
+        } else {
+            Some(app.selected.min(app.people.len() - 1))
+        };
+        app.import_character_dialog(person);
+    }
+}
+
+/// The stream page: what the loaded clip actually is.
+fn stream_column(app: &mut VeloMocap, ui: &mut egui::Ui) {
+    ui.label(egui::RichText::new(i18n::t("Stream")).size(11.5));
+    ui.add_space(4.0);
+    let name = app
+        .video
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| i18n::t("No clip loaded").to_string());
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(0x24, 0x24, 0x24))
+        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+        .inner_margin(egui::Margin::symmetric(6, 5))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new(name).size(11.0).color(TEXT));
+            for (label, value) in [
+                (
+                    i18n::t("Resolution"),
+                    format!("{} × {}", app.video_size.0, app.video_size.1),
+                ),
+                (
+                    i18n::t("Frame rate"),
+                    format!("{:.2} fps", app.current_fps()),
+                ),
+                (i18n::t("Frames"), format!("{}", app.frame_count())),
+                (
+                    i18n::t("Position"),
+                    format!("{} / {}", app.playhead + 1, app.frame_count().max(1)),
+                ),
+            ] {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(label).size(10.5).color(MUTED));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(value).size(10.5).color(TEXT));
+                    });
+                });
+            }
+        });
+}
+
+fn people_list(app: &mut VeloMocap, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(i18n::t("People")).size(11.5));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1736,9 +1958,11 @@ fn sidebar(app: &mut VeloMocap, ctx: &egui::Context) {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         model_group(app, ui);
+                        character_group(app, ui);
                         people_group(app, ui);
                         solver_group(app, ui);
                         correction_group(app, ui);
+                        storage_group(app, ui);
                         resources_group(app, ui);
                     });
             });
@@ -1766,6 +1990,7 @@ fn group<R>(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui) -> 
 }
 
 fn model_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
+    let _ = app;
     group(ui, i18n::t("Solver"), |ui| {
         // The reference lets the user choose a motion backend (ExMR / GVHMR /
         // PEAR / …). This build has exactly one — FlowHMR with SAM 3D Body — so
@@ -1774,53 +1999,113 @@ fn model_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
             .on_hover_text(i18n::t(
                 "The only reconstruction backend in this build; ExMR, GVHMR, PEAR, MAMMA, PromptHMR and GEM-X are not ported",
             ));
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(i18n::t("Graphs")).size(11.0));
-            if ui
-                .add(egui::Button::new("…").min_size(egui::vec2(22.0, 18.0)))
-                .clicked()
-            {
-                if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    app.sam3d_dir = path;
-                }
-            }
-        });
+        // The graph folder and the two mesh read-outs that used to sit here were
+        // information nobody acts on: the folder comes with the install and the
+        // vertex counts are fixed by the model, so they only took space away
+        // from the settings someone actually changes.
+    });
+}
+
+/// The details of the selected character card: what the file is, and the one
+/// action that matters — put it on the person the workspace has selected.
+fn character_group(app: &mut VeloMocap, ui: &mut egui::Ui) {    let Some(index) = app.character_panel else {
+        return;
+    };
+    if index >= app.characters.len() {
+        app.character_panel = None;
+        return;
+    }
+    let entry = app.characters[index].clone();
+    let name = entry
+        .path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| entry.path.display().to_string());
+    let format = entry
+        .path
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_uppercase())
+        .unwrap_or_default();
+    let matched = entry.character.matched();
+    let bones = entry.character.bones.len();
+    let vertices = entry.character.vertex_count();
+    let faces = entry.character.faces.len();
+    let unmatched: Vec<&str> = entry.character.unmatched().into_iter().take(8).collect();
+    let person = app.people.get(app.selected).map(|person| person.name.clone());
+    let wearing = app
+        .people
+        .get(app.selected)
+        .and_then(|person| person.character.as_ref())
+        .map(|assigned| assigned.path == entry.path)
+        .unwrap_or(false);
+    group(ui, i18n::t("Characters"), |ui| {
+        ui.label(egui::RichText::new(&name).size(11.5).color(TEXT));
         ui.add(
             egui::Label::new(
-                egui::RichText::new(
-                    app.sam3d_dir
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| i18n::t("(none)").into()),
-                )
-                .size(10.5)
+                egui::RichText::new(format!(
+                    "{format} · {matched}/{bones} {} · {vertices} {} · {faces} {}",
+                    i18n::t("Bones matched"),
+                    i18n::t("Vertices"),
+                    i18n::t("Faces"),
+                ))
+                .size(10.0)
                 .color(MUTED),
             )
             .truncate(),
         );
-        ui.label(
-            egui::RichText::new(match &app.mesh {
-                Some(mesh) => {
-                    i18n::mesh_line(mesh.vertices, mesh.triangles.len(), mesh.keypoints)
-                }
-                None => i18n::t("Mesh not loaded yet").to_string(),
-            })
-            .size(10.5)
-            .color(MUTED),
-        );
-        if let Some(faces) = &app.smplh_faces {
-            // What the viewport actually draws once the motion stage has run.
-            let vertices = app
-                .flow
-                .first()
-                .and_then(|clip| clip.frames.first())
-                .map(|verts| verts.len() / 3)
-                .unwrap_or(0);
-            ui.label(
-                egui::RichText::new(i18n::smplh_line(vertices, faces.len()))
-                    .size(10.5)
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(entry.path.display().to_string())
+                    .size(9.5)
                     .color(MUTED),
+            )
+            .truncate(),
+        );
+        if !unmatched.is_empty() {
+            ui.label(
+                egui::RichText::new(format!("{}: {}", i18n::t("Unmatched"), unmatched.join(", ")))
+                    .size(9.5)
+                    .color(MUTED),
+            );
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let label = match &person {
+                Some(person) => i18n::zh_en(
+                    &format!("用于「{person}」"),
+                    &format!("Use on {person}"),
+                ),
+                None => i18n::t("Use on this person").to_string(),
+            };
+            if ui
+                .add_enabled(
+                    person.is_some() && !wearing,
+                    egui::Button::new(egui::RichText::new(label).size(11.0)),
+                )
+                .on_hover_text(i18n::t(
+                    "Replace the selected person's body with this model",
+                ))
+                .clicked()
+            {
+                app.use_character(app.selected, index);
+            }
+            if ui
+                .add(egui::Button::new(
+                    egui::RichText::new(i18n::t("Remove from list")).size(11.0),
+                ))
+                .clicked()
+            {
+                app.remove_character(index);
+            }
+        });
+        if wearing {
+            ui.label(
+                egui::RichText::new(i18n::zh_en(
+                    &format!("「{}」正在使用这个模型", person.unwrap_or_default()),
+                    "This model is already on the selected person",
+                ))
+                .size(10.0)
+                .color(OK),
             );
         }
     });
@@ -1829,8 +2114,7 @@ fn model_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
 /// One row per person, like the reference's people list: clicking a row opens
 /// that person's panel, where the built-in body can be replaced by an imported
 /// character (and the choice is saved beside the clip).
-fn people_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
-    if app.people.is_empty() {
+fn people_group(app: &mut VeloMocap, ui: &mut egui::Ui) {    if app.people.is_empty() {
         return;
     }
     group(ui, i18n::t("People"), |ui| {
@@ -1906,7 +2190,7 @@ fn person_window(app: &mut VeloMocap, ctx: &egui::Context) {
                 .on_hover_text(i18n::t("Import a VRM / glTF humanoid for this person"))
                 .clicked()
             {
-                app.import_character_dialog(index);
+                app.import_character_dialog(Some(index));
             }
             if ui
                 .add_enabled(
@@ -2110,6 +2394,48 @@ fn memory_mode_hint(mode: crate::capture::MemoryMode) -> String {
         ),
     }
 }
+/// How a `.vp` store writes its geometry. This is the one place a project's size
+/// is decided, so it lives with the other settings rather than in a dialog.
+fn storage_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
+    group(ui, i18n::t("Project storage"), |ui| {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(i18n::t("Precision")).size(11.0));
+            egui::ComboBox::from_id_salt("storage-precision")
+                .selected_text(i18n::t(app.storage_precision.label()))
+                .width((ui.available_width() - 8.0).max(80.0))
+                .show_ui(ui, |ui| {
+                    for precision in crate::project::Precision::ALL {
+                        ui.selectable_value(
+                            &mut app.storage_precision,
+                            precision,
+                            i18n::t(precision.label()),
+                        );
+                    }
+                });
+        });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(i18n::t("Compression")).size(11.0));
+            egui::ComboBox::from_id_salt("storage-compression")
+                .selected_text(i18n::t(app.storage_compression.label()))
+                .width((ui.available_width() - 8.0).max(80.0))
+                .show_ui(ui, |ui| {
+                    for compression in crate::project::Compression::ALL {
+                        ui.selectable_value(
+                            &mut app.storage_compression,
+                            compression,
+                            i18n::t(compression.label()),
+                        );
+                    }
+                });
+        });
+        ui.label(
+            egui::RichText::new(i18n::t("Storage precision note"))
+                .size(9.5)
+                .color(MUTED),
+        );
+    });
+}
+
 fn resources_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
     group(ui, i18n::t("Processing Resources"), |ui| {
         ui.horizontal(|ui| {

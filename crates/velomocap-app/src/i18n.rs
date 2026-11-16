@@ -61,6 +61,45 @@ pub fn t(english: &'static str) -> &'static str {
         "Open video…" => "打开视频…",
         "Import video…" => "导入视频…",
         "Import character…" => "导入角色…",
+        "Bone Overlay" => "骨骼叠加",
+        "Bone overlay" => "骨骼叠加",
+        "Characters" => "角色",
+        "Import character" => "导入角色",
+        "No characters imported yet" => "还没有导入角色",
+        "Import a VRM / glTF / FBX / PMX humanoid and it joins this list" => {
+            "导入 VRM / glTF / FBX / PMX 人物，它会进到这个列表里"
+        }
+        "Use on this person" => "用于当前人物",
+        "Remove from list" => "从列表移除",
+        "Model" => "模型",
+        "Bones matched" => "骨骼匹配",
+        "Vertices" => "顶点数",
+        "Person" => "人物",
+        "Project storage" => "工程存储",
+        "Precision" => "存储精度",
+        "Compression" => "压缩算法",
+        "Storage note" => "存储说明",
+        "Faces" => "面数",
+        "Unmatched" => "未匹配",
+        "Replace the selected person's body with this model" => {
+            "用这个模型替换选中人物的身体"
+        }
+        "Resolution" => "分辨率",
+        "Frame rate" => "帧率",
+        "Frames" => "帧数",
+        "Position" => "位置",
+        "Stream" => "视频流",
+        "Ultra (lossless)" => "超高（无损）",
+        "High (default)" => "高（默认）",
+        "Medium" => "中",
+        "Low" => "低",
+        "None" => "不压缩",
+        "Fast" => "快速",
+        "Balanced" => "均衡",
+        "Smallest" => "最小",
+        "Storage precision note" => {
+            "几何按这个精度存盘；骨架（导出用）始终原样保存，导出结果不受影响"
+        }
         "Open project…" => "打开工程…",
         "Save project…" => "保存工程…",
         "Open project" => "打开工程",

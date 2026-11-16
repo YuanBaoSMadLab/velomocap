@@ -38,6 +38,104 @@ const MAGIC: &[u8; 8] = b"VMPROJV1";
 const VERSION: u32 = 1;
 const HEADER: usize = 8 + 4 + 4 + 4 + 8 + 8;
 
+/// How precisely geometry is written into a project.
+///
+/// The baked skeleton is always exact, so none of these change an export; they
+/// trade the viewport mesh's last digits for file size. `High` is the default:
+/// a tenth of a millimetre is finer than a tracked body has, and the zeroed low
+/// byte is what makes the bulk of the file compress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Precision {
+    /// Every float exactly as it came out of the pipeline.
+    Ultra,
+    /// Low mantissa byte dropped (about 0.1 mm).
+    High,
+    /// Positions rounded to 0.25 mm.
+    Medium,
+    /// Positions rounded to 16 mm, for a throwaway preview.
+    Low,
+}
+
+impl Default for Precision {
+    fn default() -> Self {
+        Precision::High
+    }
+}
+
+impl Precision {
+    pub const ALL: [Precision; 4] = [
+        Precision::Ultra,
+        Precision::High,
+        Precision::Medium,
+        Precision::Low,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Precision::Ultra => "Ultra (lossless)",
+            Precision::High => "High (default)",
+            Precision::Medium => "Medium",
+            Precision::Low => "Low",
+        }
+    }
+
+    fn quantize(self, value: f32) -> f32 {
+        match self {
+            Precision::Ultra => value,
+            Precision::High => f32::from_bits(value.to_bits() & 0xffff_ff00),
+            Precision::Medium => (value * 4096.0).round() / 4096.0,
+            Precision::Low => (value * 64.0).round() / 64.0,
+        }
+    }
+}
+
+/// The deflate level a project is written with. `None` still uses a zlib
+/// container so the reader has one path; it just stores the bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Compression {
+    None,
+    Fast,
+    Balanced,
+    Smallest,
+}
+
+impl Default for Compression {
+    fn default() -> Self {
+        // Measured on a 30-frame take, fast is the smallest of the four at the
+        // default precision: the geometry is 24-bit-limited, so the slower
+        // levels only spend time finding nothing (8.2 MB at level 1 and 8.2 MB
+        // at level 9 before the precision options existed).
+        Compression::Fast
+    }
+}
+
+impl Compression {
+    pub const ALL: [Compression; 4] = [
+        Compression::None,
+        Compression::Fast,
+        Compression::Balanced,
+        Compression::Smallest,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Compression::None => "None",
+            Compression::Fast => "Fast",
+            Compression::Balanced => "Balanced",
+            Compression::Smallest => "Smallest",
+        }
+    }
+
+    fn level(self) -> flate2::Compression {
+        match self {
+            Compression::None => flate2::Compression::none(),
+            Compression::Fast => flate2::Compression::fast(),
+            Compression::Balanced => flate2::Compression::default(),
+            Compression::Smallest => flate2::Compression::best(),
+        }
+    }
+}
+
 /// Where one bulk array lives in the file's numeric block.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct Slice {
@@ -51,24 +149,23 @@ pub struct Slice {
 pub struct Block {
     single: Vec<f32>,
     double: Vec<f64>,
+    precision: Precision,
 }
 
 impl Block {
-    /// Append geometry.
-    ///
-    /// The low mantissa byte is dropped first. A vertex keeps its position to
-    /// about a tenth of a millimetre — far finer than a tracked body has — and
-    /// every fourth byte becoming zero is what makes the bulk of this file
-    /// compress: on a 30-frame take that alone saves a quarter of the size. The
-    /// baked skeleton lives in the `f64` block and is never touched, so an export
-    /// from a reopened project is identical to one made before saving.
+    fn new(precision: Precision) -> Block {
+        Block {
+            precision,
+            ..Block::default()
+        }
+    }
+
+    /// Append geometry at the chosen precision.
     fn f32s(&mut self, values: &[f32]) -> Slice {
         let offset = self.single.len();
-        self.single.extend(
-            values
-                .iter()
-                .map(|value| f32::from_bits(value.to_bits() & 0xffff_ff00)),
-        );
+        let precision = self.precision;
+        self.single
+            .extend(values.iter().map(|value| precision.quantize(*value)));
         Slice {
             offset,
             count: values.len(),
@@ -115,6 +212,9 @@ pub struct Document {
     pub version: u32,
     pub video: Option<VideoState>,
     pub people: Vec<PersonState>,
+    /// Every character imported into the workspace, worn or not.
+    #[serde(default)]
+    pub characters: Vec<PathBuf>,
     pub flow: Vec<ClipState>,
     pub candidates: Vec<CandidateState>,
     pub locks: velomocap_motion::ContactTracks,
@@ -212,6 +312,12 @@ pub struct SettingsState {
     pub export_rest_correct: bool,
     pub export_everyone: bool,
     pub export_name: String,
+    /// How the next save writes geometry. High by default: fine enough to be
+    /// invisible, coarse enough to compress.
+    #[serde(default)]
+    pub storage_precision: Precision,
+    #[serde(default)]
+    pub storage_compression: Compression,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -249,12 +355,13 @@ pub struct Project {
     pub document: Document,
     single: Vec<f32>,
     double: Vec<f64>,
+    compression: Compression,
 }
 
 impl Project {
     /// Read the whole workspace off the running app.
     pub fn capture(app: &VeloMocap) -> Project {
-        let mut block = Block::default();
+        let mut block = Block::new(app.storage_precision);
         let document = Document {
             version: VERSION,
             video: app.video.as_ref().map(|path| VideoState {
@@ -295,6 +402,11 @@ impl Project {
                         })
                         .collect(),
                 })
+                .collect(),
+            characters: app
+                .characters
+                .iter()
+                .map(|entry| entry.path.clone())
                 .collect(),
             flow: app
                 .flow
@@ -369,6 +481,8 @@ impl Project {
                 export_rest_correct: app.export_rest_correct,
                 export_everyone: app.export_everyone,
                 export_name: app.export_name.clone(),
+                storage_precision: app.storage_precision,
+                storage_compression: app.storage_compression,
             },
             view: ViewState {
                 selected: app.selected,
@@ -396,6 +510,7 @@ impl Project {
             document,
             single: block.single,
             double: block.double,
+            compression: app.storage_compression,
         }
     }
 
@@ -412,8 +527,8 @@ impl Project {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
-        let single = deflate(&single)?;
-        let double = deflate(&double)?;
+        let single = deflate(&single, self.compression)?;
+        let double = deflate(&double, self.compression)?;
         let mut header = Vec::with_capacity(HEADER);
         header.extend_from_slice(MAGIC);
         header.extend_from_slice(&(json.len() as u32).to_le_bytes());
@@ -467,6 +582,7 @@ impl Project {
             );
         }
         Ok(Project {
+            compression: document.settings.storage_compression,
             document,
             single,
             double,
@@ -482,8 +598,8 @@ impl Project {
     }
 }
 
-fn deflate(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+fn deflate(bytes: &[u8], compression: Compression) -> Result<Vec<u8>> {
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), compression.level());
     encoder.write_all(bytes)?;
     Ok(encoder.finish()?)
 }
@@ -685,6 +801,7 @@ mod tests {
                     None,
                 ],
             }],
+            characters: vec![PathBuf::from(r"C:\models\avatar.glb")],
             flow: vec![ClipState {
                 name: "Person 1".to_string(),
                 first_frame: 0,
@@ -727,6 +844,8 @@ mod tests {
                 export_rest_correct: true,
                 export_everyone: false,
                 export_name: String::new(),
+                storage_precision: Precision::High,
+                storage_compression: Compression::Fast,
             },
             view: ViewState {
                 selected: 0,
@@ -754,6 +873,7 @@ mod tests {
             document,
             single: block.single,
             double: block.double,
+            compression: Compression::Fast,
         }
     }
 

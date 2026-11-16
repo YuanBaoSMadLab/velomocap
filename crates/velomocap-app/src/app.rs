@@ -51,6 +51,15 @@ pub struct AssignedCharacter {
     pub path: PathBuf,
     pub character: Arc<crate::character::Character>,
 }
+
+/// An imported character kept in the workspace, so switching a person's model
+/// never means finding the file on disk again. The reference's character list is
+/// the same idea: every import stays available for as long as the project lives.
+#[derive(Clone)]
+pub struct LibraryCharacter {
+    pub path: PathBuf,
+    pub character: Arc<crate::character::Character>,
+}
 #[derive(Clone)]pub struct FlowBody {
     pub name: String,
         pub first_frame: usize,
@@ -225,6 +234,9 @@ pub struct VeloMocap {
     /// `--save-project`: write the workspace once the capture finishes, then
     /// leave. Used to verify the round trip without a GUI.
     pub save_after_capture: Option<PathBuf>,
+    /// How the next project save writes geometry and compresses it.
+    pub storage_precision: crate::project::Precision,
+    pub storage_compression: crate::project::Compression,
     pub detector: PathBuf,
     pub sam3d_dir: PathBuf,
     pub params_dir: PathBuf,
@@ -341,6 +353,13 @@ pub struct VeloMocap {
     pub character_rest_positions: Option<Arc<Vec<[f32; 3]>>>,
     /// The person whose character panel is open.
     pub person_panel: Option<usize>,
+    /// Every character imported into this workspace (VRM / glTF / FBX / PMX),
+    /// whether or not a person is wearing it right now.
+    pub characters: Vec<LibraryCharacter>,
+    /// The library entry whose detail panel is open.
+    pub character_panel: Option<usize>,
+    /// Which page the movie-clip column shows: 0 people, 1 characters, 2 stream.
+    pub left_tab: usize,
     /// The saved character map has been applied to the current people.
     pub characters_loaded: bool,
     pub export_format: ExportFormat,
@@ -372,6 +391,8 @@ impl VeloMocap {
             render_probe,
             save_project,
             open_project,
+            storage_precision,
+            storage_compression,
         } = cli_args();
         let tools_ok = velomocap_video::Tools::discover().is_ok();
         let ort_path = velomocap_infer::find_runtime_library();
@@ -437,6 +458,8 @@ impl VeloMocap {
             first_frame: None,
             project_path: None,
             save_after_capture: save_project.clone(),
+            storage_precision: crate::project::Precision::default(),
+            storage_compression: crate::project::Compression::default(),
             stream: crate::stream::VideoStream::spawn(),
             play_from: None,
             framed_selected: 0,
@@ -492,6 +515,9 @@ impl VeloMocap {
             character_rest: None,
             character_rest_positions: None,
             person_panel: None,
+            characters: Vec::new(),
+            character_panel: None,
+            left_tab: 0,
             characters_loaded: false,
             export_format: ExportFormat::Bvh,
             export_name: String::new(),
@@ -525,6 +551,14 @@ impl VeloMocap {
             // A saved workspace brings its own video and clips; the argument is
             // only used when there is no project to restore.
             app.open_project(path);
+            // A command-line override lands after the project's own settings, so
+            // the same workspace can be re-saved at every precision to compare.
+            if let Some(precision) = storage_precision {
+                app.storage_precision = precision;
+            }
+            if let Some(compression) = storage_compression {
+                app.storage_compression = compression;
+            }
             // Re-saving a workspace that was just opened is the cheapest proof
             // that a project round-trips without running anything again.
             if let Some(out) = save_project.clone() {
@@ -554,6 +588,14 @@ impl VeloMocap {
         } else if let Some(path) = app.video.clone() {
             app.load_video(path);
                         app.playing = play;
+        }
+        // A command-line override lands after any project was opened, so a save
+        // can be measured at every precision without editing the project first.
+        if let Some(precision) = storage_precision {
+            app.storage_precision = precision;
+        }
+        if let Some(compression) = storage_compression {
+            app.storage_compression = compression;
         }
         if detect_only && app.video.is_some() {
             app.detect_only();
@@ -604,7 +646,7 @@ impl VeloMocap {
     /// Import a humanoid character (VRM / GLB) for one person: its own skeleton
     /// and skinned mesh replace the built-in body in the viewport, driven by the
     /// clip, and the choice is saved beside the clip.
-    pub fn import_character_dialog(&mut self, person: usize) {
+    pub fn import_character_dialog(&mut self, person: Option<usize>) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Humanoid character", &["vrm", "glb", "fbx", "pmx"])
             .set_title("Import character")
@@ -612,12 +654,20 @@ impl VeloMocap {
         else {
             return;
         };
-        self.assign_character(person, path);
+        let Some(index) = self.add_character(path) else {
+            return;
+        };
+        if let Some(person) = person.filter(|person| *person < self.people.len()) {
+            self.use_character(person, index);
+        }
     }
 
-    pub fn assign_character(&mut self, person: usize, path: PathBuf) {
-        if person >= self.people.len() {
-            return;
+    /// Load a character into the workspace library, or return the entry that is
+    /// already there. The file is read once per workspace.
+    pub fn add_character(&mut self, path: PathBuf) -> Option<usize> {
+        if let Some(index) = self.characters.iter().position(|entry| entry.path == path) {
+            self.character_panel = Some(index);
+            return Some(index);
         }
         match crate::character::Character::load(&path) {
             Ok(character) => {
@@ -629,14 +679,8 @@ impl VeloMocap {
                     .into_iter()
                     .map(|name| name.to_string())
                     .collect();
-                if self.character_rest.is_none() {
-                    let (rotations, positions) = self.rest_pose();
-                    self.character_rest = rotations;
-                    self.character_rest_positions = positions;
-                }
                 self.log(format!(
-                    "{}: {} · {bones} bones ({matched} matched), {vertices} vertices{}",
-                    self.people[person].name,
+                    "{}: {bones} bones ({matched} matched), {vertices} vertices{}",
                     path.display(),
                     if unmatched.is_empty() {
                         String::new()
@@ -644,24 +688,76 @@ impl VeloMocap {
                         format!(" · not matched: {}", unmatched.join(", "))
                     }
                 ));
-                self.status = format!(
-                    "{} · {} bones · {} vertices",
-                    path.file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                    bones,
-                    vertices
-                );
-                self.people[person].character = Some(AssignedCharacter {
+                self.characters.push(LibraryCharacter {
                     path,
                     character: Arc::new(character),
                 });
-                self.save_characters();
-                // The character replaces the built-in body, so the viewport has
-                // to reframe on it.
-                self.orbit.framed = false;
+                let index = self.characters.len() - 1;
+                self.character_panel = Some(index);
+                Some(index)
             }
-            Err(error) => self.error = Some(format!("{error:#}")),
+            Err(error) => {
+                self.error = Some(format!("{error:#}"));
+                self.log(format!("character: {error:#}"));
+                None
+            }
+        }
+    }
+
+    /// Put a library character on a person: the viewport then draws that model.
+    pub fn use_character(&mut self, person: usize, index: usize) {
+        if person >= self.people.len() || index >= self.characters.len() {
+            return;
+        }
+        let entry = self.characters[index].clone();
+        if self.character_rest.is_none() {
+            let (rotations, positions) = self.rest_pose();
+            self.character_rest = rotations;
+            self.character_rest_positions = positions;
+        }
+        let bones = entry.character.bones.len();
+        let vertices = entry.character.vertex_count();
+        self.log(format!(
+            "{}: {}",
+            self.people[person].name,
+            entry.path.display()
+        ));
+        self.status = format!(
+            "{} · {} bones · {} vertices",
+            entry
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            bones,
+            vertices
+        );
+        self.people[person].character = Some(AssignedCharacter {
+            path: entry.path,
+            character: entry.character,
+        });
+        self.save_characters();
+        // The character replaces the built-in body, so the viewport has to
+        // reframe on it.
+        self.orbit.framed = false;
+    }
+
+    /// Drop a character from the list. A person already wearing it keeps it: the
+    /// list is a shelf, not the assignment.
+    pub fn remove_character(&mut self, index: usize) {
+        if index < self.characters.len() {
+            self.characters.remove(index);
+        }
+        self.character_panel = match self.character_panel {
+            Some(panel) if panel == index => None,
+            Some(panel) if panel > index => Some(panel - 1),
+            other => other,
+        };
+    }
+
+    pub fn assign_character(&mut self, person: usize, path: PathBuf) {
+        if let Some(index) = self.add_character(path) {
+            self.use_character(person, index);
         }
     }
 
@@ -1124,22 +1220,38 @@ impl VeloMocap {
 
         let numbers = project.view();
         let mut notes: Vec<String> = Vec::new();
+        // The shelf of imported characters comes back first, so a person's
+        // assignment can reuse a model that is already loaded and so a model can
+        // be switched without finding the file again.
+        self.characters.clear();
+        self.character_panel = None;
+        for path in &document.characters {
+            if self.characters.iter().any(|entry| entry.path == *path) {
+                continue;
+            }
+            match crate::character::Character::load(path) {
+                Ok(character) => self.characters.push(LibraryCharacter {
+                    path: path.clone(),
+                    character: Arc::new(character),
+                }),
+                Err(error) => notes.push(format!("{}: {error:#}", path.display())),
+            }
+        }
+        let shelf = self.characters.clone();
         let people: Vec<PersonView> = document
             .people
             .iter()
             .map(|state| {
                 let mut person = crate::project::person(state, &numbers);
                 if let Some(path) = &state.character {
-                    match crate::character::Character::load(path) {
-                        Ok(character) => {
+                    match shelf.iter().find(|entry| entry.path == *path) {
+                        Some(entry) => {
                             person.character = Some(AssignedCharacter {
-                                path: path.clone(),
-                                character: Arc::new(character),
-                            })
+                                path: entry.path.clone(),
+                                character: entry.character.clone(),
+                            });
                         }
-                        Err(error) => {
-                            notes.push(format!("{}: {error:#}", path.display()));
-                        }
+                        None => notes.push(format!("{}: not loaded", path.display())),
                     }
                 }
                 person
@@ -1158,6 +1270,14 @@ impl VeloMocap {
         // The saved assignments are the truth from here on, not whatever the
         // clip's sidecar would have restored.
         self.characters_loaded = true;
+        // The shelf of imported characters comes back too, so a model can be
+        // switched without finding the file again.
+        self.characters.clear();
+        self.character_panel = None;
+        for path in &document.characters {
+            self.add_character(path.clone());
+        }
+        self.character_panel = None;
         self.flow = document
             .flow
             .iter()
@@ -1200,6 +1320,8 @@ impl VeloMocap {
         self.export_rest_correct = settings.export_rest_correct;
         self.export_everyone = settings.export_everyone;
         self.export_name = settings.export_name.clone();
+        self.storage_precision = settings.storage_precision;
+        self.storage_compression = settings.storage_compression;
 
         let view = &document.view;
         self.selected = view.selected.min(self.people.len().saturating_sub(1));
@@ -2352,6 +2474,8 @@ fn cli_args() -> CliArgs {
     let mut export_fbx = false;
     let mut save_project = None;
     let mut open_project = None;
+    let mut storage_precision = None;
+    let mut storage_compression = None;
     let mut detect_only = false;
     let mut play_check: Option<usize> = None;
     let mut render_probe: Option<String> = None;
@@ -2400,6 +2524,28 @@ fn cli_args() -> CliArgs {
                     open_project = Some(PathBuf::from(value));
                 }
             }
+            "--precision" => {
+                if let Some(value) = args.next() {
+                    storage_precision = match value.as_str() {
+                        "ultra" => Some(crate::project::Precision::Ultra),
+                        "high" => Some(crate::project::Precision::High),
+                        "medium" => Some(crate::project::Precision::Medium),
+                        "low" => Some(crate::project::Precision::Low),
+                        _ => None,
+                    };
+                }
+            }
+            "--compression" => {
+                if let Some(value) = args.next() {
+                    storage_compression = match value.as_str() {
+                        "none" => Some(crate::project::Compression::None),
+                        "fast" => Some(crate::project::Compression::Fast),
+                        "balanced" => Some(crate::project::Compression::Balanced),
+                        "smallest" => Some(crate::project::Compression::Smallest),
+                        _ => None,
+                    };
+                }
+            }
             other if !other.starts_with("--") => video = Some(PathBuf::from(other)),
             _ => {}
         }
@@ -2418,6 +2564,8 @@ fn cli_args() -> CliArgs {
         render_probe,
         save_project,
         open_project,
+        storage_precision,
+        storage_compression,
     }}
 struct CliArgs {
     video: Option<PathBuf>,
@@ -2433,6 +2581,8 @@ struct CliArgs {
     render_probe: Option<String>,
     save_project: Option<PathBuf>,
     open_project: Option<PathBuf>,
+    storage_precision: Option<crate::project::Precision>,
+    storage_compression: Option<crate::project::Compression>,
 }
 impl eframe::App for VeloMocap {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
