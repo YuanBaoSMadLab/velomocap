@@ -7,6 +7,7 @@
 //! | Reference | Here |
 //! | --- | --- |
 //! | `prepare_contacts` (flat mode) | `contacts::prepare`, applied by `detect` |
+//! | `prepare_contacts`' grounding shift | `root_height::grounding`, applied by `grounding_pass` |
 //! | `airborne_excursions` | `contacts` (it owns the flight mask) |
 //! | the root X/Z drift (`interp` + `gaussian_filter1d`, 12 cm cap) | `foot_lock`, `interpolate` |
 //! | `reachable_pelvis_drop` / `reachable_pelvis_lift` + their envelope | `root_height::plan` |
@@ -25,11 +26,14 @@
 //! | `contact_pose_plan._optimise_window` (root height against the reach bounds) | `pose_plan::plan`, applied by `pose_plan_window` |
 //! | `scipy.optimize.least_squares` (both planning passes) | `solver::minimise` |
 //!
-//! The vertical chain is the reference's five steps, in its order: the X/Z drift
-//! (`foot_lock`), then `root_height` (drop → lift → user offset → airborne
-//! clearance), then the pose plan, then the leg solve. There is deliberately no
-//! "drop the lowest point onto the floor" pass: the floor is measured *from* the
-//! contact soles (`crate::floor`), so the body is already standing on it.
+//! The vertical chain is the reference's six steps, in its order: the grounding
+//! shift that stands the body on the measured plane (`prepare_contacts`), the X/Z
+//! drift of the planted supports (`foot_lock`), then `root_height` (drop → lift →
+//! user offset → airborne clearance), then the pose plan, then the leg solve.
+//! The grounding is a *smoothed* floor shift, not "drop the lowest point onto the
+//! plane": it only reads the frames a foot is planted on, weights the swing at
+//! 2 %, and is clamped to ±0.75 m, which is the difference between standing on
+//! the plane and hopping onto it every time a foot lands.
 //!
 //! The root's X/Z shift used to come from a ported Kimodo `TrajectoryCorrector`
 //! (an ADMM over position / velocity / acceleration). The reference has no such
@@ -193,6 +197,20 @@ impl CorrectionSettings {
     }
 }
 
+/// Which limb-quality condition tripped the rollback gate (`helps`), when one did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SkipReason {
+    /// The clip was kept: either the correction helped or it was never asked for.
+    #[default]
+    None,
+    /// The joint-based float got worse.
+    Float,
+    /// The lower foot slid more than 5 % further.
+    Slide,
+    /// The clip got 50 % jumpier.
+    Jitter,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct CorrectionReport {
     pub foot_contacts: usize,
@@ -203,6 +221,8 @@ pub struct CorrectionReport {
     pub max_hand_error: f32,
     /// Largest vertical correction applied by the root pass.
     pub vertical_shift: f32,
+    /// Largest shift the grounding step applied (`prepare_contacts`' floor shift).
+    pub grounding: f32,
     /// Largest pelvis drop needed to span a contact (`reachable_pelvis_drop`).
     pub pelvis_drop: f32,
     /// Largest pelvis lift needed to reach a contact (`reachable_pelvis_lift`).
@@ -213,6 +233,16 @@ pub struct CorrectionReport {
     pub jitter_after: f32,
     /// The pass was rolled back because it made the clip jumpier.
     pub skipped: bool,
+    /// Which of the three quality conditions tripped that rollback.
+    pub skipped_by: SkipReason,
+    /// Joint-based float before and after the pass: the mean distance of the
+    /// lower foot joint above the floor, in metres. Kept even when the pass is
+    /// rolled back, so a "rolled back" line can say why.
+    pub float_before: f32,
+    pub float_after: f32,
+    /// Joint-based slide before and after the pass, cm per frame.
+    pub slide_before: f32,
+    pub slide_after: f32,
     /// No foot contact was detected at all, so the correction was skipped and the
     /// clip is the source unchanged (`flow_correction.py`'s `contacts == 0`).
     pub no_contacts: bool,
@@ -250,20 +280,35 @@ impl CorrectionReport {
 
     pub fn line(&self) -> String {
         let mut out = format!(
-            "correction: {} foot contacts, {} hand contacts, {} IK frames, max shift {:.3} m, hand residual {:.1} mm, root {:+.3} m (drop {:.3}, lift {:.3}), jitter {:.1}->{:.1} mm",
+            "correction: {} foot contacts, {} hand contacts, {} IK frames, max shift {:.3} m, hand residual {:.1} mm, root {:+.3} m (ground {:.3}, drop {:.3}, lift {:.3}), jitter {:.1}->{:.1} mm",
             self.foot_contacts,
             self.hand_contacts,
             self.ik_frames,
             self.max_shift,
             self.max_hand_error * 1000.0,
             self.vertical_shift,
+            self.grounding,
             self.pelvis_drop,
             self.pelvis_lift,
             self.jitter_before * 1000.0,
             self.jitter_after * 1000.0
         );
         if self.skipped {
-            out.push_str(" (rolled back: it made the clip jumpier)");
+            out.push_str(&format!(
+                " (rolled back by {}: float {:.1}->{:.1} mm, slide {:.2}->{:.2} cm/frame, jitter {:.1}->{:.1} mm)",
+                match self.skipped_by {
+                    SkipReason::Float => "float",
+                    SkipReason::Slide => "slide",
+                    SkipReason::Jitter => "jitter",
+                    SkipReason::None => "the gate",
+                },
+                self.float_before,
+                self.float_after,
+                self.slide_before,
+                self.slide_after,
+                self.jitter_before * 1000.0,
+                self.jitter_after * 1000.0
+            ));
         }
         if self.no_contacts {
             out.push_str(" (no confident foot contacts: the source is kept)");
@@ -367,8 +412,11 @@ pub fn apply_with_locks(
     let mut foot = FootPass::empty(clip.skeletons.len());
     if settings.foot && contacts {
         foot = foot_lock(sole.as_ref(), clip, settings, locks, &thresholds, &detected, &mut report);
-        // The reference's vertical chain: drop, lift, the user's own offset and
-        // the airborne clearance, all before the pose plan sees the root.
+        // The reference's vertical chain, in its order: first the grounding shift
+        // that stands the body on the measured plane, then the reach drop, the
+        // lift, the user's own offset and the airborne clearance, then the pose
+        // plan — every one of them measured from the root the previous one left.
+        grounding_pass(clip, body, settings, &foot, &detected, &mut report);
         root_height_pass(clip, body, settings, &foot, &detected, &mut report);
         if settings.pose_plan {
             pose_plan_window(clip, body, settings, &foot, &detected, &mut report);
@@ -401,19 +449,48 @@ pub fn apply_with_locks(
     let after = quality(&clip.skeletons, settings.floor);
     report.jitter_before = before.jitter;
     report.jitter_after = after.jitter;
-    // Keep the correction only when it actually helps: feet closer to the floor
-    // or less sliding, without a big jump in jitter. A turning clip is where the
-    // pins start fighting the motion, and there the network's own result is the
-    // better one.
-    let helps = after.float <= before.float + 1e-4
-        && after.slide <= before.slide * 1.05
-        && after.jitter <= before.jitter * 1.5;
+    // The gate reads the **sole** metrics, the ones a viewer sees: a pass that
+    // lifts a planted foot off the plane or lets it skate is worse than the
+    // network's own motion.
+    //
+    // It used to read the joint-based slide, whose baseline on a standing clip is
+    // ~0.1 mm/frame, so a 5 % relative tolerance tripped on a 0.4 mm/frame change
+    // and rolled back a pass that had just cut the float by 10 %. Absolute slack
+    // (0.2 mm/frame, 1 mm of hover) is what the "do no harm" promise needs.
+    let worst_float = |metrics: &crate::metrics::FootMetrics| {
+        metrics.float_mm[0].max(metrics.float_mm[1])
+    };
+    let worst_slide = |metrics: &crate::metrics::FootMetrics| {
+        metrics.slide_cm[0].max(metrics.slide_cm[1])
+    };
+    let measured = !report.feet_before.empty() && !report.feet_after.empty();
+    if measured {
+        report.float_before = worst_float(&report.feet_before);
+        report.float_after = worst_float(&report.feet_after);
+        report.slide_before = worst_slide(&report.feet_before);
+        report.slide_after = worst_slide(&report.feet_after);
+    }
+    let slide_helps = worst_slide(&report.feet_after) <= worst_slide(&report.feet_before) * 1.05 + 0.02;
+    let float_helps = worst_float(&report.feet_after) <= worst_float(&report.feet_before) + 1.0;
+    let helps = after.jitter <= before.jitter * 1.5
+        && (!measured || (slide_helps && float_helps));
     if !helps && before.jitter > 0.0 {
         clip.poses = source_poses;
         clip.skeletons = source_skeletons;
         report.skipped = true;
+        // The gate's own numbers survive the rollback: "rolled back" without them
+        // is a dead end, and the first thing to look at is which of the three
+        // tripped.
+        report.skipped_by = if measured && !float_helps {
+            SkipReason::Float
+        } else if measured && !slide_helps {
+            SkipReason::Slide
+        } else {
+            SkipReason::Jitter
+        };
         report.max_shift = 0.0;
         report.vertical_shift = 0.0;
+        report.grounding = 0.0;
         report.pelvis_drop = 0.0;
         report.pelvis_lift = 0.0;
         report.feet_after = report.feet_before;
@@ -655,13 +732,78 @@ fn release_pivots(clip: &FlowClip, fps: f32, prepared: &mut crate::contacts::Pre
     }
 }
 
+/// Step 0 of the reference's vertical chain: put the lowest **planted sole** on
+/// the floor, before the reach drop and lift are measured from it.
+///
+/// `prepare_contacts` computes this inside the detector and hands the resulting
+/// `shift[:, 1]` to everything downstream; here it is its own pass because the
+/// contacts are already resolved. Flat ground only: multi-level keeps the source
+/// elevation (`multilevel_contacts.prepare` returns a zero shift), and a clip
+/// with no contact at all never gets here.
+///
+/// The height is measured on the same skinned sole probes the contact detector
+/// used, not on the ankle joints: the joint sits above the sole, and it is the
+/// sole that visibly hovers.
+fn grounding_pass(
+    clip: &mut FlowClip,
+    body: &BodyModel,
+    settings: &CorrectionSettings,
+    foot: &FootPass,
+    detection: &Detection,
+    report: &mut CorrectionReport,
+) {
+    if settings.mode != CorrectionMode::Flat {
+        return;
+    }
+    let count = clip.skeletons.len();
+    if count < 3 || detection.rows.len() < count {
+        return;
+    }
+    let mut height = vec![0.0f32; count];
+    let mut planted = vec![false; count];
+    for frame in 0..count {
+        let mut low = f32::MAX;
+        for foot_index in 0..2 {
+            if !foot.support[frame][foot_index] {
+                continue;
+            }
+            let row = &detection.rows[frame][foot_index];
+            // The lower of the two sole patches carries the weight.
+            low = low.min(row[0][1]).min(row[1][1]);
+        }
+        if low.is_finite() {
+            height[frame] = low;
+            planted[frame] = true;
+        }
+    }
+    if !planted.iter().any(|hit| *hit) {
+        return;
+    }
+    let shift = crate::root_height::grounding(&height, &planted, settings.floor, clip.fps);
+    let mut moved = 0.0f32;
+    for frame in 0..count {
+        let delta = shift[frame];
+        if delta.abs() < 1e-6 {
+            continue;
+        }
+        moved = moved.max(delta.abs());
+        clip.poses[frame].translation[1] += delta;
+    }
+    if moved > 0.0 {
+        for frame in 0..count {
+            clip.skeletons[frame] = body.forward_joints(&clip.poses[frame]);
+        }
+    }
+    report.grounding = moved;
+    report.vertical_shift = report.vertical_shift.max(moved);
+}
+
 /// The reference's vertical chain, steps 1–4: the reach drop, the reach lift, the
 /// user's own pelvis offset and the airborne clearance (`correction.py`).
 ///
-/// Step 5 is [`pose_plan_window`], which runs afterwards on the root this
-/// produced. Nothing here pins the body to the floor: the floor was measured from
-/// these very contacts (`crate::floor`), so the soles already stand on it and a
-/// "lowest point onto the plane" pass would fight the reach bounds.
+/// Step 0 ([`grounding_pass`]) has already put the body on the plane, so the
+/// reach bounds here are measured from a root that is standing still; step 5 is
+/// [`pose_plan_window`], which runs afterwards on the root this produced.
 fn root_height_pass(
     clip: &mut FlowClip,
     body: &BodyModel,
@@ -697,7 +839,21 @@ fn root_height_pass(
         let active = foot.support[frame];
         frames.push(crate::root_height::Frame {
             hips: [positions[LEFT_HIP], positions[RIGHT_HIP]],
-            targets: [positions[LEFT_ANKLE], positions[RIGHT_ANKLE]],
+            // The contact targets, not the ankles' current positions: the current
+            // position is reachable by definition, so measuring against it never
+            // asks for a drop and the sole stays in the air.
+            targets: [
+                if active[0] {
+                    foot.targets[frame][0].map(|value| value as f64)
+                } else {
+                    positions[LEFT_ANKLE]
+                },
+                if active[1] {
+                    foot.targets[frame][1].map(|value| value as f64)
+                } else {
+                    positions[RIGHT_ANKLE]
+                },
+            ],
             high,
             low,
             active,
@@ -788,7 +944,18 @@ fn pose_plan_window(
         frames.push(crate::pose_plan::Frame {
             base: clip.poses[frame].translation[1] as f64,
             hips: [positions[1], positions[2]],
-            ankles: [positions[7], positions[8]],
+            ankles: [
+                if active[0] {
+                    foot.targets[frame][0].map(|value| value as f64)
+                } else {
+                    positions[7]
+                },
+                if active[1] {
+                    foot.targets[frame][1].map(|value| value as f64)
+                } else {
+                    positions[8]
+                },
+            ],
             lowest: lowest as f64,
             active,
             high,
@@ -994,9 +1161,10 @@ fn reach_falloff(target: [f64; 3], hip: [f64; 3], max_reach: f64) -> f64 {
 }
 
 /// Leg IK on the contact frames, ported from `DoContactIK`'s two-bone branch:
-/// the ankle is pinned to where the sole already is, so the root correction does
-/// not have to carry the whole load. The joint's own orientation is untouched
-/// (only the hip and the knee move), which is what keeps the foot flat.
+/// the ankle is pinned to the rolling anchor of the stance, in all three axes, so
+/// the sole's support point lands on the contact patch — and on the floor, its
+/// height being the anchor's. The joint's own orientation is untouched (only the
+/// hip and the knee move), which is what keeps the foot flat.
 fn leg_ik(
     sole: Option<&Sole>,
     clip: &mut FlowClip,
@@ -1048,11 +1216,7 @@ fn leg_ik(
                     let current = joint(&clip.skeletons[index], ankle);
                     let sole_at = support_point(sole, clip, index, foot_index, ankle, toe);
                     let hip_pos = joint(&clip.skeletons[index], hip);
-                    let target = [
-                        current[0] as f64 + (anchors[offset][0] - sole_at[0]) as f64,
-                        current[1] as f64,
-                        current[2] as f64 + (anchors[offset][2] - sole_at[2]) as f64,
-                    ];
+                    let target = contact_target(anchors[offset], sole_at, current, 1.0);
                     let hip_f = [hip_pos[0] as f64, hip_pos[1] as f64, hip_pos[2] as f64];
                     if distance3(target, hip_f) < min_reach * 1.0005 {
                         return 0.0;
@@ -1070,12 +1234,21 @@ fn leg_ik(
                 // strength scales the residual goal offset (`strength` in
                 // `contact_offsets`), not the root drift: the root already took
                 // the full drift, so a weak preset leaves the rest to the pose.
+                //
+                // The target is **three-dimensional**, exactly as in the
+                // reference: the anchor's height is the floor, so the vertical
+                // component of the offset is what puts the sole *on* the plane
+                // instead of leaving the network's height error in place.
                 let hold = foot.holds[index][foot_index] as f64;
-                let target = [
-                    current[0] as f64 + (anchors[offset][0] - sole_at[0]) as f64 * hold,
-                    current[1] as f64,
-                    current[2] as f64 + (anchors[offset][2] - sole_at[2]) as f64 * hold,
-                ];
+                let mut target = contact_target(anchors[offset], sole_at, current, hold);
+                if settings.mode == CorrectionMode::Flat {
+                    // `correction.py`: a target that is still below the plane
+                    // after the offset — the hold strength or the reach clamp can
+                    // leave some — is lifted onto it, bounded to 12 cm.
+                    let expected = sole_at[1] as f64 + (target[1] - current[1] as f64);
+                    let lift = (settings.floor as f64 - expected).clamp(0.0, 0.12);
+                    target[1] += lift;
+                }
                 let hip_f = [
                     hip_pos[0] as f64,
                     hip_pos[1] as f64,
@@ -1098,17 +1271,26 @@ fn leg_ik(
                 // as a twitch, so the correction always ramps with distance.
                 let mut want = [
                     (target[0] - current[0] as f64) * weight as f64,
-                    0.0,
+                    (target[1] - current[1] as f64) * weight as f64,
                     (target[2] - current[2] as f64) * weight as f64,
                 ];
-                let length = (want[0] * want[0] + want[2] * want[2]).sqrt();
+                let length = (want[0] * want[0] + want[1] * want[1] + want[2] * want[2]).sqrt();
                 if length > cap && length > 0.0 {
                     want[0] *= cap / length;
+                    want[1] *= cap / length;
                     want[2] *= cap / length;
                 }
-                if want[0].abs() + want[2].abs() < 1e-5 {
+                if want[0].abs() + want[1].abs() + want[2].abs() < 1e-5 {
                     continue;
                 }
+                // The solve runs against the *clamped* displacement, not the raw
+                // target: the cap above is what stops one frame from yanking the
+                // ankle across, and it used to be computed and then not used.
+                let solved = [
+                    current[0] as f64 + want[0],
+                    current[1] as f64 + want[1],
+                    current[2] as f64 + want[2],
+                ];
                 let source = clip.poses[index].clone();
                 let (world, positions) = crate::anatomical::forward(body, &clip.poses[index], &rest);
                 if let Some(anatomy) = crate::anatomical::solve_leg(
@@ -1120,7 +1302,7 @@ fn leg_ik(
                     hip,
                     knee,
                     ankle,
-                    target,
+                    solved,
                 ) {
                     // An off-axis knee would mean the anatomical constraint
                     // broke: keep the source pose rather than ship it.
@@ -1131,7 +1313,7 @@ fn leg_ik(
                             &rest,
                             &source,
                             &[hip, knee],
-                            weight as f64,
+                            1.0,
                         );
                         clip.skeletons[index] = body.forward_joints(&clip.poses[index]);
                         report.ik_frames += 1;
@@ -1143,6 +1325,27 @@ fn leg_ik(
         }
     }
 
+}
+
+/// The ankle target that lands the sole's support point on the contact anchor.
+///
+/// `contact_offsets` in the reference: `offsets[active] = (anchors - support -
+/// shift)·strength` and `targets = fk(ankle) + shift + offsets`, which collapses
+/// to this once the root shift cancels at full strength. **All three axes**: the
+/// anchor's height is the floor (`rolling_anchor` sets it), so the vertical term
+/// is what puts the sole on the plane rather than pinning it at whatever height
+/// the network produced.
+fn contact_target(
+    anchor: [f32; 3],
+    sole_at: [f32; 3],
+    current: [f32; 3],
+    hold: f64,
+) -> [f64; 3] {
+    [
+        current[0] as f64 + (anchor[0] - sole_at[0]) as f64 * hold,
+        current[1] as f64 + (anchor[1] - sole_at[1]) as f64 * hold,
+        current[2] as f64 + (anchor[2] - sole_at[2]) as f64 * hold,
+    ]
 }
 
 /// Gaussian smoothing of a per-frame IK weight along a stance, sigma =
@@ -1400,6 +1603,13 @@ pub struct FootPass {
     pub support: Vec<[bool; 2]>,
     /// Per frame, per foot: the hold strength behind that pin (0 = no pin).
     pub holds: Vec<[f32; 2]>,
+    /// Per frame, per foot: the **3D ankle target** the pin asks for, i.e. where
+    /// the ankle has to be for the sole's support point to land on the anchor.
+    /// This is what the reach passes measure against — measuring against the
+    /// ankle's current position instead is what made a leg that is already
+    /// straight look like it had room to straighten further, so no drop was ever
+    /// requested and the sole stayed in the air.
+    pub targets: Vec<[[f32; 3]; 2]>,
 }
 
 impl FootPass {
@@ -1407,6 +1617,7 @@ impl FootPass {
         Self {
             support: vec![[false; 2]; frames],
             holds: vec![[0.0; 2]; frames],
+            targets: vec![[[0.0; 3]; 2]; frames],
         }
     }
 }
@@ -1489,6 +1700,18 @@ fn foot_lock(
                 holds[index] = hold;
                 pass.support[index][foot_index] = true;
                 pass.holds[index][foot_index] = hold;
+                // The 3D ankle target: where the ankle has to be for the sole's
+                // support point to land on the anchor (whose height is the floor).
+                // It is invariant under a root translation, so it can be built here
+                // and used by the reach passes after the horizontal shift is in.
+                let target = contact_target(
+                    path[offset],
+                    support[index],
+                    joint(&clip.skeletons[index], ankle),
+                    hold as f64,
+                );
+                pass.targets[index][foot_index] =
+                    [target[0] as f32, target[1] as f32, target[2] as f32];
             }
         }
 
@@ -1507,9 +1730,10 @@ fn foot_lock(
             let adjustment = adjustments[stance];
             for index in *begin..*end {
                 // Horizontal only: the vertical placement belongs to the root
-                // chain, which measures reach against the legs, not the plane.
-                // The root takes the *full* drift; `strength` is applied to the
-                // remaining goal offset inside the leg IK, as the reference does.
+                // chain (`grounding` + `root_height`), which measures reach against
+                // the legs, not the plane. The root takes the *full* drift;
+                // `strength` is applied to the remaining goal offset inside the
+                // leg IK, as the reference does.
                 local_x[index] = (anchors[index][0] + adjustment[0] - support[index][0]) as f64;
                 local_z[index] = (anchors[index][2] + adjustment[1] - support[index][2]) as f64;
                 local_used[index] = true;
@@ -1573,7 +1797,7 @@ fn foot_lock(
 
 /// `np.interp(arange(count), frames, values)`: linear between the known frames,
 /// held at both ends.
-fn interpolate(values: &[f64], frames: &[usize], count: usize) -> Vec<f32> {
+pub(crate) fn interpolate(values: &[f64], frames: &[usize], count: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; count];
     if frames.is_empty() || count == 0 {
         return out;
@@ -2511,6 +2735,78 @@ mod tests {
                 "frame {index} joints moved"
             );
         }
+    }
+
+    /// The vertical half of the lock: the reference grounds the body on the plane
+    /// before it pins anything (`prepare_contacts`' floor shift), and the leg IK's
+    /// target carries the vertical component. A take whose soles hover 3 cm has to
+    /// end up standing on the floor instead of being pinned in the air.
+    #[test]
+    fn a_hovering_stance_is_set_down_on_the_floor() {
+        let Some((body, _rest)) = loaded() else {
+            eprintln!("skipping: SMPL-H model not found");
+            return;
+        };
+        let frames = 24usize;
+        let build = |lift: f32| {
+            let mut pose = Pose::neutral(body.num_joints, 16);
+            pose.translation = [0.0, lift, 0.0];
+            FlowClip {
+                fps: 30.0,
+                poses: vec![pose.clone(); frames],
+                skeletons: vec![body.forward_joints(&pose); frames],
+                rot6d: Vec::new(),
+                trans: vec![[0.0; 3]; frames],
+                betas: vec![0.0; 16],
+                // Both feet confidently planted, and standing still.
+                foot_contacts: vec![[1.0f32; 4]; frames],
+                floor: 0.0,
+                floor_from_contacts: false,
+                offset: [0.0; 3],
+                source_frames: (0..frames).collect(),
+                anchors: 0,
+                anchor_residual: [0.0; 3],
+            }
+        };
+        // Where the neutral pose's lowest sole starts, so the 3 cm hover is exact.
+        let rest_clip = build(0.0);
+        let sole = Sole::build(&rest_clip, &body).expect("sole geometry");
+        let row = sole.row(&rest_clip.skeletons[0]);
+        let hover = 0.03f32;
+        let lowest = row[0][0][1]
+            .min(row[0][1][1])
+            .min(row[1][0][1])
+            .min(row[1][1][1]);
+        let mut clip = build(hover - lowest);
+
+        let report = apply(&mut clip, &body, &CorrectionSettings::default()).expect("apply");
+        assert!(!report.no_contacts, "the plant must be detected");
+        assert!(
+            !report.skipped,
+            "the correction was rolled back: {}",
+            report.line()
+        );
+        assert!(
+            (report.grounding - hover).abs() < 5e-3,
+            "grounding moved {:.4} m, wanted {hover:.3}",
+            report.grounding
+        );
+        let worst = |values: [f32; 2]| values[0].max(values[1]);
+        assert!(
+            worst(report.feet_after.float_mm) < 5.0,
+            "the soles still hover {:?} mm",
+            report.feet_after.float_mm
+        );
+        assert!(
+            worst(report.feet_after.sink_mm) < 5.0,
+            "the soles sink {:?} mm",
+            report.feet_after.sink_mm
+        );
+        assert!(
+            worst(report.feet_after.slide_cm) < 0.1,
+            "the pinned feet slide {:?} cm/frame",
+            report.feet_after.slide_cm
+        );
     }
 
     #[test]

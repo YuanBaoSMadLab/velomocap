@@ -1,13 +1,20 @@
 //! Root-height planning, ported from `correction.py::correct_arrays` (RGB MoCap,
-//! MIT), steps 1–4 of the vertical chain:
+//! MIT), steps 0–4 of the vertical chain:
 //!
 //! ```text
+//! 0  ground    prepare_contacts       put the lowest planted sole on the floor
+//!                                    (five-band smoothing, 2 % weight in the swing)
 //! 1  drop      reachable_pelvis_drop   the legs cannot span the crouch: lower the body
 //!              (enveloped: max over 0.1 s, then gaussian 0.03 s)
 //! 2  lift      reachable_pelvis_lift   the legs cannot fold that far: raise the body
 //! 3  offset    pelvis_offset           the user's "Pelvis Height Offset (from Auto)"
 //! 4  clearance flight                  a whole airborne body must not clip the plane
 //! ```
+//!
+//! Step 0 is [`grounding`]: it is what actually stands the body on the measured
+//! plane, and steps 1–4 are refinements measured from the root it produces.
+//! Without it the soles keep the network's own height error, which reads as a
+//! foot hovering or sinking even though the horizontal pin is exact.
 //!
 //! Step 5 is [`crate::pose_plan`], which runs afterwards and is handed the root
 //! this module produced. The order matters: a drop has to happen *before* the
@@ -22,6 +29,8 @@
 
 use crate::contacts::gaussian_smooth;
 
+/// The grounding shift is clamped to this (`np.clip(floor - support, ±.75)`).
+pub const GROUND_LIMIT: f64 = 0.75;
 /// A drop is never larger than this (`np.minimum(needed, .25)`).
 pub const DROP_LIMIT: f64 = 0.25;
 /// A lift is never larger than this (`... , .12`).
@@ -185,6 +194,177 @@ pub fn plan(
     delta
 }
 
+/// The reference's grounding step, the one that runs *before* steps 1–4.
+///
+/// `prepare_contacts` puts the body on the plane it measured:
+///
+/// ```text
+/// support_height = min over the planted feet of the lowest sole patch
+/// desired        = clip(floor - support_height, ±0.75)
+/// shift          = argmin  Σ wᵢ (xᵢ - desiredᵢ)² + smooth·Σ (Δ²x)²
+///                  w = 1 on a frame with a planted foot, 0.02 elsewhere
+///                  smooth = 4·(fps/30)⁴
+/// ```
+///
+/// The 2 % weight on the swing frames is what keeps a step from snapping the
+/// whole body down: the root follows the planted soles and only borrows the
+/// interpolated height while both feet are off the ground. `scipy` solves the
+/// five-band system with `solve_banded((2,2), …)`; this is the same system, the
+/// same coefficients, solved by a five-band Cholesky.
+pub fn grounding(sole_height: &[f32], planted: &[bool], floor: f32, fps: f32) -> Vec<f32> {
+    let count = sole_height.len().min(planted.len());
+    let mut out = vec![0.0f32; count];
+    if count == 0 {
+        return out;
+    }
+    let support: Vec<usize> = (0..count).filter(|frame| planted[*frame]).collect();
+    if support.is_empty() {
+        return out;
+    }
+    // `np.interp` over the planted frames, held at both ends: the swing frames
+    // start from the height the planted soles imply rather than from zero.
+    let mut desired = vec![0.0f64; count];
+    for frame in &support {
+        desired[*frame] = ((floor - sole_height[*frame]) as f64).clamp(-GROUND_LIMIT, GROUND_LIMIT);
+    }
+    let curve: Vec<f64> = crate::correction::interpolate(&desired, &support, count)
+        .iter()
+        .map(|value| *value as f64)
+        .collect();
+
+    let smooth = 4.0 * (fps.max(1.0) as f64 / 30.0).powi(4);
+    let weight: Vec<f64> = (0..count)
+        .map(|frame| if planted[frame] { 1.0 } else { 0.02 })
+        .collect();
+    match banded_grounding(&curve, &weight, smooth) {
+        Some(solved) => {
+            for frame in 0..count {
+                out[frame] = (solved[frame].clamp(-GROUND_LIMIT, GROUND_LIMIT)) as f32;
+            }
+            out
+        }
+        None => {
+            // Not positive definite (a degenerate clip): the interpolated curve is
+            // still a valid answer, just unsmoothed.
+            for frame in 0..count {
+                out[frame] = (curve[frame].clamp(-GROUND_LIMIT, GROUND_LIMIT)) as f32;
+            }
+            out
+        }
+    }
+}
+
+/// Solve `(W + smooth·D₂ᵀD₂) x = W·curve` for a five-band symmetric positive
+/// definite system, by banded Cholesky. The matrix has a bandwidth of two: the
+/// diagonal is `w + smooth·[1,5,6,…,6,5,1]`, the first off-diagonal
+/// `-2·smooth·[1,2,…,2,1]`, the second `smooth`.
+fn banded_grounding(curve: &[f64], weight: &[f64], smooth: f64) -> Option<Vec<f64>> {
+    let count = curve.len();
+    if count < 3 {
+        return Some(curve.to_vec());
+    }
+    let mut diagonal = vec![0.0f64; count];
+    let mut first = vec![0.0f64; count - 1];
+    let mut second = vec![0.0f64; count - 2];
+    for frame in 0..count {
+        // `[1,5,6,...,6,5,1]`: the interior of `D₂ᵀD₂` is 6, its ends 5 and 1.
+        let shape = if frame == 0 || frame + 1 == count {
+            1.0
+        } else if frame == 1 || frame + 2 == count {
+            5.0
+        } else {
+            6.0
+        };
+        diagonal[frame] = weight[frame] + smooth * shape;
+    }
+    for frame in 0..count - 1 {
+        let shape = if frame == 0 || frame + 2 == count {
+            1.0
+        } else {
+            2.0
+        };
+        first[frame] = -2.0 * smooth * shape;
+    }
+    for slot in second.iter_mut() {
+        *slot = smooth;
+    }
+
+    // Lower-triangular band of the Cholesky factor: the diagonal and the two
+    // sub-diagonals.
+    let at = |row: usize, column: usize| -> f64 {
+        match row - column {
+            0 => diagonal[row],
+            1 => first[column],
+            2 => second[column],
+            _ => 0.0,
+        }
+    };
+    let mut lower_diagonal = vec![0.0f64; count];
+    let mut lower_first = vec![0.0f64; count];
+    let mut lower_second = vec![0.0f64; count];
+    for row in 0..count {
+        for column in row.saturating_sub(2)..=row {
+            let mut sum = at(row, column);
+            for inner in row.saturating_sub(2)..column {
+                let a = match row - inner {
+                    0 => lower_diagonal[row],
+                    1 => lower_first[row],
+                    _ => lower_second[row],
+                };
+                let b = match column - inner {
+                    0 => lower_diagonal[column],
+                    1 => lower_first[column],
+                    _ => lower_second[column],
+                };
+                sum -= a * b;
+            }
+            if row == column {
+                if sum <= 0.0 || !sum.is_finite() {
+                    return None;
+                }
+                lower_diagonal[row] = sum.sqrt();
+            } else {
+                let pivot = lower_diagonal[column];
+                if pivot.abs() < 1e-12 {
+                    return None;
+                }
+                let value = sum / pivot;
+                match row - column {
+                    1 => lower_first[row] = value,
+                    _ => lower_second[row] = value,
+                }
+            }
+        }
+    }
+
+    // `L y = W·curve`, then `Lᵀ x = y`.
+    let mut y = vec![0.0f64; count];
+    for row in 0..count {
+        let mut sum = weight[row] * curve[row];
+        for inner in row.saturating_sub(2)..row {
+            let a = match row - inner {
+                1 => lower_first[row],
+                _ => lower_second[row],
+            };
+            sum -= a * y[inner];
+        }
+        y[row] = sum / lower_diagonal[row];
+    }
+    let mut x = vec![0.0f64; count];
+    for row in (0..count).rev() {
+        let mut sum = y[row];
+        for inner in row + 1..(row + 3).min(count) {
+            let a = match inner - row {
+                1 => lower_first[inner],
+                _ => lower_second[inner],
+            };
+            sum -= a * x[inner];
+        }
+        x[row] = sum / lower_diagonal[row];
+    }
+    Some(x)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +496,81 @@ mod tests {
         }
         let delta = plan(&frames, 0.0, 30.0, true, -0.1);
         assert!(delta.iter().all(|value| value.abs() < 1e-12));
+    }
+
+    /// A sole hovering a constant 2 cm over the plane moves the body down by
+    /// exactly that, with no residual.
+    #[test]
+    fn grounding_lands_a_hovering_sole_on_the_plane() {
+        let heights = vec![0.02f32; 12];
+        let planted = vec![true; 12];
+        let shift = grounding(&heights, &planted, 0.0, 30.0);
+        for value in &shift {
+            assert!((*value + 0.02).abs() < 1e-6, "got {value:.6}");
+        }
+    }
+
+    /// A sole *under* the plane raises the body the same way. The shift is the
+    /// negative of the error in both directions, which is what makes it a
+    /// grounding step and not a lift.
+    #[test]
+    fn grounding_raises_a_sunken_sole() {
+        let heights = vec![-0.015f32; 12];
+        let planted = vec![true; 12];
+        let shift = grounding(&heights, &planted, 0.0, 30.0);
+        for value in &shift {
+            assert!((*value - 0.015).abs() < 1e-6, "got {value:.6}");
+        }
+    }
+
+    /// The grounding follows the planted soles and interpolates between stances:
+    /// two stances hovering at different heights give two different shifts, and
+    /// the swing between them ramps instead of stepping.
+    #[test]
+    fn grounding_follows_each_stance_and_ramps_between_them() {
+        let count = 30usize;
+        let mut heights = vec![0.0f32; count];
+        let mut planted = vec![false; count];
+        for frame in 0..10 {
+            heights[frame] = 0.02;
+            planted[frame] = true;
+        }
+        for frame in 20..count {
+            heights[frame] = 0.04;
+            planted[frame] = true;
+        }
+        let shift = grounding(&heights, &planted, 0.0, 30.0);
+        // Each stance is pulled down by its own hover height.
+        assert!((shift[0] + 0.02).abs() < 5e-3, "first stance {:.4}", shift[0]);
+        assert!((shift[29] + 0.04).abs() < 5e-3, "second stance {:.4}", shift[29]);
+        // And the swing between them is a ramp, not a jump.
+        for frame in 1..count {
+            assert!(
+                (shift[frame] - shift[frame - 1]).abs() < 5e-3,
+                "frame {frame} stepped by {:.4}",
+                shift[frame] - shift[frame - 1]
+            );
+        }
+    }
+
+    /// No planted foot means no estimate at all: the clip keeps its own height.
+    #[test]
+    fn grounding_needs_a_planted_foot() {
+        let heights = vec![0.3f32; 6];
+        let planted = vec![false; 6];
+        let shift = grounding(&heights, &planted, 0.0, 30.0);
+        assert!(shift.iter().all(|value| *value == 0.0));
+    }
+
+    /// The reference clamps the shift to ±0.75 m; a wild sole height must not
+    /// teleport the body.
+    #[test]
+    fn grounding_is_bounded() {
+        let heights = vec![3.0f32; 8];
+        let planted = vec![true; 8];
+        let shift = grounding(&heights, &planted, 0.0, 30.0);
+        for value in &shift {
+            assert!((*value + GROUND_LIMIT as f32).abs() < 1e-4, "got {value:.4}");
+        }
     }
 }
