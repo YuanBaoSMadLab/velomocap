@@ -979,9 +979,36 @@ impl Character {
                     .and_then(|reference| load_texture(folder, &reference, true))
             })
             .collect();
-        Ok(finalize(
+        let mut character = finalize(
             name, bones, rest, joints, weights, faces, uv, textures, Vec::new(),
-        ))
+        );
+        Ok(character)
+    }
+
+    /// Turn the model half a turn about Y, so a VRM 0.x avatar faces the camera
+    /// like the clip does. A rotation, not a mirror: the winding stays valid.
+    fn turn_around(&mut self) {
+        for vertex in self.rest.chunks_exact_mut(3) {
+            vertex[0] = -vertex[0];
+            vertex[2] = -vertex[2];
+        }
+        for bone in &mut self.bones {
+            bone.bind[0] = -bone.bind[0];
+            bone.bind[2] = -bone.bind[2];
+            let m = bone.bind_rot;
+            let turned = [
+                -m[0], -m[1], -m[2],
+                m[3], m[4], m[5],
+                -m[6], -m[7], -m[8],
+            ];
+            bone.bind_rot = turned;
+            bone.inverse_bind = invert(&[
+                turned[0], turned[1], turned[2], bone.bind[0],
+                turned[3], turned[4], turned[5], bone.bind[1],
+                turned[6], turned[7], turned[8], bone.bind[2],
+                0.0, 0.0, 0.0, 1.0,
+            ]);
+        }
     }
 
     /// Pose the mesh with the clip's joint rotations.
@@ -2279,9 +2306,34 @@ impl Gltf {
             joints.len() == rest.len() / 3 && weights.len() == rest.len() / 3,
             "the mesh attributes disagree on the vertex count"
         );
-        Ok(finalize(
+        let mut character = finalize(
             name, bones, rest, joints, weights, faces, uv, textures, face_texture,
-        ))
+        );
+        // VRM 0.x avatars are authored facing -Z — the opposite of the clip and
+        // of every other character — so an unrotated one stands with its back to
+        // the camera. VRM 1.0 (the `VRMC_vrm` extension) fixed that.
+        if self.is_vrm_zero() {
+            character.turn_around();
+        }
+        Ok(character)
+    }
+
+    /// Whether the file is a VRM 0.x avatar, whose models face -Z.
+    fn is_vrm_zero(&self) -> bool {
+        let uses = self
+            .document
+            .get("extensionsUsed")
+            .and_then(|value| value.as_array());
+        if uses
+            .map(|uses| uses.iter().any(|value| value.as_str() == Some("VRM")))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        self.document
+            .get("extensions")
+            .and_then(|extensions| extensions.get("VRM"))
+            .is_some()
     }
 
     /// A material's base-colour image: `pbrMetallicRoughness` for glTF 2 and the
