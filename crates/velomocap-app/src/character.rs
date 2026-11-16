@@ -519,13 +519,19 @@ impl Character {
         translation: [f32; 3],
     ) -> Vec<f32> {
         // A character's bones carry canonical indices (Hips, LeftUpLeg …), the
-        // clip's rotations are in SMPL-H joint order. Resolve once per pose.
+        // clip's rotations are in its own joint order. Resolve once per pose.
+        //
+        // The clip names its joints in the *biped* vocabulary the BVH export
+        // uses, where `LeftShoulder` is the upper arm and `LeftCollar` is the
+        // clavicle — the opposite of Mixamo's meaning for the same words. So the
+        // export-name table is what resolves them; `canonicalize` is only right
+        // for the character's own file names.
         let mut joint_of = [usize::MAX; 52];
         for (joint, name) in names.iter().enumerate() {
             if joint >= world.len() {
                 break;
             }
-            if let Some(canonical) = velomocap_motion::retarget::canonicalize(name) {
+            if let Some(canonical) = velomocap_motion::retarget::from_export_name(name) {
                 if canonical < joint_of.len() && joint_of[canonical] == usize::MAX {
                     joint_of[canonical] = joint;
                 }
@@ -1699,6 +1705,121 @@ mod tests {
             if character_legs < clip_legs { "shorter" } else { "longer" },
             lo,
             character.ground_offset(&joint_of, &positions),
+        );
+    }
+
+    /// What the clip's joint names resolve to, which decides whether a
+    /// character's arms are driven at all.
+    #[test]
+    fn the_clip_names_cover_the_limbs() {
+        use velomocap_motion::retarget::{from_export_name, BONES};
+        // The names a FlowHMR clip actually carries, in its own joint order.
+        let clip = [
+            "Hips", "LeftHip", "RightHip", "Chest", "LeftKnee", "RightKnee", "Chest2",
+            "LeftAnkle", "RightAnkle", "Chest3", "LeftToe", "RightToe", "Neck", "LeftCollar",
+            "RightCollar", "Head", "LeftShoulder", "RightShoulder", "LeftElbow", "RightElbow",
+            "LeftWrist", "RightWrist", "LeftFinger1", "LeftFinger11", "LeftFinger12",
+        ];
+        for name in clip {
+            match from_export_name(name) {
+                Some(canonical) => eprintln!("{name} -> {} ({canonical})", BONES[canonical]),
+                None => eprintln!("{name} -> unmatched"),
+            }
+        }
+        for (name, expected) in [
+            // The biped's shoulder is the upper arm, its collar the clavicle.
+            ("LeftCollar", 6usize),
+            ("RightCollar", 25),
+            ("LeftShoulder", 7),
+            ("RightShoulder", 26),
+            ("LeftElbow", 8),
+            ("RightElbow", 27),
+            ("LeftWrist", 9),
+            ("RightWrist", 28),
+            ("LeftHip", 44),
+            ("RightHip", 48),
+            ("LeftKnee", 45),
+            ("RightKnee", 49),
+            ("LeftAnkle", 46),
+            ("RightAnkle", 50),
+            ("Chest", 1),
+            ("Chest2", 2),
+            ("Chest3", 3),
+            ("LeftFinger1", 10),
+            ("LeftFinger12", 12),
+        ] {
+            assert_eq!(from_export_name(name), Some(expected), "{name}");
+        }
+    }
+
+    /// A clip named the way the export names things has to move an imported
+    /// character's upper arm, not its clavicle.
+    #[test]
+    fn a_biped_named_clip_drives_the_upper_arm() {
+        let bones = vec![
+            bound("LeftArm", 7, None, [0.0, 0.0, 0.0]),
+            bound("LeftForeArm", 8, Some(0), [1.0, 0.0, 0.0]),
+        ];
+        let mut character = handmade(bones, vec![1.0, 0.0, 0.0]);
+        character.joints[0][0] = 1;
+        // A clip whose joint 7 is named `LeftShoulder`, turned a quarter turn
+        // about Z: the forearm, and the vertex on it, have to swing up.
+        let quarter = [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let mut world = vec![neutral(); 52];
+        let rest = vec![neutral(); 52];
+        world[7] = quarter;
+        let mut names = vec![String::new(); 52];
+        names[0] = "Hips".to_string();
+        names[7] = "LeftShoulder".to_string();
+        let posed = character.pose(
+            &world,
+            &rest,
+            &vec![[0.0f32; 3]; 52],
+            &names,
+            [0.0; 3],
+        );
+        // (1, 0, 0) turned a quarter about Z is (0, 1, 0).
+        assert!(posed[0].abs() < 1e-5, "{posed:?}");
+        assert!((posed[1] - 1.0).abs() < 1e-5, "{posed:?}");
+    }
+
+    /// How far the clip's rest arms sit from level, for comparison with a
+    /// character's bind arms.
+    #[test]
+    fn the_clip_rest_arms_are_measured() {
+        let Some(model) = std::env::var_os("VELOMOCAP_SMPLH_MODEL") else {
+            return;
+        };
+        let body = velomocap_body::BodyModel::load(std::path::Path::new(&model), 16).expect("body");
+        let skeleton = body.forward_joints(&velomocap_body::Pose::neutral(body.num_joints, 16));
+        let at = |name: &str| {
+            velomocap_body::JOINT_NAMES
+                .iter()
+                .position(|joint| *joint == name)
+                .map(|joint| {
+                    [
+                        skeleton.positions[joint * 3],
+                        skeleton.positions[joint * 3 + 1],
+                        skeleton.positions[joint * 3 + 2],
+                    ]
+                })
+        };
+        let angle = |a: Option<[f32; 3]>, b: Option<[f32; 3]>| -> Option<f32> {
+            let (a, b) = (a?, b?);
+            let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let length = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            (length > 1e-6).then(|| (d[1] / length).asin().to_degrees())
+        };
+        eprintln!(
+            "clip rest: shoulder {:?} elbow {:?} wrist {:?}",
+            at("left_shoulder"),
+            at("left_elbow"),
+            at("left_wrist")
+        );
+        eprintln!(
+            "clip rest: upper arm {:.1}°, lower arm {:.1}° below level",
+            angle(at("left_shoulder"), at("left_elbow")).unwrap_or(0.0),
+            angle(at("left_elbow"), at("left_wrist")).unwrap_or(0.0)
         );
     }
 
