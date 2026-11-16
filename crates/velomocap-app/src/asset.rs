@@ -303,11 +303,18 @@ pub fn write_glb(
 
     // The mesh node sits under no bone: the skin does the work.
     let mesh_node = nodes.len();
-    nodes.push(serde_json::json!({
-        "name": character.name,
+    // A skinned mesh takes its transform from the skin, but its node still has to
+    // be listed in the scene or an importer sees a scene with no geometry.
+    let mut mesh_entry = serde_json::json!({
+        "name": format!("{}_mesh", character.name),
         "mesh": 0,
-        "skin": if options.skin { serde_json::json!(0) } else { serde_json::Value::Null },
-    }));
+    });
+    if options.skin {
+        mesh_entry["skin"] = serde_json::json!(0);
+    }
+    nodes.push(mesh_entry);
+    let mut scene_nodes: Vec<serde_json::Value> = vec![serde_json::json!(mesh_node)];
+    scene_nodes.extend(roots.iter().cloned());
 
     let mut skin_entry = serde_json::Value::Null;
     if options.skin {
@@ -382,7 +389,7 @@ pub fn write_glb(
     let mut document = serde_json::json!({
         "asset": { "version": "2.0", "generator": "VeloMocap" },
         "scene": 0,
-        "scenes": [ { "nodes": { "mesh": mesh_node, "roots": roots } } ],
+        "scenes": [ { "name": character.name, "nodes": scene_nodes } ],
         "nodes": nodes,
         "meshes": [ { "name": character.name, "primitives": primitives } ],
         "accessors": accessors,
