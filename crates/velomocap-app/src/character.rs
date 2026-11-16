@@ -1053,14 +1053,15 @@ impl Character {
         // axes follow its bones — a PMX bone's local frame is world-aligned, so
         // a local deviation bends limbs that should be straight.
         let mut delta = [identity(); 52];
-        // Fingers bend about their own axes, so the clip's finger deviation is
-        // applied in this model's finger frame: the angle is the clip's, the bend
-        // plane is the rig's own, which is where a finger physically bends.
-        // Copying the clip's world orientation instead pre-rotates each finger by
-        // the difference between the two rigs' rest hands — 64 degrees on Unreal
-        // — so the thumb and index stick out instead of pinching.
-        // `VELOMOCAP_FINGER_WORLD=1` restores the old behaviour for comparison.
-        let finger_local = std::env::var_os("VELOMOCAP_FINGER_WORLD").is_none();
+        // A finger's curl is a rotation about the finger's own axis, but applying
+        // the clip's deviation in this model's finger frame turned the whole hand
+        // over on the VRM avatar: the frame the clip's finger deviation is
+        // measured in is the *clip's* rest hand, not this rig's, and on a hand
+        // whose roll differs they are not the same frame at all. Copying the
+        // clip's world orientation stays the default; the local bend is behind
+        // `VELOMOCAP_FINGER_LOCAL=1` until the roll difference is measured and
+        // corrected on its own.
+        let finger_local = std::env::var_os("VELOMOCAP_FINGER_LOCAL").is_some();
         let mut mapped = [false; 52];
         // The clip's deviation expressed in each joint's own rest frame. A
         // finger is driven by this rather than by the world delta: the bend a
