@@ -102,7 +102,10 @@ VeloMocap.cmd clip.mp4 --play               # open and play
 VeloMocap.cmd clip.mp4 --detect-only        # detection pass only, prints candidates
 ```
 
-![A reconstructed body](assets/body-generated.png)
+![The SMPL-H body model](assets/body-generated.png)
+
+*The body model behind every take — SMPL-H, 6 890 vertices and 52 joints, in a
+neutral A-pose from the front, three-quarter and profile, next to its skeleton.*
 
 Command line:
 

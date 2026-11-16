@@ -88,7 +88,10 @@ VeloMocap.cmd clip.mp4 --play               # 打开并播放
 VeloMocap.cmd clip.mp4 --detect-only        # 只做检测，打印候选人物
 ```
 
-![重建出的人体](assets/body-generated.png)
+![SMPL-H 人体模型](assets/body-generated.png)
+
+*每条动作背后的身体模型 —— SMPL-H，6 890 顶点、52 关节，以中性 A 姿态的正面、
+四分之三、侧面三视图，以及它的骨架。*
 
 命令行：
 
