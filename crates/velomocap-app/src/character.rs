@@ -1135,29 +1135,6 @@ impl Character {
         // got, so a whole arm turns as one piece. Measuring each bone's angle
         // from its own bind instead left the forearm corrected twice, 52° off.
         let (aligned, _) = self.align_hierarchy(&joint_of, &units, rest_positions);
-        // The fixed roll a rig's hand carries relative to the clip's rest hand.
-        // One rotation per side, taken from the hand bone's bind orientation
-        // against the clip's own rest hand: identity on Mixamo, which is why its
-        // fingers were always right, about 64° on Unreal, and different again on
-        // an avatar. Applying it to the finger keeps the clip's bend angle and
-        // puts the bend back into the plane the hand actually folds along.
-        let hand_roll = |hand: usize| -> [f32; 9] {
-            let Some(slot) = self
-                .bones
-                .iter()
-                .position(|bone| bone.canonical == Some(hand))
-            else {
-                return identity();
-            };
-            let joint = joint_of[hand];
-            if joint == usize::MAX || joint >= rest.len() {
-                return identity();
-            }
-            multiply(&rest[joint], &transpose(&units[slot]))
-        };
-        let left_roll = hand_roll(9);
-        let right_roll = hand_roll(28);
-        let no_roll = std::env::var_os("VELOMOCAP_NO_HAND_ROLL").is_some();
         // Walk parents first: a bone's world rotation is its parent's times its
         // own rest-relative local rotation and the clip's deviation for that
         // joint, and its pivot follows its parent.
@@ -1231,15 +1208,7 @@ impl Character {
                     if finger_local && is_finger(canonical) {
                         multiply(&local_rest, &deviation[canonical])
                     } else {
-                        let roll = if is_finger(canonical) && !no_roll {
-                            if canonical < 25 { left_roll } else { right_roll }
-                        } else {
-                            identity()
-                        };
-                        multiply(
-                            &transpose(&parent_rotation),
-                            &multiply(&delta[canonical], &multiply(&aligned[index], &roll)),
-                        )
+                        multiply(&transpose(&parent_rotation), &multiply(&delta[canonical], &aligned[index]))
                     }
                 }
                 // A bone the clip cannot drive keeps its rest-relative pose and
