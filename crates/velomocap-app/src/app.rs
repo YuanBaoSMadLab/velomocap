@@ -376,6 +376,18 @@ pub struct VeloMocap {
     pub export_name: String,
     /// One file per person instead of the selected one.
     pub export_everyone: bool,
+    /// What a character asset export writes: mesh with skin weights, materials
+    /// with their textures, and the animation. All on by default, which is what
+    /// a game engine needs to import the model and play the take.
+    pub asset_skin: bool,
+    pub asset_materials: bool,
+    pub asset_animation: bool,
+    /// Which people's models to write; one file each.
+    pub asset_selected: Vec<bool>,
+    /// Where they land; empty means beside the clip.
+    pub asset_folder: String,
+    /// What the last asset export did, for the panel.
+    pub asset_status: String,
     pub tools_ok: bool,
     pub ort_path: Option<PathBuf>,
     pub cuda_ok: bool,
@@ -538,6 +550,12 @@ impl VeloMocap {
             characters_loaded: false,
             export_format: ExportFormat::Bvh,
             export_name: String::new(),
+        asset_skin: true,
+        asset_materials: true,
+        asset_animation: true,
+        asset_selected: Vec::new(),
+        asset_folder: String::new(),
+        asset_status: String::new(),
             export_everyone: false,
             model_status: Vec::new(),
             model_root: None,
@@ -829,6 +847,82 @@ impl VeloMocap {
             Some(panel) if panel > index => Some(panel - 1),
             other => other,
         };
+    }
+
+    /// Write every selected person's model as its own animated `.glb`: mesh with
+    /// skin weights, materials with their textures, and the take the viewport is
+    /// playing. This is the export that puts a usable asset in a game engine, as
+    /// opposed to the skeleton-only BVH/FBX motion export next to it.
+    pub fn export_asset_models(&mut self) {
+        let Some(project) = self.project_path.clone() else {
+            self.asset_status = i18n::zh_en(
+                "先保存工程文件，再导出角色资产",
+                "Save the project first, then export the character assets",
+            )
+            .to_string();
+            return;
+        };
+        let folder = if self.asset_folder.trim().is_empty() {
+            project
+                .parent()
+                .map(|parent| parent.to_path_buf())
+                .unwrap_or_default()
+        } else {
+            PathBuf::from(self.asset_folder.trim())
+        };
+        if let Err(error) = std::fs::create_dir_all(&folder) {
+            self.asset_status = format!("{error}");
+            return;
+        }
+        let options = crate::asset::Options {
+            skin: self.asset_skin,
+            materials: self.asset_materials,
+            animation: self.asset_animation,
+        };
+        let model = self.smplh_model.display().to_string();
+        let mut written = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+        // Collect the paths first: the loop must not hold the people list while
+        // reporting an error through `self`.
+        let wanted: Vec<(usize, PathBuf)> = self
+            .people
+            .iter()
+            .enumerate()
+            .filter_map(|(index, person)| {
+                let assigned = person.character.as_ref()?;
+                if !self.asset_selected.get(index).copied().unwrap_or(true) {
+                    return None;
+                }
+                Some((index, assigned.path.clone()))
+            })
+            .collect();
+        for (index, path) in wanted {
+            let stem = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| format!("person{}", index + 1));
+            let out = folder.join(format!("{stem}.glb"));
+            let result = crate::probe::export_animation(
+                &model,
+                &path.display().to_string(),
+                &project.display().to_string(),
+                &out.display().to_string(),
+                options,
+            );
+            match result {
+                Ok(()) => written += 1,
+                Err(error) => failures.push(format!("{stem}: {error:#}")),
+            }
+        }
+        for failure in failures {
+            self.log(format!("asset: {failure}"));
+        }
+        self.asset_status = format!(
+            "{} {} → {}",
+            i18n::zh_en("已导出", "wrote"),
+            written,
+            folder.display()
+        );
     }
 
     /// Put a person back on the built-in body.

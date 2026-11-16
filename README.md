@@ -55,10 +55,14 @@ around it.
 * **Exports**: BVH with Character Studio bone names (`Hips`, `Chest`, …,
   `LeftFinger0…4`) and a uniform `Zrotation Xrotation Yrotation` encoding, plus binary
   FBX 7.4 in centimetres — both with the same 52-bone skeleton the viewport shows.
-* **Characters**: import a **VRM** avatar, an **Unreal Engine** body (UE5_Manny_Simple,
-  UE5_Quinn_Simple, shipped in `models/`) or any **Mixamo-rigged** glTF/FBX/GLB, and the
-  generated clip drives it in the viewport with its own materials and textures. The library is
+* **Characters**: import a **VRM** avatar, an **Unreal Engine** body, or any
+  **Mixamo-rigged** glTF/FBX/GLB, and the generated clip drives it in the viewport with its own
+  materials and textures. `UE5_Manny_Simple`, `UE5_Quinn_Simple` and `Mixamo_Remy` ship in
+  `models/characters/`, so a fresh install already has three rigs to export to. The library is
   shared by every project: import once, use everywhere.
+* **Character asset export**: writes the model that is on screen — mesh, skin weights, materials
+  with their textures and the animation — as one `.glb` per character, so it imports into Unreal,
+  Unity or Blender as a skeletal mesh with a take, instead of motion that has to be re-skinned.
 * **MMD (experimental)**: PMX models load with their materials, 付与 (inherit) links and
   deform bones; the rigid-body physics that moves MMD hair and cloth is not simulated yet.
 * **Self-checking**: SAM parity tests run the PyTorch reference and the exported module

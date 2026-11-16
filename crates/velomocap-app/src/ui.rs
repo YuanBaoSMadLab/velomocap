@@ -2901,6 +2901,91 @@ fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
                     .color(ERR),
                 );
             }
+            ui.add_space(8.0);
+            ui.separator();
+            // Character assets: the model itself, not just its skeleton. One
+            // file per person, carrying mesh, skin weights, materials and the
+            // take, which is what a game engine imports.
+            ui.label(
+                egui::RichText::new(i18n::zh_en("角色资产（网格 + 骨骼 + 动画）", "Character asset (mesh + skeleton + animation)"))
+                    .size(11.5)
+                    .strong(),
+            );
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut app.asset_skin, i18n::zh_en("网格与蒙皮", "Mesh and skin"));
+                ui.checkbox(&mut app.asset_materials, i18n::zh_en("材质与贴图", "Materials"));
+                ui.checkbox(&mut app.asset_animation, i18n::zh_en("动画", "Animation"));
+            });
+            let mut shown = 0usize;
+            for index in 0..app.people.len() {
+                let Some(assigned) = app.people[index].character.as_ref() else {
+                    continue;
+                };
+                let name = assigned
+                    .path
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if app.asset_selected.len() <= index {
+                    app.asset_selected.resize(index + 1, true);
+                }
+                let mut chosen = app.asset_selected[index];
+                if ui
+                    .checkbox(
+                        &mut chosen,
+                        egui::RichText::new(format!("{} · {}", app.people[index].name, name)).size(11.0),
+                    )
+                    .changed()
+                {
+                    app.asset_selected[index] = chosen;
+                }
+                shown += 1;
+            }
+            if shown == 0 {
+                ui.label(
+                    egui::RichText::new(i18n::zh_en(
+                        "还没有人物使用导入的模型",
+                        "No person is wearing an imported model yet",
+                    ))
+                    .size(10.0)
+                    .color(MUTED),
+                );
+            }
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(i18n::zh_en("输出目录", "Output folder")).size(10.5));
+                let hint = i18n::zh_en("留空＝工程所在目录", "empty = beside the project");
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.asset_folder)
+                        .hint_text(hint)
+                        .desired_width(ui.available_width() - 8.0),
+                );
+            });
+            if !app.asset_status.is_empty() {
+                ui.label(egui::RichText::new(&app.asset_status).size(10.0).color(OK));
+            }
+            ui.horizontal(|ui| {
+                let can = shown > 0 && app.project_path.is_some();
+                if ui
+                    .add_enabled(
+                        can,
+                        egui::Button::new(i18n::zh_en("导出角色资产 (.glb)", "Export character assets (.glb)")),
+                    )
+                    .on_hover_text(i18n::zh_en(
+                        "每个勾选的角色导出一个 .glb：网格、蒙皮、材质和内嵌贴图、动画",
+                        "One .glb per ticked character: mesh, skin, materials with embedded textures, animation",
+                    ))
+                    .clicked()
+                {
+                    app.export_asset_models();
+                }
+                if app.project_path.is_none() {
+                    ui.label(
+                        egui::RichText::new(i18n::zh_en("先保存工程", "Save the project first"))
+                            .size(10.0)
+                            .color(MUTED),
+                    );
+                }
+            });
             ui.add_space(6.0);
             // The last file written, so a click always leaves a visible result.
             if let Some(note) = &app.export_note {

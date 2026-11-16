@@ -45,9 +45,12 @@ VeloMocap 把一段手机视频变成可用的三维动作：检测人物、重�
 * **导出**：BVH 使用 Character Studio 骨骼名（`Hips`、`Chest`、…、`LeftFinger0…4`），
   统一 `Zrotation Xrotation Yrotation` 编码；二进制 FBX 7.4 以厘米为单位。两者与视口显示的
   是同一副 52 骨骨架。
-* **角色**：可导入 **VRM** 虚拟形象、**虚幻引擎**身体（`models/` 里带 `UE5_Manny_Simple` /
-  `UE5_Quinn_Simple`），以及任意 **Mixamo 骨骼** 的 glTF/FBX/GLB；片段会用它自己的材质和贴图
+* **角色**：可导入 **VRM** 虚拟形象、**虚幻引擎**身体（`models/characters/` 里带 `UE5_Manny_Simple`、`UE5_Quinn_Simple`、
+  `Mixamo_Remy`），以及任意 **Mixamo 骨骼** 的 glTF/FBX/GLB；片段会用它自己的材质和贴图
   驱动角色。角色库存在本机，导入一次所有工程共用。
+* **角色资产导出**：把视口里那个模型——网格、蒙皮权重、材质与贴图、以及动画——按每个角色写成
+  一个 `.glb`。导入 Unreal / Unity / Blender 直接得到「骨骼网格体 + 动画序列」，而不是只有
+  需要重新蒙皮的动作。
 * **MMD（实验性）**：PMX 能加载材质、付与（继承）和变形骨；MMD 用刚体物理驱动的头发、裙摆
   还没有模拟。
 * **可自证**：SAM 的比对测试在同一个进程里同时跑 PyTorch 原版和导出模块；FBX 写出后会被
