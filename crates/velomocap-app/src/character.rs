@@ -1268,6 +1268,20 @@ impl Character {
             self.report_carries(&position, &rest_at, inherit);
             self.report_lowest(inherit);
         }
+        if std::env::var_os("VELOMOCAP_DEBUG_HANDS").is_some() {
+            for joint in 0..names.len().min(world.len()).min(rest.len()) {
+                let canonical = velomocap_motion::retarget::from_export_name(&names[joint]);
+                let fk = multiply(&world[joint], &transpose(&rest[joint]));
+                let trace = fk[0] + fk[4] + fk[8];
+                let angle = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0).acos().to_degrees();
+                if canonical.map(|canonical| canonical >= 10 && canonical <= 43).unwrap_or(false) {
+                    eprintln!(
+                        "hand: joint {joint:2} {:>16} canonical {:?} turns {angle:5.1}°",
+                        names[joint], canonical
+                    );
+                }
+            }
+        }
         let mut out = vec![0.0f32; self.rest.len()];
         for vertex in 0..self.vertex_count() {
             let at = [self.rest[vertex * 3], self.rest[vertex * 3 + 1], self.rest[vertex * 3 + 2]];
