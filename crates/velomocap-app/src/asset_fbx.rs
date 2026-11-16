@@ -1036,4 +1036,42 @@ mod tests {
             "the node TRS and the cluster bind disagree by {worst} at {worst_bone}"
         );
     }
+
+    /// The file a game engine opens starts with the FBX signature and the 7.4
+    /// version, and every combination of the three content switches writes one
+    /// without panicking. The switches are what the export dialog offers, so
+    /// each of the eight states has to be a file, not a crash.
+    #[test]
+    fn every_content_switch_writes_a_74_file() {
+        let Some(path) = std::env::var_os("VELOMOCAP_CHARACTER") else {
+            return;
+        };
+        let character = Character::load(std::path::Path::new(&path)).expect("load");
+        let folder = std::env::temp_dir().join("velomocap-fbx-test");
+        std::fs::create_dir_all(&folder).expect("temp folder");
+        let signature = b"Kaydara FBX Binary  \0\x1a\0";
+        for bits in 0..8 {
+            let options = Options {
+                skin: bits & 1 != 0,
+                materials: bits & 2 != 0,
+                animation: bits & 4 != 0,
+            };
+            let out = folder.join(format!("switch-{bits}.fbx"));
+            write_fbx(&character, &[], options, 30.0, &out).expect("write");
+            let bytes = std::fs::read(&out).expect("read back");
+            assert!(
+                bytes.starts_with(signature),
+                "switch {bits}: the signature is missing"
+            );
+            assert_eq!(
+                u32::from_le_bytes([bytes[23], bytes[24], bytes[25], bytes[26]]),
+                7400,
+                "switch {bits}: not a 7.4 file"
+            );
+            assert!(bytes.len() > 4096, "switch {bits}: {} bytes", bytes.len());
+        }
+        // A skinless, textureless write must not leave a texture folder behind.
+        assert!(!folder.join("switch-0_textures").exists());
+        std::fs::remove_dir_all(&folder).ok();
+    }
 }
