@@ -148,7 +148,14 @@ impl FlowBody {
         let index = playhead
             .saturating_sub(self.first_frame)
             .min(self.frames.len() - 1);
-        self.frames.get(index).map(|verts| verts.as_slice())
+        // Skip empty bake results: an empty slice draws nothing, which is how a
+        // take whose last frames failed to skin turned into "the model is gone".
+        (0..=index).rev().find_map(|at| {
+            self.frames
+                .get(at)
+                .filter(|verts| !verts.is_empty())
+                .map(|verts| verts.as_slice())
+        })
     }}
 impl PersonView {
     pub fn frame(&self, index: usize) -> Option<&Arc<PersonFrame>> {

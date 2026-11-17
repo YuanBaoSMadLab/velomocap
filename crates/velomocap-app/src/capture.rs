@@ -697,15 +697,50 @@ fn run_flow(
         };
         let mut bodies = Vec::with_capacity(clip.frames());
         let poses = clip.poses.len().max(1);
+        let mut empty_bodies = 0usize;
+        let mut first_empty = 0usize;
         for (pose_index, pose) in clip.poses.iter().enumerate() {
             match model.forward_mesh(pose) {
                 Ok((_, vertices)) => bodies.push(vertices),
-                Err(_) => bodies.push(Vec::new()),
+                Err(_) => {
+                    if empty_bodies == 0 {
+                        first_empty = pose_index;
+                    }
+                    empty_bodies += 1;
+                    bodies.push(Vec::new());
+                }
             }
             // Skinning 90 frames of a 14k-triangle body is not instant; let the
             // bar move instead of sitting at "generating motion".
             if pose_index % 8 == 0 {
                 report_stage(shared, 4, pose_index, poses, "skin");
+            }
+        }
+        // A take whose tail failed to skin, or whose track stopped early, shows up
+        // as "the model disappeared" in the viewport: say so in the log instead of
+        // leaving the user to notice it.
+        if empty_bodies > 0 {
+            if let Ok(mut state) = shared.lock() {
+                state.flow_note = format!(
+                    "{}: {} of {} frames could not be skinned (first at frame {})",
+                    person.name,
+                    empty_bodies,
+                    bodies.len(),
+                    first_empty
+                );
+            }
+        }
+        let expected = person.frames.len();
+        let start = clip.source_frames.first().copied().unwrap_or(0);
+        if start + clip.frames() < expected {
+            if let Ok(mut state) = shared.lock() {
+                state.flow_note = format!(
+                    "{}: the take covers frames {}..{} of {} (the person track ended early)",
+                    person.name,
+                    start,
+                    start + clip.frames(),
+                    expected
+                );
             }
         }
         let mut summary = velomocap_motion::summarise_flow(&clip);
