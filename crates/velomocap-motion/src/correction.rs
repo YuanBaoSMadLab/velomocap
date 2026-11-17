@@ -1399,6 +1399,8 @@ fn leg_ik(
         (2, 5, 8, 11), // right hip, knee, ankle, toe
     ];
     let cap = thresholds.max_correction.min(0.05) as f64;
+    // One lookup per clip instead of one per frame inside the pin loops.
+    let debug_pins = std::env::var_os("VELOMOCAP_DEBUG_PIN").is_some();
     // 1 - exp(-dt/0.05): the reference's 50 ms one-pole on the applied
     // correction (pear/foot_lock.py::smooth_correction).
     for (foot_index, (hip, knee, ankle, toe)) in legs.into_iter().enumerate() {
@@ -1505,6 +1507,20 @@ fn leg_ik(
                     // is left alone rather than levering the body again here.
                     continue;
                 }
+                if debug_pins {
+                    let current_ankle = joint(&clip.skeletons[index], ankle);
+                    let reach = distance3(target, hip_f);
+                    eprintln!(
+                        "[pin] f{index} leg{foot_index} d={reach:.3} max={max_reach:.3} ratio={:.3} w={weight:.2} hold={hold:.2} ankle=({:.3},{:.3},{:.3}) target=({:.3},{:.3},{:.3})",
+                        reach / max_reach.max(1e-9),
+                        current_ankle[0],
+                        current_ankle[1],
+                        current_ankle[2],
+                        target[0],
+                        target[1],
+                        target[2]
+                    );
+                }
                 apply_leg_pin(
                     body, clip, &rest, hip, knee, ankle, index, target, weight, cap,
                     report,
@@ -1525,11 +1541,35 @@ fn leg_ik(
                 continue;
             }
             let current = joint(&clip.skeletons[index], ankle);
-            let target = [
+            let mut target = [
                 current[0] as f64 + offset[0] as f64,
                 current[1] as f64 + offset[1] as f64,
                 current[2] as f64 + offset[2] as f64,
             ];
+            // A release carries the stance's residual out, and that residual can be
+            // most of a stance's vertical correction — 7 cm on `2月27日.mp4`, where
+            // the whole take stands ~7 cm above the estimated floor. Carried into a
+            // frame the foot is already leaving, it drags the sole *under* the
+            // plane (measured: 56 mm below) and straightens the knee to get there.
+            // The reference keeps a free sole out of the floor the same way
+            // (`contact_offsets`'s `floor_lift` on the non-contact frames): the
+            // hand-off may lower the ankle, but only until the sole touches.
+            if settings.mode == CorrectionMode::Flat {
+                let sole_at = support_point_with(
+                    sole,
+                    clip,
+                    index,
+                    foot_index,
+                    ankle,
+                    toe,
+                    foot.weights[index][foot_index],
+                );
+                let expected = sole_at[1] as f64 + (target[1] - current[1] as f64);
+                let floor = settings.floor as f64;
+                if expected < floor {
+                    target[1] += floor - expected;
+                }
+            }
             let hip_f = joint(&clip.skeletons[index], hip).map(|value| value as f64);
             if distance3(target, hip_f) < min_reach * 1.0005 {
                 continue;
@@ -1537,6 +1577,22 @@ fn leg_ik(
             let weight = reach_falloff(target, hip_f, max_reach) as f32;
             if weight <= 0.02 {
                 continue;
+            }
+            if debug_pins {
+                let current_ankle = joint(&clip.skeletons[index], ankle);
+                eprintln!(
+                    "[pin] f{index} leg{foot_index} TRANSITION d={:.3} offset=({:.3},{:.3},{:.3}) ankle=({:.3},{:.3},{:.3}) target=({:.3},{:.3},{:.3})",
+                    distance3(target, hip_f),
+                    offset[0],
+                    offset[1],
+                    offset[2],
+                    current_ankle[0],
+                    current_ankle[1],
+                    current_ankle[2],
+                    target[0],
+                    target[1],
+                    target[2]
+                );
             }
             apply_leg_pin(
                 body, clip, &rest, hip, knee, ankle, index, target, weight, cap,
