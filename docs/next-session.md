@@ -108,3 +108,27 @@ cargo build --release -p velomocap-app -p velomocap-cli
 - 安装时**绝不杀用户正在跑的窗口**：先 `Get-Process velomocap-app`，若在运行就改名
   `velomocap-app.running-<pid>.exe` 再覆盖，最后删掉残留。
 - 参考项目：`E:\RGBMocap\toyxyz_RGBMocap`（`mocap/pear/foot_lock.py` 已 1:1 复刻完）。
+
+## 5. 2026-11-17 傍晚：Apply Correction 从来没到过视口
+
+`CaptureShared` 在任务结束后一直保留结果，`poll_capture` 每帧都读它；只要 take 与快照
+不同就整段替换。而"重新求解后的 take"必然与快照不同 —— 于是校正结果落地 16 ms 后被
+换回校正前的烘焙。用户看到的"开不开锁脚一样"不是锁脚无效，是两次看到的是同一份。
+
+- `poll_capture` 每轮 capture 只采纳一次（`flow_adopted`）；`start_capture` 里清空。
+- 勾选"因果脚锁"立即触发 `apply_correction`；其余设置改动把 take 标记为过期并在面板提示。
+- 因果脚锁的"do no harm"单独判定：变差只回滚它自己，不再拖累前面所有 pass。
+- `rolling_anchor` 先对脚跟/脚尖高度差做 `max(0.5, fps*0.04)` 高斯（参考
+  `support_weights` 就是这么做的），再进去抖动带。
+
+### 三条路径的实测（`短暂.mp4`，105 帧，同源 dump，replay）
+
+| pass | slide cm/帧 | float mm | sink mm | jitter mm |
+|---|---|---|---|---|
+| 精确 IK + 因果锁 | 0.16 / 0.08 | 0.6 / 0.1 | 3.0 / 1.9 | 21.9→35.5 |
+| 只有精确 IK | 0.16 / 0.13 | 0.3 / 0.1 | 3.0 / 1.5 | 21.9→33.4 |
+| 只有因果锁 | 0.25 / 0.16 | 2.0 / 1.2 | 17.8 / 6.5 | 21.9→21.1 |
+
+因果锁单独跑明显不如精确 IK（sink 17.8 mm），叠在精确 IK 上才有用（右脚 slide 0.13→0.08）。
+参考里 `LiveFootLock` 只用在 PEAR 实时预览（`pear/multi_worker.py:224`），批处理
+`flow_correction.py` 完全没有它 —— 我们是把它当批处理的最后一级叠加，这是和参考的结构差异。
