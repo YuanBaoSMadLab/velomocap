@@ -697,6 +697,20 @@ impl VeloMocap {
             std::process::exit(0);
         }
         app.log("VeloMocap native core ready.");
+        // A session header, so the file log can be read on its own: which build,
+        // which binary, and what the correction was asked to do. Without it a
+        // report from yesterday cannot be told apart from today's.
+        app.log(format!(
+            "build {} · {}",
+            env!("CARGO_PKG_VERSION"),
+            std::env::current_exe()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| "?".into())
+        ));
+        app.log(correction_line(&app.correction));
+        if let Some(path) = log_file_path() {
+            app.log(format!("log file: {}", path.display()));
+        }
         match device_memory {
             Some(total) => app.log(format!(
                 "Memory mode: {} ({:.1} GB device, auto-selected)",
@@ -789,6 +803,20 @@ impl VeloMocap {
         self.console.push(format!("{stamp}{message}"));
         if self.console.len() > 500 {
             self.console.remove(0);
+        }
+        // The panel is memory only and gone the moment the window closes, which
+        // makes it the wrong place for the one report that says whether the
+        // foot lock ran: "the feet will not stay put" is a question about a
+        // specific run's settings and numbers, and it has to be readable
+        // afterwards. `log_file_path` says where it goes.
+        if let Some(path) = log_file_path() {
+            if std::fs::metadata(&path).map(|meta| meta.len() > 4 * 1024 * 1024).unwrap_or(false) {
+                let _ = std::fs::remove_file(&path);
+            }
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                use std::io::Write;
+                let _ = writeln!(file, "{stamp}{message}");
+            }
         }
     }
     /// Import a humanoid character (VRM / GLB) for one person: its own skeleton
@@ -2036,6 +2064,8 @@ impl VeloMocap {
             self.status = i18n::t("Reconstructing every person…").into();
             self.log("SAM 3D Body capture started (detector → per-person mesh).");
         }
+        self.log(format!("video: {}", video.display()));
+        self.log(correction_line(&self.correction));
         self.capture = Some(capture::start(capture::CaptureSettings {
             video,
             config: SamConfig {
@@ -2938,6 +2968,53 @@ fn chrono_like_clock() -> String {
         seconds / 3600,
         (seconds % 3600) / 60,
         seconds % 60
+    )
+}
+
+/// Where every log line also goes, so a report outlives the window.
+///
+/// `%LOCALAPPDATA%\VeloMocap\logs\velomocap.log`, beside the character library,
+/// appended across runs and truncated at 4 MB. One file rather than one per day:
+/// the interesting thing is "the last run that showed the shaking", and a single
+/// file makes that the tail.
+pub fn log_file_path() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))?;
+    let folder = base.join("VeloMocap").join("logs");
+    std::fs::create_dir_all(&folder).ok()?;
+    Some(folder.join("velomocap.log"))
+}
+
+/// One line that says exactly what the correction was asked to do.
+///
+/// A report without the settings that produced it is unreadable a day later:
+/// `preset=normal live_lock=false pose_plan=true` is the difference between
+/// "the pass is wrong" and "the pass never ran".
+pub fn correction_line(settings: &velomocap_motion::correction::CorrectionSettings) -> String {
+    use velomocap_motion::correction::{CorrectionMode, LockPreset};
+    format!(
+        "correction config: {} mode={} foot={} hand={} preset={} floor={:+.3} m \
+         pelvis_offset={:+.3} m smoothing={} mesh_sole={} leg_ik={} pose_plan={} live_lock={}",
+        if settings.enabled { "enabled" } else { "DISABLED" },
+        match settings.mode {
+            CorrectionMode::Flat => "flat",
+            CorrectionMode::MultiLevel => "multi",
+        },
+        settings.foot,
+        settings.hand,
+        match settings.preset {
+            LockPreset::Tight => "tight",
+            LockPreset::Normal => "normal",
+            LockPreset::Loose => "loose",
+        },
+        settings.floor,
+        settings.pelvis_offset,
+        settings.smoothing,
+        settings.mesh_sole,
+        settings.leg_ik,
+        settings.pose_plan,
+        settings.live_lock,
     )
 }
 fn resolve_model(candidates: &[&str]) -> Option<PathBuf> {
