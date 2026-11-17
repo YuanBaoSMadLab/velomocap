@@ -231,6 +231,9 @@ pub struct CorrectionReport {
     pub live_frames: usize,
     /// Worst distance left between a live-solved ankle and its lock target.
     pub live_residual: f32,
+    /// The causal live lock was rolled back on its own: it left the clip jumpier
+    /// than the exact passes did. Everything before it stays.
+    pub live_rolled_back: bool,
     /// Worst distance between a solved wrist and its pinned target.
     pub max_hand_error: f32,
     /// Largest vertical correction applied by the root pass.
@@ -316,7 +319,9 @@ impl CorrectionReport {
             self.jitter_before * 1000.0,
             self.jitter_after * 1000.0
         );
-        if self.live_frames > 0 {
+        if self.live_rolled_back {
+            out.push_str("; live lock rolled back (it made the clip jumpier)");
+        } else if self.live_frames > 0 {
             out.push_str(&format!(
                 "; live lock re-solved {} leg(s), worst residual {:.1} mm",
                 self.live_frames,
@@ -478,7 +483,27 @@ pub fn apply_with_locks(
     // and re-solves the legs with its own two-bone solver, so a stance whose
     // detection flickered is still held still frame to frame.
     if settings.foot && contacts && settings.live_lock {
+        // Judge the live lock on its own. It is the only pass here that decides
+        // contact timing causally, so on a clip whose detection it disagrees with
+        // it can add twitch — and until now that twitch threw away *every* other
+        // pass with it. That is what made "lock on" and "lock off" look identical:
+        // the gate discarded the whole solve instead of this one stage.
+        let poses_before_live = clip.poses.clone();
+        let skeletons_before_live = clip.skeletons.clone();
+        let jitter_before_live = quality(&clip.skeletons, settings.floor).jitter;
         live_foot_lock(sole.as_ref(), clip, body, settings, &mut report);
+        clip.skeletons = clip
+            .poses
+            .iter()
+            .map(|pose| body.forward_joints(pose))
+            .collect();
+        let jitter_after_live = quality(&clip.skeletons, settings.floor).jitter;
+        if jitter_before_live > 0.0 && jitter_after_live > jitter_before_live * 1.5 + 0.003 {
+            clip.poses = poses_before_live;
+            clip.skeletons = skeletons_before_live;
+            report.live_rolled_back = true;
+            report.live_frames = 0;
+        }
     }
 
     clip.skeletons = clip
@@ -2079,16 +2104,30 @@ fn rolling_anchor(
 ) -> Vec<[f32; 3]> {
     let frames = end - begin;
     let mut separations = Vec::with_capacity(frames);
-    let mut weights = Vec::with_capacity(frames);
-    let mut observed = Vec::with_capacity(frames);
+    let mut deltas = Vec::with_capacity(frames);
+    let mut points = Vec::with_capacity(frames);
     for frame in begin..end {
         let (toe_at, heel) = sole_points(sole, clip, frame, foot, ankle, toe);
-        let weight = support_weight(toe_at, heel);
         separations.push([
             heel[0] - toe_at[0],
             heel[1] - toe_at[1],
             heel[2] - toe_at[2],
         ]);
+        deltas.push(toe_at[1] - heel[1]);
+        points.push((toe_at, heel));
+    }
+    // `support_weights`: the height difference is smoothed *before* the deadband,
+    // with a gaussian of `max(0.5, fps·0.04)`. Without it, a few millimetres of
+    // sole noise per frame crosses the 5 mm deadband, the heel weight flips, and
+    // `rolling_anchor` integrates that flip as a real roll: the anchor moved
+    // 10 cm × Δw, i.e. several millimetres per frame. On `短暂.mp4` that walked a
+    // planted foot 30 mm inside its own stance, which is the "飘" that would not go
+    // away no matter how strong the pin was — the anchor itself was moving.
+    let smoothed = crate::contacts::gaussian_smooth(&deltas, (clip.fps * 0.04).max(0.5));
+    let mut weights = Vec::with_capacity(frames);
+    let mut observed = Vec::with_capacity(frames);
+    for (toe_at, heel) in points.into_iter() {
+        let weight = support_weight_from_delta(smoothed[weights.len()]);
         weights.push(weight);
         observed.push([
             toe_at[0] * (1.0 - weight) + heel[0] * weight,
@@ -2135,7 +2174,12 @@ fn sole_points(
 /// deadband keeps millimetre noise from being read as a weight transfer and the
 /// ramp saturates at 25 mm.
 fn support_weight(toe: [f32; 3], heel: [f32; 3]) -> f32 {
-    let delta = toe[1] - heel[1];
+    support_weight_from_delta(toe[1] - heel[1])
+}
+
+/// The same weight from a height difference that has already been smoothed over
+/// time, which is what `support_weights` feeds `rolling_anchor`.
+fn support_weight_from_delta(delta: f32) -> f32 {
     let x = ((delta.abs() - 0.005) / 0.02).clamp(0.0, 1.0);
     let smooth = x * x * (3.0 - 2.0 * x);
     0.5f32 + 0.5 * smooth * delta.signum()

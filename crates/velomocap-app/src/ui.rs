@@ -2534,6 +2534,7 @@ fn correction_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
                 );
             });
             ui.label(egui::RichText::new(i18n::t("Lock Preset")).size(11.0).color(MUTED));
+            let preset_before = app.correction.preset;
             egui::ComboBox::from_id_salt("lock-preset")
                 .selected_text(match app.correction.preset {
                     LockPreset::Tight => i18n::t("Tight"),
@@ -2558,6 +2559,9 @@ fn correction_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
                         i18n::t("Loose"),
                     );
                 });
+            if app.correction.preset != preset_before {
+                app.correction_dirty = true;
+            }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(i18n::t("Floor Height")).size(11.0));
@@ -2572,6 +2576,7 @@ fn correction_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
                 {
                     // The grid follows the correction floor so both agree.
                     app.floor = app.correction.floor;
+                    app.correction_dirty = true;
                 }
                 if ui
                     .add(egui::Button::new(i18n::t("Reset")).min_size(egui::vec2(44.0, 16.0)))
@@ -2589,21 +2594,38 @@ fn correction_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
                     .on_hover_text(i18n::t(
                         "Offset from the automatic pelvis height; positive gives back the reach drop, negative lowers the body",
                     ));
-                ui.add(
-                    egui::DragValue::new(&mut app.correction.pelvis_offset)
-                        .speed(0.005)
-                        .range(-0.25..=0.25)
-                        .suffix(" m"),
-                );
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut app.correction.pelvis_offset)
+                            .speed(0.005)
+                            .range(-0.25..=0.25)
+                            .suffix(" m"),
+                    )
+                    .changed()
+                {
+                    app.correction_dirty = true;
+                }
             });
             ui.add_space(4.0);
-            ui.checkbox(
-                &mut app.correction.live_lock,
-                egui::RichText::new(i18n::t("Causal Foot Lock")).size(11.0),
-            )
-            .on_hover_text(i18n::t(
-                "Hold each planted foot with the reference's live lock: 75 ms of evidence to lock, no lookahead, and a smooth hand-over when the foot lifts",
-            ));
+            if ui
+                .checkbox(
+                    &mut app.correction.live_lock,
+                    egui::RichText::new(i18n::t("Causal Foot Lock")).size(11.0),
+                )
+                .on_hover_text(i18n::t(
+                    "Hold each planted foot with the reference's live lock: 75 ms of evidence to lock, no lookahead, and a smooth hand-over when the foot lifts",
+                ))
+                .changed()
+            {
+                // This is the one setting anybody tests by eye: apply it straight
+                // away, so the viewport reloads with the new solve. Without this
+                // the checkbox only changed what the *next* capture would do, and
+                // on and off looked identical on the take already on screen.
+                app.correction_dirty = true;
+                if app.can_apply_correction() {
+                    app.apply_correction();
+                }
+            }
             ui.add_space(4.0);
             // `Apply Correction`: re-solve the contact correction on the takes
             // already generated, with these settings and the timeline's locks —
@@ -2622,15 +2644,18 @@ fn correction_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
             {
                 app.apply_correction();
             }
-            if !app.recorrect_note.is_empty() {
+            if app.correction_dirty || app.locks_dirty {
+                // The take on screen was solved with the old settings. Say it, so a
+                // setting that needs Apply Correction is never mistaken for one
+                // that did nothing.
                 ui.label(
-                    egui::RichText::new(&app.recorrect_note)
+                    egui::RichText::new(i18n::t("Settings changed — apply to update the motion"))
                         .size(9.5)
                         .color(MUTED),
                 );
-            } else if app.locks_dirty {
+            } else if !app.recorrect_note.is_empty() {
                 ui.label(
-                    egui::RichText::new(i18n::t("Locks edited — apply to update the motion"))
+                    egui::RichText::new(&app.recorrect_note)
                         .size(9.5)
                         .color(MUTED),
                 );

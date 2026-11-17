@@ -211,6 +211,7 @@ pub fn t(english: &'static str) -> &'static str {
         "Re-solve the contacts with these settings and the timeline's locks, without running the model again" => "用当前设置和时间轴上的锁定重新求解接触，不重跑模型",
         "Generate a motion first: a take loaded from a project has no saved solver input" => "先生成动作：从工程打开的 take 没有保存求解器输入",
         "Locks edited — apply to update the motion" => "锁定已改 —— 点“应用校正”生效",
+        "Settings changed — apply to update the motion" => "设置已改 —— 点“应用校正”生效",
         "Offset from the automatic pelvis height; positive gives back the reach drop, negative lowers the body" => "相对自动骨盆高度的偏移；正值只把自动压低的部分还回来，负值压低身体",
         "Pin planted feet and resting hands after the motion is generated" => "动作生成后锁定着地的脚和静止的手",
         "Reconstruct this person when the run starts" => "开始重建时包含此人",

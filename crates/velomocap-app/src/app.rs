@@ -344,6 +344,18 @@ pub struct VeloMocap {
         pub flow: Vec<FlowBody>,
         pub smplh_faces: Option<Arc<Vec<[u32; 3]>>>,
         pub flow_note: String,
+    /// Whether the flow of the running capture has been taken into `flow`.
+    ///
+    /// The capture job keeps its result in the shared state for the rest of the
+    /// session, and `poll_capture` reads it on every paint. Adopting it more than
+    /// once meant "Apply Correction" was undone 16 ms after it landed: the
+    /// re-solved frames differed from the snapshot, the "fresh" test fired, and
+    /// the take went back to the pre-correction bake. That is why the lock read
+    /// as "on and off are the same" — both were the capture-time result.
+    flow_adopted: bool,
+    /// Set when a correction setting changed, so the panel can say the motion on
+    /// screen is the old solve until Apply Correction runs.
+    pub correction_dirty: bool,
     pub selected: usize,
         pub floor: f32,
     pub capture_fps: f64,
@@ -551,6 +563,8 @@ impl VeloMocap {
             flow: Vec::new(),
             smplh_faces: None,
             flow_note: String::new(),
+            flow_adopted: false,
+            correction_dirty: false,
             selected: 0,
             floor: 0.0,
             capture_fps: 0.0,
@@ -1993,6 +2007,11 @@ impl VeloMocap {
         self.playhead = 0;
         self.playing = false;
         self.orbit.framed = false;
+        // A new run has its own result: the previous take must not survive it, and
+        // the new one has to be adopted exactly once when it lands.
+        self.flow_adopted = false;
+        self.correction_dirty = false;
+        self.flow.clear();
                 let seeds: Vec<[f32; 4]> = self
             .candidates
             .iter()
@@ -2177,6 +2196,13 @@ impl VeloMocap {
                 rebuilt.name, elapsed, rebuilt.summary
             ));
         }
+        // The re-solved frames are the take now: never let the capture snapshot
+        // overwrite them (see `flow_adopted`), and redraw at once so the viewport
+        // visibly reloads instead of waiting for the transport's next tick.
+        self.flow_adopted = true;
+        self.correction_dirty = false;
+        self.log("viewport reloaded with the re-solved take".to_string());
+        ctx.request_repaint();
         self.recorrect_note = format!(
             "{} {:.1} s",
             i18n::t("Correction applied in"),
@@ -2424,14 +2450,15 @@ impl VeloMocap {
         if was_live && !running {
             self.stream.invalidate();
         }
-        if !flow.is_empty() {
-            let fresh = self.flow.len() != flow.len()
-                || self
-                    .flow
-                    .iter()
-                    .zip(flow.iter())
-                    .any(|(old, new)| !Arc::ptr_eq(&old.frames, &new.frames));
-            if fresh {
+        if !flow.is_empty() && !self.flow_adopted {
+            // Adopt the job's result **once**. This used to re-adopt whenever the
+            // take differed from the snapshot, which is exactly what an "Apply
+            // Correction" result looks like: the re-solved frames replaced the
+            // take, the next paint saw them differ, and the pre-correction bake
+            // went back on screen 16 ms later. That is why the foot lock read as
+            // "on and off are the same": both were the capture-time solve.
+            self.flow_adopted = true;
+            {
                 for clip in &flow {
                     self.log(format!("FlowHMR {}: {}", clip.name, clip.summary));
                 }
@@ -2453,6 +2480,7 @@ impl VeloMocap {
                 // The run that just landed used these locks, so the timeline no
                 // longer needs to ask for another one.
                 self.locks_dirty = false;
+                self.correction_dirty = false;
             }
         }
         if let Some(faces) = smplh_faces {
