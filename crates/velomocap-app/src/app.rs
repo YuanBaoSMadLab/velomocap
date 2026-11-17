@@ -2050,7 +2050,15 @@ impl VeloMocap {
     /// needs the generated motion, not the baked one — regenerating is the only
     /// way for those.
     pub fn can_apply_correction(&self) -> bool {
-        self.capture.is_none()
+        // A *finished* capture is not a running one. This used to say
+        // `self.capture.is_none()`, and the finished job is never dropped, so the
+        // button stayed disabled for the rest of the session: a take could be
+        // generated but never re-solved with other settings.
+        let capture_idle = self
+            .capture
+            .as_ref()
+            .map_or(true, |job| !job.is_running());
+        capture_idle
             && self.recorrect.is_none()
             && self.flow.iter().any(|take| take.source.is_some())
     }
@@ -2542,6 +2550,11 @@ impl VeloMocap {
             // rate so the bars move and the window stays usable. It used to ask
             // for a frame every 120 ms, which made the whole UI feel blocked.
             ctx.request_repaint_after(Duration::from_millis(16));
+        }
+        // Let the job go once it has finished: everything it produced has been
+        // folded in above, and holding it kept `can_apply_correction` false.
+        if finished && !running {
+            self.capture = None;
         }
     }
         fn sync_people(&mut self, snapshot: &[velomocap_motion::PersonTrack]) {
