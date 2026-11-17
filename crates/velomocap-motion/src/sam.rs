@@ -44,6 +44,13 @@ pub struct SamConfig {
     /// Tracks shorter than this are dropped.
     pub min_hits: usize,
     /// Frames a track may coast without a detection.
+    ///
+    /// The reference's ByteTrack runs `track_buffer=60` (`person_tracking.py`) and
+    /// `with_reid`, i.e. two seconds at 30 fps, and that is what keeps a body
+    /// across a doorway/occlusion. Ours coasted 8 frames (0.27 s), so any longer
+    /// dropout ended the track: the 24 fps source — resampled to 30 fps, where a
+    /// blurred source frame becomes one and a quarter output frames — lost the
+    /// person near the end, the take stopped there, and the viewport went empty.
     pub max_missing: usize,
     /// Prefer the CUDA execution provider.
     pub gpu: bool,
@@ -77,7 +84,7 @@ impl Default for SamConfig {
             work_width: 960,
             max_frames: 0,
             min_hits: 3,
-            max_missing: 8,
+            max_missing: 60,
             gpu: true,
             max_people: 16,
             min_box_height: 0.12,
