@@ -359,6 +359,22 @@ fn person_box(bbox: [f32; 4]) -> ([f32; 2], [f32; 2]) {
 }
 
 /// The full loop, with hooks for the UI.
+/// IoU of a detection with a plain box: the "is this the same body?" test used to
+/// follow a picked person across a track-id change.
+fn overlap(a: &Detection, b: [f32; 4]) -> f32 {
+    let x0 = a.x0.max(b[0]);
+    let y0 = a.y0.max(b[1]);
+    let x1 = a.x1.min(b[2]);
+    let y1 = a.y1.min(b[3]);
+    let inter = (x1 - x0).max(0.0) * (y1 - y0).max(0.0);
+    let union = a.area() + (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0) - inter;
+    if union <= 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
+}
+
 pub fn capture_people_with(
     video: impl AsRef<Path>,
     config: &SamConfig,
@@ -474,6 +490,11 @@ pub fn capture_people_with(
     let mut meshes_stored = 0usize;
     let mut dropped_meshes = 0usize;
     let mut decoded = 0usize;
+    // The last box the picked person was seen in. A dropout longer than
+    // `max_missing` gives the same body a new track id, and following the *id*
+    // alone ends the take where the id changed: the viewport then has no frames
+    // to draw and the character disappears while the video still moves.
+    let mut last_box: Option<[f32; 4]> = None;
 
     while let Some(frame) = decoder.next_frame()? {
         if (hooks.cancelled)() {
@@ -492,19 +513,6 @@ pub fn capture_people_with(
         // Restrict to the people the user picked: on the first frame keep only
         // detections that overlap a seed box, then only those track ids.
         if !config.seed_boxes.is_empty() && index == 0 {
-            let overlap = |a: &Detection, b: [f32; 4]| -> f32 {
-                let x0 = a.x0.max(b[0]);
-                let y0 = a.y0.max(b[1]);
-                let x1 = a.x1.min(b[2]);
-                let y1 = a.y1.min(b[3]);
-                let inter = (x1 - x0).max(0.0) * (y1 - y0).max(0.0);
-                let union = a.area() + (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0) - inter;
-                if union <= 0.0 {
-                    0.0
-                } else {
-                    inter / union
-                }
-            };
             seeded_ids = tracker
                 .tracks
                 .iter()
@@ -541,7 +549,38 @@ pub fn capture_people_with(
             .tracks
             .iter()
             .filter(|track| track.missing <= config.max_missing)
-            .filter(|track| config.seed_boxes.is_empty() || seeded_ids.contains(&track.id))
+            .filter(|track| {
+                if config.seed_boxes.is_empty() || seeded_ids.contains(&track.id) {
+                    return true;
+                }
+                // Same body, new id: accept it when it continues the box the person
+                // was last seen in — overlapping it, or with its centre within
+                // about half a body of it (the box moves while the track was lost).
+                let Some(previous) = last_box else {
+                    return false;
+                };
+                track
+                    .boxes
+                    .get(index)
+                    .and_then(|slot| *slot)
+                    .map_or(false, |detection| {
+                        let center = [
+                            0.5 * (detection.x0 + detection.x1),
+                            0.5 * (detection.y0 + detection.y1),
+                        ];
+                        let before = [
+                            0.5 * (previous[0] + previous[2]),
+                            0.5 * (previous[1] + previous[3]),
+                        ];
+                        let scale = (previous[2] - previous[0])
+                            .max(previous[3] - previous[1])
+                            .max(1.0);
+                        let distance = ((center[0] - before[0]).powi(2)
+                            + (center[1] - before[1]).powi(2))
+                        .sqrt();
+                        distance < 0.6 * scale || overlap(&detection, previous) > 0.15
+                    })
+            })
             .filter_map(|track| {
                 track
                     .boxes
@@ -559,6 +598,19 @@ pub fn capture_people_with(
             detection.height() >= config.min_box_height * frame.height as f32
         });
         candidates.truncate(config.max_people);
+
+        // Follow the body, not the id: adopt whichever track continues the box the
+        // person was last seen in, so a re-detection after a dropout keeps the take
+        // going instead of ending it (which is what leaves the viewport empty while
+        // the video still moves).
+        if !config.seed_boxes.is_empty() {
+            if let Some((id, detection)) = candidates.first() {
+                if !seeded_ids.contains(id) {
+                    seeded_ids.push(*id);
+                }
+                last_box = Some([detection.x0, detection.y0, detection.x1, detection.y1]);
+            }
+        }
 
         for (track_id, detection) in candidates {
             (hooks.progress)(decoded, total, "reconstructing");
