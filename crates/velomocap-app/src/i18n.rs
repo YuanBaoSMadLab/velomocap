@@ -202,6 +202,8 @@ pub fn t(english: &'static str) -> &'static str {
         "Tight" => "严格",
         "Loose" => "宽松",
         "Pelvis Offset" => "骨盆高度偏移（相对自动）",
+        "Causal Foot Lock" => "因果脚锁",
+        "Hold each planted foot with the reference's live lock: 75 ms of evidence to lock, no lookahead, and a smooth hand-over when the foot lifts" => "用参考实现的实时锁把着地脚逐帧钉住：需要 75 毫秒的着地证据才上锁、不看未来帧、抬脚时平滑过渡",
         "Apply Correction" => "应用校正",
         "Applying correction…" => "正在应用校正…",
         "Correction applied in" => "校正完成，用时",

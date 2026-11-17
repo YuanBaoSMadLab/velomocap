@@ -526,6 +526,9 @@ pub fn apply_with_locks(
     let float_helps = worst_float(&report.feet_after) <= worst_float(&report.feet_before) + 1.0;
     let helps = after.jitter <= before.jitter * 1.5
         && (!measured || (slide_helps && float_helps));
+    // A diagnostic escape hatch: seeing a rolled-back pass's own output is what
+    // tells a bad correction apart from a bad gate.
+    let helps = helps || std::env::var_os("VELOMOCAP_NO_GATE").is_some();
     if !helps && before.jitter > 0.0 {
         clip.poses = source_poses;
         clip.skeletons = source_skeletons;
@@ -1682,6 +1685,15 @@ fn live_foot_lock(
 
         // How far the pelvis has to come down for a locked foot to stay
         // reachable: the reference's `limit`, bounded to 4 cm and never positive.
+        //
+        // The reference runs this live, where nothing else plans the root height,
+        // so it has `move_root=True`. Here the root chain above (grounding, reach
+        // drop, the temporal plan) already made every contact reachable, and the
+        // second, causal correction only pushed the body down for no gain: on the
+        // serve window it lowered the pelvis 14 mm and pushed a pinned sole the
+        // same distance through the floor. `move_root=False` is the same code the
+        // reference runs when its caller passes it.
+        const MOVE_ROOT: bool = false;
         let mut reach = [0.0f64; 2];
         let mut limit = 0.0f64;
         for (side, (hip, knee, ankle, _)) in legs.iter().enumerate() {
@@ -1691,7 +1703,7 @@ fn live_foot_lock(
             let length = distance3(b, a) + distance3(c, b);
             let maximum = (length - 1e-7).min(distance3(c, a));
             reach[side] = maximum;
-            if feet[side].strength > 1e-4 {
+            if MOVE_ROOT && feet[side].strength > 1e-4 {
                 let target = sub3(targets[side], rotate3(&world[*ankle], offsets[side]));
                 let horizontal =
                     ((target[0] - a[0]).powi(2) + (target[2] - a[2]).powi(2)).sqrt();
@@ -1703,7 +1715,7 @@ fn live_foot_lock(
             }
         }
         // Critically damped, bounded pelvis compensation. It cannot oscillate.
-        let goal = limit.max(-0.04);
+        let goal = if MOVE_ROOT { limit.max(-0.04) } else { 0.0 };
         let omega = 12.0;
         let decay = (-omega * dt).exp();
         let x = shift - goal;
@@ -1870,25 +1882,34 @@ fn apply_leg_pin(
             // through a 50 ms one-pole before applying it. That is why its live
             // feet look rock solid while a per-frame analytic solve trembles: the
             // solve chases a noisy target, the filter does not.
+            //
+            // The filter holds the **delta from the source pose**, not the
+            // absolute angle. Filtering absolute angles made a new stance inherit
+            // the previous stance's angles and blend toward them over several
+            // frames — the foot flew 35 cm away and drifted back (the serve clip's
+            // 479 mm jitter spike), because a stale absolute angle is a whole limb
+            // position, while a stale delta is a few degrees.
             for (joint, slot) in [(hip, 0usize), (knee, 1)] {
                 let at = (joint - 1) * 3;
-                let solved_angles = [
-                    clip.poses[index].body[at],
-                    clip.poses[index].body[at + 1],
-                    clip.poses[index].body[at + 2],
+                let solved_angles = clip.poses[index].joint(joint);
+                let base = source.joint(joint);
+                let delta = [
+                    solved_angles[0] - base[0],
+                    solved_angles[1] - base[1],
+                    solved_angles[2] - base[2],
                 ];
                 let previous = if slot == 0 { filter.hip } else { filter.knee };
                 let blended = match previous {
                     Some(previous) => [
-                        previous[0] + (solved_angles[0] - previous[0]) * alpha,
-                        previous[1] + (solved_angles[1] - previous[1]) * alpha,
-                        previous[2] + (solved_angles[2] - previous[2]) * alpha,
+                        previous[0] + (delta[0] - previous[0]) * alpha,
+                        previous[1] + (delta[1] - previous[1]) * alpha,
+                        previous[2] + (delta[2] - previous[2]) * alpha,
                     ],
-                    None => solved_angles,
+                    None => delta,
                 };
-                clip.poses[index].body[at] = blended[0];
-                clip.poses[index].body[at + 1] = blended[1];
-                clip.poses[index].body[at + 2] = blended[2];
+                clip.poses[index].body[at] = base[0] + blended[0];
+                clip.poses[index].body[at + 1] = base[1] + blended[1];
+                clip.poses[index].body[at + 2] = base[2] + blended[2];
                 if slot == 0 {
                     filter.hip = Some(blended);
                 } else {

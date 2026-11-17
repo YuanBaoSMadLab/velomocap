@@ -2597,6 +2597,14 @@ fn correction_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
                 );
             });
             ui.add_space(4.0);
+            ui.checkbox(
+                &mut app.correction.live_lock,
+                egui::RichText::new(i18n::t("Causal Foot Lock")).size(11.0),
+            )
+            .on_hover_text(i18n::t(
+                "Hold each planted foot with the reference's live lock: 75 ms of evidence to lock, no lookahead, and a smooth hand-over when the foot lifts",
+            ));
+            ui.add_space(4.0);
             // `Apply Correction`: re-solve the contact correction on the takes
             // already generated, with these settings and the timeline's locks —
             // no inference. The reference puts the same button here.
