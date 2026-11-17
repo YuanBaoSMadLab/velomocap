@@ -566,8 +566,23 @@ pub fn apply_with_locks(
     // float from 13.5 mm to 3.2 mm (`短暂.mp4`, 105 frames). The absolute slack is
     // the part of the promise that matters: "no more than a millimetre or so of
     // extra twitch", not "no more than 50 % of a tiny number".
-    let helps = after.jitter <= before.jitter * 1.5 + 0.003
-        && (!measured || (slide_helps && float_helps));
+    //
+    // A pass that puts a floating foot on the floor is not "extra twitch", though,
+    // whatever the *leg* accelerations say: the legs have to move to hold a foot
+    // still, so their second difference rising is the price of the lock, not noise.
+    // `2月27日.mp4` is the case that proved it — float 50.0 mm -> 0.7 mm, slide
+    // 0.29 -> 0.06 cm/frame, and the pass was thrown away because the knees, which
+    // now do the holding, went from 22.6 mm to 56.9 mm of second difference. The
+    // user then saw the untouched network motion and reported "the feet shake and
+    // the correction does nothing" — exactly what a discarded pass looks like.
+    let big_sole_gain = measured
+        && worst_float(&report.feet_after) * 4.0 <= worst_float(&report.feet_before)
+        && worst_slide(&report.feet_after) <= worst_slide(&report.feet_before) * 0.5;
+    let jitter_helps = after.jitter <= before.jitter * 1.5 + 0.003
+        // Even a big sole gain may not turn the body into a windmill: the ceiling
+        // is 3x, and the knee spikes on that clip (2.5x) sit under it.
+        || (big_sole_gain && after.jitter <= before.jitter * 3.0);
+    let helps = jitter_helps && (!measured || (slide_helps && float_helps));
     // A diagnostic escape hatch: seeing a rolled-back pass's own output is what
     // tells a bad correction apart from a bad gate.
     let helps = helps || std::env::var_os("VELOMOCAP_NO_GATE").is_some();
