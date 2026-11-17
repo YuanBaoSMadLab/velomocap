@@ -358,6 +358,9 @@ enum Command {
         /// Correction mode: `flat` or `multi` (`--lock-mode` in `flow`).
         #[arg(long, default_value = "flat")]
         lock_mode: String,
+        /// Lock preset: tight, normal or loose (`--lock-preset` in `flow`).
+        #[arg(long, default_value = "normal")]
+        lock_preset: String,
     },
     /// Run the SAM 3D Body TorchScript module through LibTorch.
     SamTorch {
@@ -590,6 +593,7 @@ fn main() -> Result<()> {
             live_lock,
             joint_sole,
             lock_mode,
+            lock_preset,
         } => replay_clip(
             &joints,
             &rotations,
@@ -609,6 +613,7 @@ fn main() -> Result<()> {
                 live_lock,
                 joint_sole,
                 lock_mode: lock_mode.clone(),
+                lock_preset: lock_preset.clone(),
             },
         ),
         Command::Flow {
@@ -2848,6 +2853,8 @@ struct ReplayFlags {
     joint_sole: bool,
     /// `flat` or `multi` (`--lock-mode`), the same option `flow` takes.
     lock_mode: String,
+    /// `tight`, `normal` or `loose` (`--lock-preset`), the same option `flow` takes.
+    lock_preset: String,
 }
 
 fn read_f32(path: &std::path::Path) -> Result<Vec<f32>> {
@@ -2995,6 +3002,11 @@ fn replay_clip(
         mode: match flags.lock_mode.as_str() {
             "multi" => velomocap_motion::correction::CorrectionMode::MultiLevel,
             _ => velomocap_motion::correction::CorrectionMode::Flat,
+        },
+        preset: match flags.lock_preset.as_str() {
+            "tight" => velomocap_motion::correction::LockPreset::Tight,
+            "loose" => velomocap_motion::correction::LockPreset::Loose,
+            _ => velomocap_motion::correction::LockPreset::Normal,
         },
         ..Default::default()
     };
