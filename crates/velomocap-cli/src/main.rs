@@ -248,8 +248,10 @@ enum Command {
         /// contact_pose_plan pass).
         #[arg(long)]
         no_pose_plan: bool,
-        /// Skip the reference's causal live foot lock (on by default; the last
-        /// pass, `pear/foot_lock.py`'s LiveFootLock).
+        /// Run the reference's causal live foot lock as a last pass
+        /// (`pear/foot_lock.py`'s LiveFootLock). Off by default: the reference
+        /// only uses it in its live preview, and on three takes it made every
+        /// sole metric worse on top of the exact contact solve.
         #[arg(long)]
         live_lock: bool,
         /// Use the skinned foot-mesh sole points as the contact source.
@@ -341,6 +343,10 @@ enum Command {
         dump_joints: Option<PathBuf>,
         #[arg(long)]
         dump_soles: Option<PathBuf>,
+        /// Temporal smoothing weight applied before the contacts (0 = off,
+        /// smaller is stronger), the same knob `flow --smooth` sets.
+        #[arg(long, default_value_t = 0.0)]
+        smooth: f64,
         #[arg(long)]
         no_correction: bool,
         #[arg(long)]
@@ -585,6 +591,7 @@ fn main() -> Result<()> {
             floor,
             dump_joints,
             dump_soles,
+            smooth,
             no_correction,
             no_foot,
             hand_lock,
@@ -612,6 +619,7 @@ fn main() -> Result<()> {
                 no_pose_plan,
                 live_lock,
                 joint_sole,
+                smooth,
                 lock_mode: lock_mode.clone(),
                 lock_preset: lock_preset.clone(),
             },
@@ -2851,6 +2859,8 @@ struct ReplayFlags {
     no_pose_plan: bool,
     live_lock: bool,
     joint_sole: bool,
+    /// Temporal smoothing weight applied before the contacts (`--smooth`).
+    smooth: f64,
     /// `flat` or `multi` (`--lock-mode`), the same option `flow` takes.
     lock_mode: String,
     /// `tight`, `normal` or `loose` (`--lock-preset`), the same option `flow` takes.
@@ -2999,6 +3009,7 @@ fn replay_clip(
         pose_plan: !flags.no_pose_plan,
         live_lock: flags.live_lock,
         mesh_sole: !flags.joint_sole,
+        smoothing: flags.smooth,
         mode: match flags.lock_mode.as_str() {
             "multi" => velomocap_motion::correction::CorrectionMode::MultiLevel,
             _ => velomocap_motion::correction::CorrectionMode::Flat,

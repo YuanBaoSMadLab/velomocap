@@ -406,6 +406,24 @@ pub fn apply(
     apply_with_locks(clip, body, settings, &crate::locks::ContactTracks::automatic())
 }
 
+/// Is this pass's improvement to the planted feet big enough that its extra leg
+/// motion must not be allowed to veto it?
+///
+/// A pass that puts a floating sole on the plane and does not make it skate is
+/// the whole point of the correction; the legs' second difference rising is the
+/// price of holding a foot still, not noise. The slide half used to demand a
+/// *halving*, which is a stricter copy of `slide_helps` and discarded the one
+/// case this exists for: `2月27日.vp` reached `float 62.2 -> 0.7 mm` with
+/// `slide 0.28 -> 0.14` and was rolled back because exactly-half is not half.
+fn sole_gain_wins(slide_before: f32, slide_after: f32, float_before: f32, float_after: f32) -> bool {
+    // `float_before > 0.0` matters: `0.0 * 4.0 <= 0.0` is true, so a clip that
+    // was already on the floor used to qualify for the escape hatch and could
+    // keep any amount of extra leg motion. There has to be float to give back.
+    float_before > 0.0
+        && float_after * 4.0 <= float_before
+        && slide_after <= slide_before * 1.05 + 0.02
+}
+
 /// Apply the correction with hand-drawn contact timing.
 ///
 /// The tracks are data, not a setting: they belong to one clip, so they travel
@@ -589,9 +607,23 @@ pub fn apply_with_locks(
     // now do the holding, went from 22.6 mm to 56.9 mm of second difference. The
     // user then saw the untouched network motion and reported "the feet shake and
     // the correction does nothing" — exactly what a discarded pass looks like.
+    // The slide half of this used to demand that the pass *halve* the slide.
+    // That is a second, stricter copy of `slide_helps` above, and it threw away
+    // the one case the escape hatch exists for: `2月27日.vp` (preset Tight, the
+    // causal live lock on, both restored from the project file) ended at
+    // `float 62.2 -> 0.7 mm` with `slide 0.28 -> 0.14 cm/frame` — half the slide,
+    // six millimetres of float left — and `0.14 <= 0.28*0.5` is only true at
+    // exactly half, so a 1.88x jitter reading rolled the whole pass back and the
+    // viewport showed the untouched network motion: feet skating at 0.28
+    // cm/frame, 6 cm above the floor. "Not worse" is the promise; "twice as
+    // good" was never it.
     let big_sole_gain = measured
-        && worst_float(&report.feet_after) * 4.0 <= worst_float(&report.feet_before)
-        && worst_slide(&report.feet_after) <= worst_slide(&report.feet_before) * 0.5;
+        && sole_gain_wins(
+            worst_slide(&report.feet_before),
+            worst_slide(&report.feet_after),
+            worst_float(&report.feet_before),
+            worst_float(&report.feet_after),
+        );
     let jitter_helps = after.jitter <= before.jitter * 1.5 + 0.003
         // Even a big sole gain may not turn the body into a windmill: the ceiling
         // is 3x, and the knee spikes on that clip (2.5x) sit under it.
@@ -1492,6 +1524,12 @@ fn leg_ik(
         (1, 4, 7, 10), // left hip, knee, ankle, toe
         (2, 5, 8, 11), // right hip, knee, ankle, toe
     ];
+    // Bounded per frame on purpose. The reference's `SolveLegs` places the ankle
+    // *at* its target with no cap, and removing ours was measured: the soles get
+    // perfect (`sink 0.0/0.0` on all three takes, `slide 0.00` on two) but the
+    // ankles pay 4 mm of extra shake (`2月27日` 34.7 -> 38.4 mm, `短暂` 34.0 ->
+    // 38.1) with the slide unchanged. The cap is the better trade: a sole 3 mm
+    // under the plane reads as planted, an ankle shaking 4 mm more does not.
     let cap = thresholds.max_correction.min(0.05) as f64;
     // One lookup per clip instead of one per frame inside the pin loops.
     let debug_pins = std::env::var_os("VELOMOCAP_DEBUG_PIN").is_some();
@@ -2719,6 +2757,13 @@ fn foot_lock(
 /// These frames are **not** contacts: `support` stays stance-only, so the
 /// grounding, the reach passes and the foot metrics never see them.
 fn add_transitions(pass: &mut FootPass, clip: &FlowClip, detection: &Detection) {
+    // Diagnostic escape hatch: a release hand-off exists to unwind a stance's
+    // residual instead of dropping it at the contact edge, but it also drags a
+    // swinging ankle by whatever that residual was. Turning it off says which
+    // of the two the clip is paying for.
+    if std::env::var_os("VELOMOCAP_NO_HANDOFF").is_some() {
+        return;
+    }
     let count = clip.skeletons.len();
     if count < 3 {
         return;
@@ -4421,6 +4466,24 @@ mod tests {
             lifted.update([0.0, 0.08, 0.0], dt, 0.0, true);
         }
         assert!(!lifted.locked, "a foot lifted to 80 mm is not a contact");
+    }
+
+    /// The rule that decides whether a big improvement to the planted feet may
+    /// keep its extra leg motion. Written against the numbers that got it wrong:
+    /// `2月27日.vp` improved the float from 62.2 mm to 0.7 mm, was rolled back
+    /// because the slide only halved, and the viewport showed the raw motion.
+    #[test]
+    fn a_halved_slide_still_counts_as_a_gain() {
+        assert!(sole_gain_wins(0.28, 0.14, 62.2, 0.7), "the case that failed");
+        // The same pass with the slide left where it was is still a gain: it did
+        // not make the foot skate.
+        assert!(sole_gain_wins(0.28, 0.28, 62.2, 0.7));
+        // A pass that trades the float for skating is not a gain.
+        assert!(!sole_gain_wins(0.28, 0.45, 62.2, 0.7));
+        // Nor is one that barely moved the float.
+        assert!(!sole_gain_wins(0.28, 0.10, 62.2, 40.0));
+        // A clip with no float to begin with cannot claim the escape hatch.
+        assert!(!sole_gain_wins(0.02, 0.01, 0.0, 0.0));
     }
 }
 

@@ -1878,6 +1878,18 @@ impl VeloMocap {
 
         let settings = &document.settings;
         self.correction = settings.correction;
+        // A saved project must not resurrect the causal live lock. It was the
+        // default when `2月27日.vp` was written, and it is the one pass we have
+        // measured as harmful: on top of the exact contact solve it dragged the
+        // slide from 0.08 to 0.14 cm/frame, which broke the rollback gate's
+        // "did the sole get much better" test and made the whole correction be
+        // discarded — the project's take is still the raw network motion
+        // (`float 62.2 -> 0.7` computed, then rolled back). The reference only
+        // runs this pass in its live preview, never in its batch correction.
+        if self.correction.live_lock {
+            self.correction.live_lock = false;
+            self.log("project: the saved causal live lock is ignored — it is a live-preview pass and it is not part of a batch correction");
+        }
         self.estimate_camera = settings.estimate_camera;
         self.refine_camera = settings.refine_camera;
         self.confidence = settings.confidence;
