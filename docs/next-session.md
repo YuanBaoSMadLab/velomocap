@@ -252,3 +252,24 @@ root 0.842–1.057 m（跳还在），ankle shake 47.5→48.4（几乎不加）�
   正则只是在跟输入较劲。
 - **留下的是**：规划自己拥有交接帧目标高度 + 参考的离地间隙项（自由脚被抬出地面而不是埋进去），
   以及 `angle − phase·extension` 的状态定义。变量与掩码都已就位，只是当前 `movable=false`。
+
+## 11. 2026-11-17 晚：对照原项目审计 —— 这次是整段被闸门丢了
+
+完整报告见 [foot-lock-audit.md](foot-lock-audit.md)。要点：
+
+- `2月27日.vp`（17:57，Tight，`live_lock: true`）里保存的 take **就是原始动作**：
+  summary 明写 `(rolled back by jitter: float 62.2->0.7 mm, slide 0.28->0.14,
+  jitter 21.6->40.7 mm)`，且 feet before == after（float 62.2/57.8 mm）。
+- 丢掉的原因：`big_sole_gain` 要求 slide 至少减半（`0.28*0.5 = 0.14`），
+  而工程里带的因果脚锁把 slide 从 0.08 拖到 0.14，正好卡在边界 → 大 float
+  收益被 jitter 1.88 倍否掉。参考批处理既没有这道闸门，也没有因果脚锁。
+- 工程文件会把 `live_lock=true` 带回来（`project.rs:474` / `app.rs:1886`），
+  即使代码默认已关。
+- 另两处真实差异：每帧 IK 多了参考没有的 `reach_falloff` 权重和 5 cm 截断
+  （`correction.rs:1495/1526/1594`）；导入角色（本工程是 `vrm.vrm`）没有参考
+  `retarget/` 那一级的目标骨架脚重锚（foot_calibration / polish_feet / stabilize）。
+- 锁住之后腿仍动是几何必然：脚底钉死、踝世界朝向保留源旋转，源脚踝 pitch
+  二阶差分 p99 4.6°，踝/膝必须反向补偿（实测 ankle shake 26.9→42.9 mm）。
+  `短暂.vp` 的中位数是 0.13 mm / 0.5°，尖峰只在 stance 进出的 1–2 帧。
+- 已加两个只读工具：`probe/vp_inspect.py`（直接量 .vp 的脚/踝/膝）和
+  `probe/vp_dump.py`（把 .vp 抽成 `replay` 的 dump，免推理 A/B）。

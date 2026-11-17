@@ -810,13 +810,7 @@ impl VeloMocap {
         // specific run's settings and numbers, and it has to be readable
         // afterwards. `log_file_path` says where it goes.
         if let Some(path) = log_file_path() {
-            if std::fs::metadata(&path).map(|meta| meta.len() > 4 * 1024 * 1024).unwrap_or(false) {
-                let _ = std::fs::remove_file(&path);
-            }
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                use std::io::Write;
-                let _ = writeln!(file, "{stamp}{message}");
-            }
+            append_log_line(&path, &format!("{stamp}{message}"));
         }
     }
     /// Import a humanoid character (VRM / GLB) for one person: its own skeleton
@@ -2986,6 +2980,28 @@ pub fn log_file_path() -> Option<PathBuf> {
     Some(folder.join("velomocap.log"))
 }
 
+/// Append one line to the log file, dropping a file that has grown past 4 MB.
+///
+/// Split out of `log` so the file side can be tested without a whole app: the
+/// only way this feature fails is silently, and a silent log is worse than no
+/// log at all, because an empty file reads like a run that did nothing.
+fn append_log_line(path: &std::path::Path, line: &str) {
+    if std::fs::metadata(path)
+        .map(|meta| meta.len() > 4 * 1024 * 1024)
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_file(path);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 /// One line that says exactly what the correction was asked to do.
 ///
 /// A report without the settings that produced it is unreadable a day later:
@@ -3209,7 +3225,7 @@ impl eframe::App for VeloMocap {
     }}
 #[cfg(test)]
 mod tests {
-    use super::playback_frame;
+    use super::{append_log_line, correction_line, playback_frame};
 
     /// One frame per 1/fps second, starting from the anchor.
     #[test]
@@ -3243,6 +3259,58 @@ mod tests {
         assert_eq!(playback_frame(0, 1.0, 0.0, 0.0, 0), 0);
         assert_eq!(playback_frame(5, 0.0, 30.0, 1.0, 1), 0);
         assert_eq!(playback_frame(5, f64::NAN, 30.0, 1.0, 10), 5);
+    }
+
+    /// The log has to exist on disk after the fact, and appending has to add
+    /// lines rather than replace the file: a run's report is only useful if the
+    /// previous run is still above it.
+    #[test]
+    fn the_log_file_keeps_every_line() {
+        let path = std::env::temp_dir().join(format!("velomocap-log-test-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        append_log_line(&path, "[10:00:00] first run");
+        append_log_line(&path, "[10:05:00] feet: slide 0.03/0.05 cm/frame");
+        let text = std::fs::read_to_string(&path).expect("log file");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(lines[0].contains("first run"), "{text}");
+        assert!(lines[1].contains("slide"), "{text}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A 4 MB log is dropped rather than appended to forever: the point of the
+    /// file is the last session, not the whole history of the machine.
+    #[test]
+    fn a_full_log_file_is_replaced() {
+        let path = std::env::temp_dir().join(format!("velomocap-log-full-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, vec![b'x'; 4 * 1024 * 1024 + 1]).expect("big log");
+        append_log_line(&path, "fresh");
+        let text = std::fs::read_to_string(&path).expect("log file");
+        assert_eq!(text, "fresh\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The session header must name the switches that decide behaviour. A report
+    /// you cannot tell apart from "the pass never ran" is what made the last
+    /// round of numbers ambiguous.
+    #[test]
+    fn the_settings_line_names_the_switches() {
+        let mut settings = velomocap_motion::correction::CorrectionSettings::default();
+        let line = correction_line(&settings);
+        for needle in [
+            "enabled", "mode=flat", "foot=true", "preset=normal", "leg_ik=true",
+            "pose_plan=true", "live_lock=false",
+        ] {
+            assert!(line.contains(needle), "{needle} missing from {line}");
+        }
+        settings.live_lock = true;
+        settings.foot = false;
+        settings.preset = velomocap_motion::correction::LockPreset::Loose;
+        let line = correction_line(&settings);
+        assert!(line.contains("live_lock=true"), "{line}");
+        assert!(line.contains("foot=false"), "{line}");
+        assert!(line.contains("preset=loose"), "{line}");
     }
 }
 
