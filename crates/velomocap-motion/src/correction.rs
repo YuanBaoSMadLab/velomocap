@@ -269,6 +269,10 @@ pub struct CorrectionReport {
     /// Joint-based slide before and after the pass, cm per frame.
     pub slide_before: f32,
     pub slide_after: f32,
+    /// 99th percentile of the ankles' and toes' second difference, in metres,
+    /// before and after the pass: the number that matches "the feet shake".
+    pub ankle_before: f32,
+    pub ankle_after: f32,
     /// No foot contact was detected at all, so the correction was skipped and the
     /// clip is the source unchanged (`flow_correction.py`'s `contacts == 0`).
     pub no_contacts: bool,
@@ -328,8 +332,7 @@ impl CorrectionReport {
                 self.live_residual * 1000.0
             ));
         }
-        if self.root_jitter_before > 0.0 {
-            out.push_str(&format!(
+        if self.root_jitter_before > 0.0 {            out.push_str(&format!(
                 " (root {:.1}->{:.1} mm)",
                 self.root_jitter_before * 1000.0,
                 self.root_jitter_after * 1000.0
@@ -367,6 +370,13 @@ impl CorrectionReport {
             out.push_str(&crate::metrics::FootMetrics::delta_line(
                 &self.feet_before,
                 &self.feet_after,
+            ));
+        }
+        if self.ankle_before > 0.0 {
+            out.push_str(&format!(
+                ", ankle shake {:.1}->{:.1} mm",
+                self.ankle_before * 1000.0,
+                self.ankle_after * 1000.0
             ));
         }
         out
@@ -524,6 +534,8 @@ pub fn apply_with_locks(
     let after = quality(&clip.skeletons, settings.floor);
     report.jitter_before = before.jitter;
     report.jitter_after = after.jitter;
+    report.ankle_before = ankle_shake(&source_skeletons);
+    report.ankle_after = ankle_shake(&clip.skeletons);
     report.root_jitter_before = before.root;
     report.root_jitter_after = after.root;
     // The gate reads the **sole** metrics, the ones a viewer sees: a pass that
@@ -673,21 +685,37 @@ pub fn pose_jitter(skeletons: &[Skeleton]) -> f32 {
 }
 
 fn jitter_score(skeletons: &[Skeleton]) -> f32 {
+    jitter_score_of(skeletons, &CORRECTION_JOINTS)
+}
+
+/// The same 99th percentile over the ankles and toes only.
+///
+/// "The feet are shaking" and "the clip is jumpy" are different complaints, and
+/// the whole-body number hides the first one behind whatever the arms do. This is
+/// the number that answers the foot question, and it sits next to the float and
+/// slide in the report so a take can be judged without a dump.
+pub fn ankle_shake(skeletons: &[Skeleton]) -> f32 {
+    jitter_score_of(skeletons, &ANKLE_JOINTS)
+}
+
+const ANKLE_JOINTS: [usize; 4] = [7, 8, 10, 11];
+
+fn jitter_score_of(skeletons: &[Skeleton], joints_of_interest: &[usize]) -> f32 {
     let count = skeletons.len();
     if count < 3 {
         return 0.0;
     }
-    let mut values = Vec::with_capacity((count - 2) * CORRECTION_JOINTS.len());
+    let mut values = Vec::with_capacity((count - 2) * joints_of_interest.len());
     for frame in 1..count - 1 {
         let previous = &skeletons[frame - 1].positions;
         let current = &skeletons[frame].positions;
         let next = &skeletons[frame + 1].positions;
         let joints = current.len() / 3;
-        for joint in CORRECTION_JOINTS {
-            if joint >= joints {
+        for joint in joints_of_interest {
+            if *joint >= joints {
                 continue;
             }
-            let second = second_difference(previous, current, next, joint);
+            let second = second_difference(previous, current, next, *joint);
             values.push(
                 (second[0] * second[0] + second[1] * second[1] + second[2] * second[2]).sqrt(),
             );
@@ -1315,14 +1343,20 @@ fn couple_anchor_offsets(
     adjustment
 }
 
-/// Kimodo's `TargetReachFalloff`: a Gaussian that fades the IK weight out as the
-/// target approaches the limit of what the two bones can reach, so the solver
-/// never straightens a limb into a locked pose.
+/// The reference's reach gain: `1/(1+(reach_gap/.03)^4)`, with the gap in metres
+/// and **only the shortfall counted** (`contact_arm_plan.py:92`).
+///
+/// This used to be a Gaussian over the last 1 % of the leg's reach, which is a
+/// different curve in the only place it matters: 1 cm short of full extension the
+/// reference still holds the pin at 0.99, while the old form was already down to
+/// 0.16. A standing actor keeps the support leg at 98.7–99.4 % of its reach, i.e.
+/// 5–13 mm short — exactly inside the band the old curve deleted. The pin was
+/// therefore weakest in the pose people judge the feet in, and the network's own
+/// drift kept a third of its speed. Measured on `短暂.mp4`: 1.6 mm/frame of sole
+/// slide with the old curve.
 fn reach_falloff(target: [f64; 3], hip: [f64; 3], max_reach: f64) -> f64 {
-    let distance = distance3(target, hip);
-    let mut t = (distance / max_reach.max(1e-6) - 0.99).max(0.0) / 0.01;
-    t *= t;
-    (-2.0 * t * t).exp()
+    let gap = (distance3(target, hip) - max_reach).max(0.0) / 0.03;
+    1.0 / (1.0 + gap.powi(4))
 }
 
 /// Leg IK on the contact frames, ported from `DoContactIK`'s two-bone branch:
@@ -1352,7 +1386,6 @@ fn leg_ik(
     let cap = thresholds.max_correction.min(0.05) as f64;
     // 1 - exp(-dt/0.05): the reference's 50 ms one-pole on the applied
     // correction (pear/foot_lock.py::smooth_correction).
-    let alpha = (1.0 - (-(1.0 / fps as f64) / 0.05).exp()) as f32;
     for (foot_index, (hip, knee, ankle, toe)) in legs.into_iter().enumerate() {
         // Bone lengths from the rest pose: the reach limit for the falloff.
         let thigh = distance3(
@@ -1371,7 +1404,6 @@ fn leg_ik(
         };
 
         // Per foot, the applied correction is filtered across frames.
-        let mut filter = PinFilter::default();
         // The same runs the root pass holds on: contact timing resolved once.
         for (begin, end) in foot_runs(&foot.support, foot_index) {
             // Same rolling anchor the root pass uses, so the leg IK and the root
@@ -1384,7 +1416,15 @@ fn leg_ik(
                 .enumerate()
                 .map(|(offset, index)| {
                     let current = joint(&clip.skeletons[index], ankle);
-                    let sole_at = support_point(sole, clip, index, foot_index, ankle, toe);
+                    let sole_at = support_point_with(
+                        sole,
+                        clip,
+                        index,
+                        foot_index,
+                        ankle,
+                        toe,
+                        foot.weights[index][foot_index],
+                    );
                     let hip_pos = joint(&clip.skeletons[index], hip);
                     let target = contact_target(anchors[offset], sole_at, current, 1.0);
                     let hip_f = [hip_pos[0] as f64, hip_pos[1] as f64, hip_pos[2] as f64];
@@ -1397,7 +1437,15 @@ fn leg_ik(
             let weights = smooth_weights(&raw_weights, fps);
             for (offset, index) in (begin..end).enumerate() {
                 let current = joint(&clip.skeletons[index], ankle);
-                let sole_at = support_point(sole, clip, index, foot_index, ankle, toe);
+                let sole_at = support_point_with(
+                    sole,
+                    clip,
+                    index,
+                    foot_index,
+                    ankle,
+                    toe,
+                    foot.weights[index][foot_index],
+                );
                 let hip_pos = joint(&clip.skeletons[index], hip);
                 // Move the ankle so that the sole's support point lands back on
                 // the anchor; the ankle itself is free to slide over it. The hold
@@ -1443,7 +1491,7 @@ fn leg_ik(
                     continue;
                 }
                 apply_leg_pin(
-                    body, clip, &rest, hip, knee, ankle, index, target, weight, cap, alpha, &mut filter,
+                    body, clip, &rest, hip, knee, ankle, index, target, weight, cap,
                     report,
                 );
             }
@@ -1476,7 +1524,7 @@ fn leg_ik(
                 continue;
             }
             apply_leg_pin(
-                body, clip, &rest, hip, knee, ankle, index, target, weight, cap, alpha, &mut filter,
+                body, clip, &rest, hip, knee, ankle, index, target, weight, cap,
                 report,
             );
         }
@@ -1846,13 +1894,6 @@ fn live_foot_lock(
 /// still holds. The displacement is weighted and capped **before** the solve, so
 /// the cap is what the solve is asked for — not a number computed and ignored.
 #[allow(clippy::too_many_arguments)]
-/// Last applied hip/knee angles of one leg, for the one-pole filter below.
-#[derive(Clone, Copy, Default)]
-struct PinFilter {
-    hip: Option<[f32; 3]>,
-    knee: Option<[f32; 3]>,
-}
-
 fn apply_leg_pin(
     body: &BodyModel,
     clip: &mut FlowClip,
@@ -1864,8 +1905,6 @@ fn apply_leg_pin(
     target: [f64; 3],
     weight: f32,
     cap: f64,
-    alpha: f32,
-    filter: &mut PinFilter,
     report: &mut CorrectionReport,
 ) {
     let current = joint(&clip.skeletons[index], ankle);
@@ -1907,45 +1946,23 @@ fn apply_leg_pin(
         // An off-axis knee would mean the anatomical constraint broke: keep the
         // source pose rather than ship it.
         if anatomy.off_axis_deg < 1e-4 {
-            // `pear/foot_lock.py::smooth_correction`: the applied correction, not
-            // the solve, is what the viewer sees, and the reference runs *that*
-            // through a 50 ms one-pole before applying it. That is why its live
-            // feet look rock solid while a per-frame analytic solve trembles: the
-            // solve chases a noisy target, the filter does not.
+            // The solve is applied **as solved**.
             //
-            // The filter holds the **delta from the source pose**, not the
-            // absolute angle. Filtering absolute angles made a new stance inherit
-            // the previous stance's angles and blend toward them over several
-            // frames — the foot flew 35 cm away and drifted back (the serve clip's
-            // 479 mm jitter spike), because a stale absolute angle is a whole limb
-            // position, while a stale delta is a few degrees.
-            for (joint, slot) in [(hip, 0usize), (knee, 1)] {
-                let at = (joint - 1) * 3;
-                let solved_angles = clip.poses[index].joint(joint);
-                let base = source.joint(joint);
-                let delta = [
-                    solved_angles[0] - base[0],
-                    solved_angles[1] - base[1],
-                    solved_angles[2] - base[2],
-                ];
-                let previous = if slot == 0 { filter.hip } else { filter.knee };
-                let blended = match previous {
-                    Some(previous) => [
-                        previous[0] + (delta[0] - previous[0]) * alpha,
-                        previous[1] + (delta[1] - previous[1]) * alpha,
-                        previous[2] + (delta[2] - previous[2]) * alpha,
-                    ],
-                    None => delta,
-                };
-                clip.poses[index].body[at] = base[0] + blended[0];
-                clip.poses[index].body[at + 1] = base[1] + blended[1];
-                clip.poses[index].body[at + 2] = base[2] + blended[2];
-                if slot == 0 {
-                    filter.hip = Some(blended);
-                } else {
-                    filter.knee = Some(blended);
-                }
-            }
+            // This used to be a 50 ms one-pole on the delta from the source pose,
+            // copied from `pear/foot_lock.py::smooth_correction`. That filter is
+            // right for the live path, where the target is a state-machine guess
+            // and the frames arrive one at a time — but in the batch path the
+            // target here is already exact (a stance anchor plus a planned
+            // hand-off), so the filter only made the applied correction *lag* a
+            // moving source. On `短暂.mp4` that lag was the whole foot problem:
+
+            //   stock   slide 0.16/0.08 cm/frame, float 0.6/0.2 mm, sink 3.0/1.9
+            //   direct  slide 0.02/0.01 cm/frame, float 0.4/0.1 mm, sink 0.0/0.7
+            //
+            // and it raised the whole-body jitter from 28.3 mm to 35.5 mm and the
+            // ankles' shake from 34.6 mm to 42.8 mm. Filtering a *lagging* copy of
+            // an exact goal is not smoothing: it is a steady-state residual plus
+            // the noise the filter puts back in.
             scale_chain_towards_source(body, &mut clip.poses[index], rest, &source, &[hip, knee], 1.0);
             clip.skeletons[index] = body.forward_joints(&clip.poses[index]);
             report.ik_frames += 1;
@@ -2102,6 +2119,24 @@ fn rolling_anchor(
     toe: usize,
     floor: f32,
 ) -> Vec<[f32; 3]> {
+    rolling_anchor_and_weights(sole, clip, begin, end, foot, ankle, toe, floor).0
+}
+
+/// `rolling_anchor`, and the smoothed heel weights it was built from.
+///
+/// The caller needs both: `support_samples` in the reference blends the two sole
+/// patches with the *same* weights, so the support point and the anchor agree
+/// about where the contact is on every frame.
+fn rolling_anchor_and_weights(
+    sole: Option<&Sole>,
+    clip: &FlowClip,
+    begin: usize,
+    end: usize,
+    foot: usize,
+    ankle: usize,
+    toe: usize,
+    floor: f32,
+) -> (Vec<[f32; 3]>, Vec<f32>) {
     let frames = end - begin;
     let mut separations = Vec::with_capacity(frames);
     let mut deltas = Vec::with_capacity(frames);
@@ -2136,7 +2171,7 @@ fn rolling_anchor(
         ]);
     }
 
-    rolling_path(&separations, &weights, &observed, floor)
+    (rolling_path(&separations, &weights, &observed, floor), weights)
 }
 
 /// The two material points of a sole: the toe joint and a heel estimated behind
@@ -2195,7 +2230,25 @@ fn support_point(
     toe: usize,
 ) -> [f32; 3] {
     let (toe_at, heel) = sole_points(sole, clip, frame, foot, ankle, toe);
-    let weight = support_weight(toe_at, heel);
+    blend_support(toe_at, heel, support_weight(toe_at, heel))
+}
+
+/// The same point with the weight the stance already decided on
+/// (`support_samples`), so a heel-to-toe roll is not re-read as noise every frame.
+fn support_point_with(
+    sole: Option<&Sole>,
+    clip: &FlowClip,
+    frame: usize,
+    foot: usize,
+    ankle: usize,
+    toe: usize,
+    weight: f32,
+) -> [f32; 3] {
+    let (toe_at, heel) = sole_points(sole, clip, frame, foot, ankle, toe);
+    blend_support(toe_at, heel, weight)
+}
+
+fn blend_support(toe_at: [f32; 3], heel: [f32; 3], weight: f32) -> [f32; 3] {
     [
         toe_at[0] * (1.0 - weight) + heel[0] * weight,
         toe_at[1].min(heel[1]),
@@ -2264,6 +2317,15 @@ pub struct FootPass {
     pub pinned: Vec<[bool; 2]>,
     /// Per frame, per foot: the 3D offset applied on those release frames.
     pub offsets: Vec<[[f32; 3]; 2]>,
+    /// Per frame, per foot: the **smoothed** heel weight of the sole.
+    ///
+    /// The reference feeds one `weights` array to both `rolling_anchor` and
+    /// `support_samples`, so the support point moves only when the weight really
+    /// rolls. Recomputing it from the frame's own geometry is a different number
+    /// every frame: 10 cm of heel-to-toe separation times a hundredth of weight
+    /// noise is a millimetre of target jitter per frame, and the IK chases it.
+    /// That is the steady 2 mm of ankle motion a planted foot showed here.
+    pub weights: Vec<[f32; 2]>,
 }
 
 impl FootPass {
@@ -2274,6 +2336,7 @@ impl FootPass {
             targets: vec![[[0.0; 3]; 2]; frames],
             pinned: vec![[false; 2]; frames],
             offsets: vec![[[0.0; 3]; 2]; frames],
+            weights: vec![[0.5; 2]; frames],
         }
     }
 }
@@ -2337,7 +2400,8 @@ fn foot_lock(
             // The anchor is Kimodo's rolling anchor: a continuous no-slip path
             // through the stance, so a foot that rolls from heel to toe keeps its
             // contact patch still instead of jumping at the middle of the run.
-            let path = rolling_anchor(sole, clip, *begin, *end, foot_index, ankle, toe, ground);
+            let (path, weights) =
+                rolling_anchor_and_weights(sole, clip, *begin, *end, foot_index, ankle, toe, ground);
             // Weak presets hold 60% of the correction, and a low network contact
             // probability softens it further instead of dropping the contact. A
             // hand-drawn lock is the user's decision, so it is held at full
@@ -2352,7 +2416,17 @@ fn foot_lock(
             report.foot_contacts += 1;
             for (offset, index) in (*begin..*end).enumerate() {
                 anchors[index] = path[offset];
-                support[index] = support_point(sole, clip, index, foot_index, ankle, toe);
+                // One weight per frame for the whole stance, shared with the anchor.
+                pass.weights[index][foot_index] = weights[offset];
+                support[index] = support_point_with(
+                    sole,
+                    clip,
+                    index,
+                    foot_index,
+                    ankle,
+                    toe,
+                    weights[offset],
+                );
                 holds[index] = hold;
                 pass.support[index][foot_index] = true;
                 pass.holds[index][foot_index] = hold;

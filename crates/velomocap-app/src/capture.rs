@@ -452,6 +452,14 @@ fn run(
             state.progress.total = total;
             state.progress.message = stage.to_string();
             state.progress.elapsed = started.elapsed().as_secs_f64();
+            // Sample device memory *inside* a stage, not only at its edges: a
+            // per-frame leak in the reconstruction loop is invisible otherwise, and
+            // "it used to be 8 GB" has to be answerable from the log.
+            if frame % 10 == 0 {
+                if let Some(line) = velomocap_motion::vram::cuda_memory_line() {
+                    state.vram = format!("{line} · {stage}");
+                }
+            }
         }
     };
     let mut preview = {

@@ -356,6 +356,10 @@ pub struct VeloMocap {
     /// Set when a correction setting changed, so the panel can say the motion on
     /// screen is the old solve until Apply Correction runs.
     pub correction_dirty: bool,
+    /// Last VRAM line written to the log, so each stage is logged once instead of
+    /// on every paint. The status bar only shows the latest one; a run that climbs
+    /// from 8 GB to 20 GB needs the whole curve to say which stage did it.
+    logged_vram: String,
     pub selected: usize,
         pub floor: f32,
     pub capture_fps: f64,
@@ -565,6 +569,7 @@ impl VeloMocap {
             flow_note: String::new(),
             flow_adopted: false,
             correction_dirty: false,
+            logged_vram: String::new(),
             selected: 0,
             floor: 0.0,
             capture_fps: 0.0,
@@ -2570,6 +2575,10 @@ impl VeloMocap {
             let _ = elapsed;
             self.progress_stage = stage_index;
             self.vram = vram;
+            if !self.vram.is_empty() && self.vram != self.logged_vram {
+                self.log(format!("VRAM {}", self.vram));
+                self.logged_vram = self.vram.clone();
+            }
             let stage_label = capture::stage_name(stage_index);
             self.progress = (
                 frame,
