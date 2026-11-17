@@ -36,7 +36,7 @@ const SELECT_BG: egui::Color32 = egui::Color32::from_rgb(0x35, 0x35, 0x38);
 /// Where a missing SMPL-H model comes from. This is the official Max Planck
 /// download page (registration required), not a mirror: the body model is not
 /// redistributed with the app.
-const MODEL_DOWNLOAD_URL: &str = "https://download.is.tue.mpg.de/";
+const MODEL_DOWNLOAD_URL: &str = "https://mano.is.tue.mpg.de/";
 const REPOSITORY_URL: &str = "https://github.com/YuanBaoSMadLab/velomocap";
 const SPONSOR_URL: &str = "https://afdian.com/a/YuanBaoSMadLab";
 
@@ -2853,8 +2853,8 @@ fn status_bar(app: &mut VeloMocap, ctx: &egui::Context) {
                                 .min_size(egui::vec2(78.0, 18.0)),
                             )
                             .on_hover_text(i18n::zh_en(
-                                "打开 SMPL-H 官方下载页（download.is.tue.mpg.de，需注册）",
-                                "Open the official SMPL-H download page (download.is.tue.mpg.de, registration required)",
+                                "打开 SMPL-H 官方下载页（mano.is.tue.mpg.de，需注册）",
+                                "Open the official SMPL-H download page (mano.is.tue.mpg.de, registration required)",
                             ))
                             .clicked()
                         {
