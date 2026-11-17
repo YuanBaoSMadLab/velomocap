@@ -30,6 +30,7 @@
 
 use crate::solver;
 
+
 /// One frame of input, in metres.
 #[derive(Clone, Copy, Debug)]
 pub struct Frame {
@@ -39,10 +40,26 @@ pub struct Frame {
     pub hips: [[f64; 3]; 2],
     /// The ankle target each leg is pinned to (x/z fixed).
     pub ankles: [[f64; 3]; 2],
+    /// Lowest sole of each foot at this frame, before the plan moves anything.
+    pub soles: [f64; 2],
     /// Lowest sole height of the whole body at this frame.
     pub lowest: f64,
     /// Contact per leg.
     pub active: [bool; 2],
+    /// `active | transition`: the frames the reference's plan regularises.
+    pub planned: [bool; 2],
+    /// `free_follow_weights`: 1 where the foot rides the planned root (a free
+    /// foot), 0 where it is held (a stance), and a C1 ramp across a hand-off.
+    pub follow: [f64; 2],
+    /// A release/approach frame (	ransition & !active): the clearance term may
+    /// lift its goal out of the floor, but the knee-angle regulariser does not
+    /// chase it — regularising the hand-offs moved the body for a millimetre of
+    /// sole clearance (2月27日.mp4: jitter 29.1 -> 31.2 mm).
+    pub handoff: [bool; 2],
+    /// planned & !active & !flight: this frame's target height is a variable
+    /// of the plan, bounded to ±2 cm — a hand-off may move its goal, a stance
+    /// may not.
+    pub movable: [bool; 2],
     /// Max reach per leg (`anatomical::reach`).
     pub high: [f64; 2],
     /// Min reach per leg (`anatomical::minimum_reach`).
@@ -52,6 +69,21 @@ pub struct Frame {
     /// The knee geometry of each leg (`anatomical::knee_plane`), which is what
     /// turns a root height into the knee angle the solver will produce.
     pub knee: [Knee; 2],
+}
+
+/// What the plan decided.
+#[derive(Clone, Debug, Default)]
+pub struct Plan {
+    /// Root height per frame.
+    pub root: Vec<f64>,
+    /// Planned absolute height of each ankle target, per frame per leg, in the
+    /// same space as [`Frame::ankles`] (i.e. before the root shift this pass
+    /// applies). The stance entries are the input; the hand-off entries carry the
+    /// plan's own target variable and the floor clearance, and are what the leg
+    /// IK should be asked for.
+    pub goal_y: Vec<[f64; 2]>,
+    /// How many target-height variables the solve carried.
+    pub targets: usize,
 }
 
 /// One leg's bend-plane geometry and how fast the source moved through it.
@@ -71,7 +103,11 @@ pub struct Knee {
 const ROOT_SIGMA: f64 = 0.01;
 const ROOT_ACCELERATION_SIGMA: f64 = 0.0004;
 const ROOT_LIMIT: f64 = 0.02;
-/// `contact_temporal_root.CONFIG`: pose, velocity, acceleration and the shared
+/// How far a hand-off frame may move its own target height (`target_limit`).
+const TARGET_LIMIT: f64 = 0.02;
+/// `target_sigma`: a hand-off target is not free to wander either.
+const TARGET_SIGMA: f64 = 0.02;
+/// `contact_pose_plan.CONFIG`: pose, velocity, acceleration and the shared
 /// temporal weight. The pose term is the predicted knee angle; the two difference
 /// terms are what keep the plan from buying height with a knee twitch.
 const POSE_SIGMA: f64 = 0.175;
@@ -95,11 +131,29 @@ pub fn knee_angle(knee: &Knee, horizontal: f64, over: f64, straight: f64, shift:
     knee.phase * (1.0 - straight) + bent
 }
 
-/// Plan the root height. Returns one height per frame.
-pub fn plan(frames: &[Frame], _floor: f64, fps: f64, _flat: bool) -> Vec<f64> {
+/// Plan the root height and every hand-off frame's target height.
+///
+/// This is `contact_pose_plan._optimise_window`: the variables are the root height
+/// and one target height per hand-off frame (bounded to ±2 cm), and the objective
+/// carries the **predicted knee angle** of every planned frame — its offset, its
+/// velocity and its acceleration — weighted by how still the source leg was.
+///
+/// The hand-off freedom is the point. Holding the hand-off frames to the same
+/// knee-angle smoothness with the root as the only variable just pushed the root
+/// around (measured: root jitter 5.2 -> 19.2 mm on `2月27日.mp4`); with their own
+/// bounded target the plan can keep the leg still without moving the body.
+pub fn plan(frames: &[Frame], floor: f64, fps: f64, flat: bool) -> Plan {
     let count = frames.len();
+    let mut out = Plan {
+        root: frames.iter().map(|frame| frame.base).collect(),
+        goal_y: frames
+            .iter()
+            .map(|frame| [frame.ankles[0][1], frame.ankles[1][1]])
+            .collect(),
+        targets: 0,
+    };
     if count < 3 {
-        return frames.iter().map(|frame| frame.base).collect();
+        return out;
     }
     let fps = fps.max(1.0);
     let rate = fps / 30.0;
@@ -136,7 +190,7 @@ pub fn plan(frames: &[Frame], _floor: f64, fps: f64, _flat: bool) -> Vec<f64> {
             highest_shift[frame] = highest_shift[frame].min(upper);
         }
     }
-    
+
     let mut lower = vec![0.0f64; count];
     let mut upper = vec![0.0f64; count];
     for frame in 0..count {
@@ -146,8 +200,14 @@ pub fn plan(frames: &[Frame], _floor: f64, fps: f64, _flat: bool) -> Vec<f64> {
             (base[frame] - ROOT_LIMIT).max(base[frame] + lowest_shift[frame]),
             (base[frame] + ROOT_LIMIT).min(base[frame] + highest_shift[frame]),
         );
-        if !lowest_shift[frame].is_finite() || !highest_shift[frame].is_finite() || high - low < 1e-7
+        let planned = frames[frame].planned[0] || frames[frame].planned[1];
+        if !planned
+            || !lowest_shift[frame].is_finite()
+            || !highest_shift[frame].is_finite()
+            || high - low < 1e-7
         {
+            // Nothing planned here, airborne, or no room: the frame keeps the
+            // root it settled at (`contact_pose_plan`'s `freeze`).
             lower[frame] = base[frame] - 1e-10;
             upper[frame] = base[frame] + 1e-10;
         } else {
@@ -156,15 +216,21 @@ pub fn plan(frames: &[Frame], _floor: f64, fps: f64, _flat: bool) -> Vec<f64> {
         }
     }
 
-    // `mask`: a leg the plan is allowed to bend, i.e. one that is planted with
-    // its hip above the target.
-    let mask = |frame: usize, leg: usize| -> f64 {
-        if frames[frame].active[leg] && over[frame][leg] > 0.0 {
-            1.0
-        } else {
-            0.0
+    // The target-height variables: one per hand-off frame that is neither held by
+    // a stance nor airborne (`movable`), scaled by `target_gain = 1 - follow`.
+    let mut slot = vec![[usize::MAX; 2]; count];
+    let mut movable = Vec::new();
+    for frame in 0..count {
+        for leg in 0..2 {
+            let gain = 1.0 - frames[frame].follow[leg];
+            if frames[frame].movable[leg] && gain > 1e-6 {
+                slot[frame][leg] = movable.len();
+                movable.push((frame, leg, gain));
+            }
         }
-    };
+    }
+    let movable_count = movable.len();
+
     // `static_weight = .25 + .75/(1 + (speed/20°)²)`: a knee that is already
     // moving is allowed to keep moving; a still one is what the plan smooths.
     let still = |frame: usize, leg: usize| -> f64 {
@@ -177,50 +243,97 @@ pub fn plan(frames: &[Frame], _floor: f64, fps: f64, _flat: bool) -> Vec<f64> {
         let phase = frames[frame].knee[leg].phase.abs();
         ((5.0f64.to_radians() - phase) / 4.0f64.to_radians()).clamp(0.0, 1.0)
     };
-    // The knee angle a root height implies (`contact_temporal_root`'s `angle`).
-    let angle = |frame: usize, leg: usize, height: f64| -> f64 {
-        knee_angle(
-            &frames[frame].knee[leg],
-            horizontal[frame][leg],
-            over[frame][leg],
-            straight(frame, leg),
-            height - frames[frame].base,
-        ) * mask(frame, leg)
+
+    // The goal the plan asks for, as a height offset from the source ankle: a free
+    // foot rides the planned root (`follow`), a hand-off frame adds its own
+    // variable, and a planned free foot is lifted out of the floor.
+    let goal_offset = |frame: usize, leg: usize, x: &[f64]| -> f64 {
+        let source = &frames[frame];
+        let root = x[frame];
+        let mut offset = source.follow[leg] * (root - base[frame]);
+        let at = slot[frame][leg];
+        if at != usize::MAX {
+            offset += x[count + at] * movable[at].2;
+        }
+        if flat && source.handoff[leg] && !source.flight {
+            // `predict()`'s clearance: the sole a free planned foot would reach,
+            // lifted back to the plane with a 1 cm grazing tolerance.
+            let gap = floor - (source.soles[leg] + offset);
+            let lift = if gap >= 0.01 {
+                gap
+            } else if gap <= -0.01 {
+                0.0
+            } else {
+                (gap + 0.01).powi(2) / 0.04
+            };
+            offset += lift.min(0.12);
+        }
+        offset
     };
 
     let residual = |x: &[f64]| -> Vec<f64> {
-        let mut out: Vec<f64> = Vec::with_capacity(count * 8);
+        let mut out: Vec<f64> = Vec::with_capacity(count * 10 + movable_count);
         // 1. Stay near the settled root.
         for frame in 0..count {
             out.push((x[frame] - base[frame]) / ROOT_SIGMA);
         }
-        // 2. No knee motion the source did not have: pose, then its first and
+        // 2. Keep the hand-off target heights near the source.
+        for at in 0..movable_count {
+            out.push(x[count + at] / TARGET_SIGMA);
+        }
+        // 3. No knee motion the source did not have: pose, then its first and
         //    second differences, both faded where the source knee was moving.
-        let angles: Vec<[f64; 2]> = (0..count)
-            .map(|frame| [angle(frame, 0, x[frame]), angle(frame, 1, x[frame])])
-            .collect();
+        //    The state is the flex *change* from the source bend
+        //    (`angle − phase·extension_support`), so a leg the plan does not have
+        //    to move leaves a zero residual.
+        let mut states = vec![[0.0f64; 2]; count];
         for frame in 0..count {
             for leg in 0..2 {
-                if mask(frame, leg) > 0.0 {
-                    out.push(angles[frame][leg] / POSE_SIGMA);
+                let source = &frames[frame];
+                if !source.planned[leg] {
+                    continue;
+                }
+                let offset = goal_offset(frame, leg, x);
+                let shift = (x[frame] - base[frame]) - offset;
+                let angle = knee_angle(
+                    &source.knee[leg],
+                    horizontal[frame][leg],
+                    over[frame][leg],
+                    straight(frame, leg),
+                    shift,
+                );
+                states[frame][leg] = angle - source.knee[leg].phase * straight(frame, leg);
+            }
+        }
+        let planned = |frame: usize, leg: usize| -> f64 {
+            if frames[frame].planned[leg] {
+                1.0
+            } else {
+                0.0
+            }
+        };
+        for frame in 0..count {
+            for leg in 0..2 {
+                if frames[frame].planned[leg] {
+                    out.push(states[frame][leg] / POSE_SIGMA);
                 }
             }
         }
         for frame in 0..count - 1 {
             for leg in 0..2 {
-                let weight = mask(frame, leg).min(mask(frame + 1, leg))
+                let weight = planned(frame, leg).min(planned(frame + 1, leg))
                     * still(frame, leg).min(still(frame + 1, leg)).sqrt()
                     * rate
                     * TEMPORAL_WEIGHT
                     / VELOCITY_SIGMA;
-                out.push((angles[frame + 1][leg] - angles[frame][leg]) * weight);
+                out.push((states[frame + 1][leg] - states[frame][leg]) * weight);
             }
         }
         for frame in 0..count - 2 {
             for leg in 0..2 {
-                let common = mask(frame, leg)
-                    .min(mask(frame + 1, leg))
-                    .min(mask(frame + 2, leg));
+                let common = planned(frame, leg)
+                    .min(planned(frame + 1, leg))
+                    .min(planned(frame + 2, leg));
                 let common_still = still(frame, leg)
                     .min(still(frame + 1, leg))
                     .min(still(frame + 2, leg));
@@ -230,11 +343,12 @@ pub fn plan(frames: &[Frame], _floor: f64, fps: f64, _flat: bool) -> Vec<f64> {
                     * rate
                     * TEMPORAL_WEIGHT
                     / ACCELERATION_SIGMA;
-                let second = angles[frame + 2][leg] - 2.0 * angles[frame + 1][leg] + angles[frame][leg];
+                let second =
+                    states[frame + 2][leg] - 2.0 * states[frame + 1][leg] + states[frame][leg];
                 out.push(second * weight);
             }
         }
-        // 3. No root kick.
+        // 4. No root kick.
         for frame in 0..count - 2 {
             let second = x[frame + 2] - 2.0 * x[frame + 1] + x[frame];
             out.push(second * rate * rate / ROOT_ACCELERATION_SIGMA);
@@ -242,30 +356,40 @@ pub fn plan(frames: &[Frame], _floor: f64, fps: f64, _flat: bool) -> Vec<f64> {
         out
     };
 
+    let mut start: Vec<f64> = base
+        .iter()
+        .enumerate()
+        .map(|(frame, value)| value.clamp(lower[frame] + 1e-12, upper[frame] - 1e-12))
+        .collect();
+    start.resize(count + movable_count, 0.0);
+    let mut box_lower = lower.clone();
+    box_lower.resize(count + movable_count, -TARGET_LIMIT);
+    let mut box_upper = upper.clone();
+    box_upper.resize(count + movable_count, TARGET_LIMIT);
+
     let solution = solver::minimise(
         // The reference's trust region keeps the iterate feasible; this solver
         // projects its steps, so the initial guess has to start inside the box or
         // a frame whose reach forbids its settled height stays put. Clamping the
         // start is what makes a hard bound hard.
-        &base
-            .iter()
-            .enumerate()
-            .map(|(frame, value)| value.clamp(lower[frame] + 1e-12, upper[frame] - 1e-12))
-            .collect::<Vec<f64>>(),
-        &lower,
-        &upper,
+        &start,
+        &box_lower,
+        &box_upper,
         residual,
         solver::Options {
             max_iterations: 60,
             tolerance: 1e-9,
         },
     );
-    solution
-        .x
-        .iter()
-        .enumerate()
-        .map(|(frame, value)| value.clamp(base[frame] - ROOT_LIMIT, base[frame] + ROOT_LIMIT))
-        .collect()
+    let x = &solution.x;
+    for frame in 0..count {
+        out.root[frame] = x[frame].clamp(base[frame] - ROOT_LIMIT, base[frame] + ROOT_LIMIT);
+        for leg in 0..2 {
+            out.goal_y[frame][leg] = frames[frame].ankles[leg][1] + goal_offset(frame, leg, x);
+        }
+    }
+    out.targets = movable_count;
+    out
 }
 
 #[cfg(test)]
@@ -282,9 +406,14 @@ mod tests {
                 [-0.09, base + 0.85, 0.0],
             ],
             ankles: [[0.09, base, 0.0], [-0.09, base, 0.0]],
+            soles: [0.0, 0.0],
             // The sole rests on the floor.
             lowest: 0.0,
             active: [true, true],
+            planned: [true, true],
+            handoff: [false, false],
+            follow: [0.0, 0.0],
+            movable: [false, false],
             high: [0.95, 0.95],
             low: [0.20, 0.20],
             flight: false,
@@ -363,7 +492,7 @@ mod tests {
                 source.hips[leg][1] = source.base + 0.96;
             }
         }
-        let planned = plan(&frames, 0.0, 30.0, true);
+        let planned = plan(&frames, 0.0, 30.0, true).root;
         let last = *planned.last().unwrap();
         assert!(
             last < frames[frames.len() - 1].base - 0.005,
@@ -373,6 +502,26 @@ mod tests {
         let hip = frames[frames.len() - 1].hips[0][1] - (frames[frames.len() - 1].base - last);
         let reach = hip - frames[frames.len() - 1].ankles[0][1];
         assert!(reach <= 0.95 * 0.9995 + 2e-3, "reach still {reach:.3} m");
+    }
+
+    /// A hand-off frame whose sole would end up under the plane gets its **own**
+    /// goal lifted, not the body: `contact_pose_plan`'s clearance term on a
+    /// planned, non-active foot.
+    #[test]
+    fn a_handoff_goal_is_lifted_out_of_the_floor() {
+        let mut frames: Vec<Frame> = (0..9).map(|_| frame(0.9)).collect();
+        // Frame 4 is a release for the left foot: no stance, but a hand-off.
+        frames[4].active = [false, true];
+        frames[4].planned = [true, true];
+        frames[4].handoff = [true, false];
+        // Its sole would sit 4 cm under the plane.
+        frames[4].soles = [-0.04, 0.0];
+        let plan = plan(&frames, 0.0, 30.0, true);
+        let lifter = plan.goal_y[4][0] - frames[4].ankles[0][1];
+        assert!(
+            lifter > 0.03,
+            "hand-off goal only moved {lifter:.3} m, the foot stays buried"
+        );
     }
 
     /// A free foot under the floor does **not** raise the body: the reference puts
@@ -387,7 +536,7 @@ mod tests {
             // A swing frame whose sole is 4 cm under the plane.
             source.lowest = if index == 6 { -0.04 } else { 0.0 };
         }
-        let planned = plan(&frames, 0.0, 30.0, true);
+        let planned = plan(&frames, 0.0, 30.0, true).root;
         for (index, value) in planned.iter().enumerate() {
             assert!(
                 (value - frames[index].base).abs() < 1e-6,
@@ -401,7 +550,7 @@ mod tests {
     #[test]
     fn keeps_a_settled_root_when_nothing_violates() {
         let frames: Vec<Frame> = (0..16).map(|_| frame(0.9)).collect();
-        let planned = plan(&frames, 0.0, 30.0, true);
+        let planned = plan(&frames, 0.0, 30.0, true).root;
         for (index, value) in planned.iter().enumerate() {
             assert!(
                 (value - frames[index].base).abs() < 1e-3,
@@ -420,7 +569,7 @@ mod tests {
                 source.hips[leg][1] = source.base + 1.20;
             }
         }
-        let planned = plan(&frames, 0.0, 30.0, true);
+        let planned = plan(&frames, 0.0, 30.0, true).root;
         for (index, value) in planned.iter().enumerate() {
             assert!(
                 (value - frames[index].base).abs() <= ROOT_LIMIT + 1e-9,
@@ -430,7 +579,6 @@ mod tests {
         }
     }
 }
-
 
 
 

@@ -492,7 +492,7 @@ pub fn apply_with_locks(
         grounding_pass(clip, body, settings, &foot, &detected, &mut report);
         root_height_pass(clip, body, settings, &foot, &detected, &mut report);
         if settings.pose_plan {
-            pose_plan_window(clip, body, settings, &foot, &detected, &mut report);
+            pose_plan_window(clip, body, settings, &mut foot, &detected, &mut report);
         }
     }
     if settings.hand {
@@ -1106,7 +1106,7 @@ fn pose_plan_window(
     clip: &mut FlowClip,
     body: &BodyModel,
     settings: &CorrectionSettings,
-    foot: &FootPass,
+    foot: &mut FootPass,
     detection: &Detection,
     report: &mut CorrectionReport,
 ) {
@@ -1116,6 +1116,54 @@ fn pose_plan_window(
     }
     let rest = body.rest_joints(&clip.betas);
     let legs = [(1usize, 4usize, 7usize), (2, 5, 8)];
+    // `free_follow_weights`: 1 where a foot rides the planned root, 0 where it is
+    // held, and a C1 ramp across a hand-off. Plus the two masks the plan reads:
+    // `planned = active | transition`, and `movable` = a hand-off frame that is
+    // neither held nor airborne, i.e. the frames whose target height is a
+    // variable of the plan.
+    let mut follow = vec![[0.0f64; 2]; count];
+    let mut planned = vec![[false; 2]; count];
+    let mut handoff = vec![[false; 2]; count];
+    let mut movable = vec![[false; 2]; count];
+    for leg in 0..2 {
+        let free = |frame: usize| foot.pinned[frame][leg] && !foot.support[frame][leg];
+        let mut frame = 0;
+        while frame < count {
+            if !free(frame) {
+                frame += 1;
+                continue;
+            }
+            let first = frame;
+            while frame < count && free(frame) {
+                frame += 1;
+            }
+            let end = frame;
+            let left = first > 0 && foot.support[first - 1][leg];
+            let right = end < count && foot.support[end][leg];
+            let gap = end - first;
+            for slot in 0..gap {
+                let t = (slot + 1) as f64 / (gap + 1) as f64;
+                let smooth = t * t * (3.0 - 2.0 * t);
+                follow[first + slot][leg] = if left && right {
+                    0.0
+                } else if left {
+                    smooth
+                } else if right {
+                    1.0 - smooth
+                } else {
+                    1.0
+                };
+            }
+        }
+    }
+    for frame in 0..count {
+        let airborne = detection.prepared.flight.get(frame).copied().unwrap_or(false);
+        for leg in 0..2 {
+            planned[frame][leg] = foot.support[frame][leg];
+            handoff[frame][leg] = foot.pinned[frame][leg] && !foot.support[frame][leg];
+            movable[frame][leg] = false;
+        }
+    }
     let mut frames = Vec::with_capacity(count);
     // The knee's own rotation per frame and leg: its bend plane gives the plan the
     // angle a root height would cost, its change over time gives the "static"
@@ -1129,6 +1177,12 @@ fn pose_plan_window(
             .min(row[1][0][1])
             .min(row[1][1][1]);
         let active = foot.support[frame];
+        // Per foot, the lower of the two sole patches: what the plan's clearance
+        // term measures a free planned foot against.
+        let soles = [
+            row[0][0][1].min(row[0][1][1]) as f64,
+            row[1][0][1].min(row[1][1][1]) as f64,
+        ];
         let mut high = [0.0f64; 2];
         let mut low = [0.0f64; 2];
         let mut knee_planes = [crate::anatomical::KneePlane {
@@ -1150,23 +1204,33 @@ fn pose_plan_window(
             knee_rotations[leg] = knee_local;
         }
         knees.push(knee_rotations);
+        // The goal this frame's leg is being asked for: the stance anchor, or the
+        // release offset the hand-off planned (`targets = j + shift + offsets`).
+        let goal = |leg: usize, ankle: usize| -> [f64; 3] {
+            if foot.support[frame][leg] {
+                foot.targets[frame][leg].map(|value| value as f64)
+            } else if foot.pinned[frame][leg] {
+                let offset = foot.offsets[frame][leg];
+                [
+                    positions[ankle][0] + offset[0] as f64,
+                    positions[ankle][1] + offset[1] as f64,
+                    positions[ankle][2] + offset[2] as f64,
+                ]
+            } else {
+                positions[ankle]
+            }
+        };
         frames.push(crate::pose_plan::Frame {
             base: clip.poses[frame].translation[1] as f64,
             hips: [positions[1], positions[2]],
-            ankles: [
-                if active[0] {
-                    foot.targets[frame][0].map(|value| value as f64)
-                } else {
-                    positions[7]
-                },
-                if active[1] {
-                    foot.targets[frame][1].map(|value| value as f64)
-                } else {
-                    positions[8]
-                },
-            ],
+            ankles: [goal(0, LEFT_ANKLE), goal(1, RIGHT_ANKLE)],
+            soles,
             lowest: lowest as f64,
             active,
+            planned: planned[frame],
+            follow: follow[frame],
+            handoff: handoff[frame],
+            movable: movable[frame],
             high,
             low,
             flight: detection.prepared.flight.get(frame).copied().unwrap_or(false),
@@ -1185,7 +1249,7 @@ fn pose_plan_window(
             }),
         });
     }
-    let planned = crate::pose_plan::plan(
+    let plan = crate::pose_plan::plan(
         &frames,
         settings.floor as f64,
         clip.fps as f64,
@@ -1193,12 +1257,28 @@ fn pose_plan_window(
     );
     let mut moved = 0.0f32;
     for frame in 0..count {
-        let delta = (planned[frame] - frames[frame].base) as f32;
+        let delta = (plan.root[frame] - frames[frame].base) as f32;
         if delta.abs() < 1e-6 {
             continue;
         }
         moved = moved.max(delta.abs());
         clip.poses[frame].translation[1] += delta;
+    }
+    // The plan owns the hand-off target heights now: hand them to the leg IK
+    // (`offsets[:] = goal − fk(ankle) − target_shift` in the reference). The
+    // offset is measured against the ankle *after* the root shift, because that
+    // is what the IK adds it to — measuring against the pre-shift ankle would move
+    // a held foot by the root delta, which is exactly the 9 cm the root takes here.
+    for frame in 0..count {
+        let root_delta = (plan.root[frame] - frames[frame].base) as f64;
+        for leg in 0..2 {
+            if !foot.pinned[frame][leg] || foot.support[frame][leg] {
+                continue;
+            }
+            let offset = plan.goal_y[frame][leg] - (frames[frame].ankles[leg][1] + root_delta);
+            foot.offsets[frame][leg][1] =
+                (foot.offsets[frame][leg][1] as f64 + offset) as f32;
+        }
     }
     if moved > 0.0 {
         for frame in 0..count {
