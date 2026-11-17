@@ -1533,6 +1533,19 @@ fn leg_ik(
     let cap = thresholds.max_correction.min(0.05) as f64;
     // One lookup per clip instead of one per frame inside the pin loops.
     let debug_pins = std::env::var_os("VELOMOCAP_DEBUG_PIN").is_some();
+    // `SolveLegs` gives every contact frame the full correction and clamps
+    // *inside* the solve (`flex = min(acos(...), 160°)`); it never skips a frame
+    // and never tapers one. This pass used to do both — `reach_falloff` scaled
+    // the correction and an out-of-reach or over-folded target was skipped
+    // outright — and a skipped frame next to a solved one is a step, which is
+    // where the remaining jitter sits.
+    //
+    // Measured on the three takes, going full weight changes **nothing**: the
+    // root passes (`reachable_pelvis_drop/lift`) already make every stance
+    // target reachable, so the taper never fired. It is kept as the safe
+    // behaviour for the clip where it does: `VELOMOCAP_IK_TAPER=1` restores the
+    // old tapering for a side-by-side reading.
+    let full_ik = std::env::var_os("VELOMOCAP_IK_TAPER").is_none();
     // 1 - exp(-dt/0.05): the reference's 50 ms one-pole on the applied
     // correction (pear/foot_lock.py::smooth_correction).
     for (foot_index, (hip, knee, ankle, toe)) in legs.into_iter().enumerate() {
@@ -1629,11 +1642,11 @@ fn leg_ik(
                 ];
                 // Too close to the hip for the knee to bend that far: leave the
                 // network pose alone rather than over-folding the leg.
-                if distance3(target, hip_f) < min_reach * 1.0005 {
+                if !full_ik && distance3(target, hip_f) < min_reach * 1.0005 {
                     continue;
                 }
-                let weight = weights[offset];
-                if weight <= 0.02 {
+                let weight = if full_ik { 1.0 } else { weights[offset] };
+                if !full_ik && weight <= 0.02 {
                     // Out of reach: the root chain (`root_height`) has already
                     // moved the pelvis as far as the bounds allow, so this frame
                     // is left alone rather than levering the body again here.
@@ -1699,11 +1712,15 @@ fn leg_ik(
                 target[1] = keep_sole_on_floor(target[1], current[1] as f64, sole_at[1], settings.floor);
             }
             let hip_f = joint(&clip.skeletons[index], hip).map(|value| value as f64);
-            if distance3(target, hip_f) < min_reach * 1.0005 {
+            if !full_ik && distance3(target, hip_f) < min_reach * 1.0005 {
                 continue;
             }
-            let weight = reach_falloff(target, hip_f, max_reach) as f32;
-            if weight <= 0.02 {
+            let weight = if full_ik {
+                1.0
+            } else {
+                reach_falloff(target, hip_f, max_reach) as f32
+            };
+            if !full_ik && weight <= 0.02 {
                 continue;
             }
             if debug_pins {
