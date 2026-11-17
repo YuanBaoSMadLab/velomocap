@@ -251,7 +251,7 @@ enum Command {
         /// Skip the reference's causal live foot lock (on by default; the last
         /// pass, `pear/foot_lock.py`'s LiveFootLock).
         #[arg(long)]
-        no_live_lock: bool,
+        live_lock: bool,
         /// Use the skinned foot-mesh sole points as the contact source.
         #[arg(long)]
         joint_sole: bool,
@@ -352,7 +352,7 @@ enum Command {
         #[arg(long)]
         no_pose_plan: bool,
         #[arg(long)]
-        no_live_lock: bool,
+        live_lock: bool,
         #[arg(long)]
         joint_sole: bool,
     },
@@ -584,7 +584,7 @@ fn main() -> Result<()> {
             hand_lock,
             no_leg_ik,
             no_pose_plan,
-            no_live_lock,
+            live_lock,
             joint_sole,
         } => replay_clip(
             &joints,
@@ -602,7 +602,7 @@ fn main() -> Result<()> {
                 hand_lock,
                 no_leg_ik,
                 no_pose_plan,
-                no_live_lock,
+                live_lock,
                 joint_sole,
             },
         ),
@@ -636,7 +636,7 @@ fn main() -> Result<()> {
             hand_lock,
             no_leg_ik,
             no_pose_plan,
-            no_live_lock,
+            live_lock,
             joint_sole,
             smooth,
             lock_preset,
@@ -706,7 +706,7 @@ fn main() -> Result<()> {
             hand_lock,
             no_leg_ik,
             no_pose_plan,
-            no_live_lock,
+            live_lock,
             joint_sole,
             smooth,
             &lock_preset,
@@ -1313,7 +1313,7 @@ fn flow_report(
     hand_lock: bool,
     no_leg_ik: bool,
     no_pose_plan: bool,
-    no_live_lock: bool,
+    live_lock: bool,
     joint_sole: bool,
     smoothing: f64,
     lock_preset: &str,
@@ -1556,7 +1556,7 @@ fn flow_report(
         pelvis_offset: pelvis,
         leg_ik: !no_leg_ik,
         pose_plan: !no_pose_plan,
-        live_lock: !no_live_lock,
+        live_lock,
         mesh_sole: !joint_sole,
         smoothing,
     };
@@ -2839,7 +2839,7 @@ struct ReplayFlags {
     hand_lock: bool,
     no_leg_ik: bool,
     no_pose_plan: bool,
-    no_live_lock: bool,
+    live_lock: bool,
     joint_sole: bool,
 }
 
@@ -2983,7 +2983,7 @@ fn replay_clip(
         floor,
         leg_ik: !flags.no_leg_ik,
         pose_plan: !flags.no_pose_plan,
-        live_lock: !flags.no_live_lock,
+        live_lock: flags.live_lock,
         mesh_sole: !flags.joint_sole,
         ..Default::default()
     };

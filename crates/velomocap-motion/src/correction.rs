@@ -142,9 +142,23 @@ pub struct CorrectionSettings {
     /// (`pear/foot_lock.py`'s `LiveFootLock`): a hysteresis state machine per
     /// foot, the two-bone solve with the observability gate and the continued
     /// knee pole, the 50 ms one-pole on the applied correction, and the bounded
-    /// pelvis compensation. On by default: it is what makes the reference's feet
-    /// look still, because it never lets a contact flicker on and off between
-    /// frames.
+    /// pelvis compensation.
+    ///
+    /// Off by default. The reference only runs this in its **live** preview
+    /// (`pear/multi_worker.py:224`); its batch correction (`flow_correction.py`)
+    /// has no such pass, and adding one on top of the exact contact IK is a
+    /// second, causal opinion about the same leg. Measured on three clips with the
+    /// exact pass already in place, it made every sole metric worse:
+    ///
+    /// ```text
+    ///               slide cm/frame     float mm        sink mm
+    ///  2月27日  on   0.05 / 0.06      0.7 / 0.4      3.2 / 0.0
+    ///          off  0.03 / 0.05      0.0 / 0.0      3.1 / 0.0
+    ///  短暂     on   0.02 / 0.01      0.4 / 0.2      0.0 / 0.7
+    ///          off  0.01 / 0.00      0.1 / 0.0      0.0 / 0.5
+    ///  tennis  on   0.01 / 0.02      0.3 / 0.5      0.2 / 3.5
+    ///          off  0.00 / 0.00      0.0 / 0.0      0.0 / 0.1
+    /// ```
     pub live_lock: bool,
 }
 
@@ -160,7 +174,7 @@ impl Default for CorrectionSettings {
             pelvis_offset: 0.0,
             leg_ik: true,
             pose_plan: true,
-            live_lock: true,
+            live_lock: false,
             mesh_sole: true,
             smoothing: 0.0,
         }

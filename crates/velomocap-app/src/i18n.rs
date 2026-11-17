@@ -204,6 +204,7 @@ pub fn t(english: &'static str) -> &'static str {
         "Pelvis Offset" => "骨盆高度偏移（相对自动）",
         "Causal Foot Lock" => "因果脚锁",
         "Hold each planted foot with the reference's live lock: 75 ms of evidence to lock, no lookahead, and a smooth hand-over when the foot lifts" => "用参考实现的实时锁把着地脚逐帧钉住：需要 75 毫秒的着地证据才上锁、不看未来帧、抬脚时平滑过渡",
+        "The reference's live-preview stabiliser, run on top of the exact contact solve: 75 ms of evidence to lock, no lookahead, and a smooth hand-over when the foot lifts. Off by default — the reference does not run it in batch, and measured on three takes it made every sole metric worse" => "参考实现的“实时预览”稳定器，叠在精确接触求解之上：需要 75 毫秒证据才上锁、不看未来帧、抬脚时平滑交接。默认关闭 —— 参考的批处理并不跑它，三台片子实测它让脚掌指标全面变差",
         "Apply Correction" => "应用校正",
         "Applying correction…" => "正在应用校正…",
         "Correction applied in" => "校正完成，用时",

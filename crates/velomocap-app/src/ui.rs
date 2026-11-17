@@ -2613,7 +2613,7 @@ fn correction_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
                     egui::RichText::new(i18n::t("Causal Foot Lock")).size(11.0),
                 )
                 .on_hover_text(i18n::t(
-                    "Hold each planted foot with the reference's live lock: 75 ms of evidence to lock, no lookahead, and a smooth hand-over when the foot lifts",
+                    "The reference's live-preview stabiliser, run on top of the exact contact solve: 75 ms of evidence to lock, no lookahead, and a smooth hand-over when the foot lifts. Off by default — the reference does not run it in batch, and measured on three takes it made every sole metric worse",
                 ))
                 .changed()
             {
