@@ -2210,6 +2210,12 @@ impl VeloMocap {
         );
         self.status = self.recorrect_note.clone();
         self.locks_dirty = false;
+        // A toggle that arrived while this run was in flight (it could not start
+        // a second one) still has to be solved, or the checkbox and the picture
+        // would disagree until the next edit.
+        if self.correction_dirty && self.can_apply_correction() {
+            self.apply_correction();
+        }
     }
     /// Where the hand-drawn contact timing of this clip lives.
     pub fn locks_path(&self) -> Option<PathBuf> {
