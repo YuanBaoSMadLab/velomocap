@@ -222,6 +222,14 @@ enum Command {
         /// 2 patches x 3), the data behind the foot-stability line.
         #[arg(long)]
         dump_soles: Option<PathBuf>,
+        /// Write the clip's shape coefficients (f32 LE, length = num betas), so a
+        /// dumped clip can be replayed through the correction without inference.
+        #[arg(long)]
+        dump_betas: Option<PathBuf>,
+        /// Write the network's foot contact probabilities (f32 LE, frames x 4):
+        /// the detector scores its runs with them, so a replay needs them.
+        #[arg(long)]
+        dump_contacts: Option<PathBuf>,
         /// Disable foot/hand contact correction.
         #[arg(long)]
         no_correction: bool,
@@ -240,6 +248,10 @@ enum Command {
         /// contact_pose_plan pass).
         #[arg(long)]
         no_pose_plan: bool,
+        /// Skip the reference's causal live foot lock (on by default; the last
+        /// pass, `pear/foot_lock.py`'s LiveFootLock).
+        #[arg(long)]
+        no_live_lock: bool,
         /// Use the skinned foot-mesh sole points as the contact source.
         #[arg(long)]
         joint_sole: bool,
@@ -301,6 +313,48 @@ enum Command {
         /// Use the CPU execution provider only.
         #[arg(long)]
         cpu: bool,
+    },
+    /// Replay a dumped clip through the correction passes, without inference.
+    ///
+    /// The dumps are the ones `flow --dump-joints/--dump-rotations/--dump-betas`
+    /// writes: one iteration of the foot/root/IK work takes milliseconds instead
+    /// of a full inference run, which is what makes tuning a single clip
+    /// practical.
+    Replay {
+        /// Joint world positions (f32 LE, frames x joints x 3).
+        joints: PathBuf,
+        /// Joint world rotations (f32 LE, frames x joints x 9).
+        rotations: PathBuf,
+        #[arg(long, default_value = "models/body_models/smplh/neutral/model.npz")]
+        model: PathBuf,
+        /// Shape coefficients (f32 LE, from `--dump-betas`).
+        #[arg(long)]
+        betas: Option<PathBuf>,
+        /// Foot contact probabilities (f32 LE, frames x 4, from `--dump-contacts`).
+        #[arg(long)]
+        contacts: Option<PathBuf>,
+        #[arg(long, default_value_t = 30.0)]
+        fps: f32,
+        #[arg(long, default_value_t = 0.0)]
+        floor: f32,
+        #[arg(long)]
+        dump_joints: Option<PathBuf>,
+        #[arg(long)]
+        dump_soles: Option<PathBuf>,
+        #[arg(long)]
+        no_correction: bool,
+        #[arg(long)]
+        no_foot: bool,
+        #[arg(long)]
+        hand_lock: bool,
+        #[arg(long)]
+        no_leg_ik: bool,
+        #[arg(long)]
+        no_pose_plan: bool,
+        #[arg(long)]
+        no_live_lock: bool,
+        #[arg(long)]
+        joint_sole: bool,
     },
     /// Run the SAM 3D Body TorchScript module through LibTorch.
     SamTorch {
@@ -515,6 +569,43 @@ fn main() -> Result<()> {
             limit,
             json,
         } => camera_track(&video, &weights, interval, !cpu, limit, json),
+        Command::Replay {
+            joints,
+            rotations,
+            model,
+            betas,
+            contacts,
+            fps,
+            floor,
+            dump_joints,
+            dump_soles,
+            no_correction,
+            no_foot,
+            hand_lock,
+            no_leg_ik,
+            no_pose_plan,
+            no_live_lock,
+            joint_sole,
+        } => replay_clip(
+            &joints,
+            &rotations,
+            &model,
+            betas.as_deref(),
+            contacts.as_deref(),
+            fps,
+            floor,
+            dump_joints.as_deref(),
+            dump_soles.as_deref(),
+            ReplayFlags {
+                no_correction,
+                no_foot,
+                hand_lock,
+                no_leg_ik,
+                no_pose_plan,
+                no_live_lock,
+                joint_sole,
+            },
+        ),
         Command::Flow {
             video,
             detector,
@@ -538,11 +629,14 @@ fn main() -> Result<()> {
             dump_rotations,
             dump_probes,
             dump_soles,
+            dump_betas,
+            dump_contacts,
             no_correction,
             no_foot,
             hand_lock,
             no_leg_ik,
             no_pose_plan,
+            no_live_lock,
             joint_sole,
             smooth,
             lock_preset,
@@ -605,11 +699,14 @@ fn main() -> Result<()> {
             dump_rotations.as_deref(),
             dump_probes.as_deref(),
             dump_soles.as_deref(),
+            dump_betas.as_deref(),
+            dump_contacts.as_deref(),
             no_correction,
             no_foot,
             hand_lock,
             no_leg_ik,
             no_pose_plan,
+            no_live_lock,
             joint_sole,
             smooth,
             &lock_preset,
@@ -1209,11 +1306,14 @@ fn flow_report(
     dump_rotations: Option<&std::path::Path>,
     dump_probes: Option<&std::path::Path>,
     dump_soles: Option<&std::path::Path>,
+    dump_betas: Option<&std::path::Path>,
+    dump_contacts: Option<&std::path::Path>,
     no_correction: bool,
     no_foot: bool,
     hand_lock: bool,
     no_leg_ik: bool,
     no_pose_plan: bool,
+    no_live_lock: bool,
     joint_sole: bool,
     smoothing: f64,
     lock_preset: &str,
@@ -1456,6 +1556,7 @@ fn flow_report(
         pelvis_offset: pelvis,
         leg_ik: !no_leg_ik,
         pose_plan: !no_pose_plan,
+        live_lock: !no_live_lock,
         mesh_sole: !joint_sole,
         smoothing,
     };
@@ -1600,6 +1701,20 @@ fn flow_report(
             clip.skeletons.len(),
             clip.skeletons.first().map(|s| s.positions.len() / 3).unwrap_or(0)
         );
+    }
+    if let Some(path) = dump_betas {
+        let bytes: Vec<u8> = clip.betas.iter().flat_map(|value| value.to_le_bytes()).collect();
+        std::fs::write(path, &bytes)?;
+        println!("wrote {} ({} betas)", path.display(), clip.betas.len());
+    }
+    if let Some(path) = dump_contacts {
+        let bytes: Vec<u8> = clip
+            .foot_contacts
+            .iter()
+            .flat_map(|row| row.iter().flat_map(|value| value.to_le_bytes()))
+            .collect();
+        std::fs::write(path, &bytes)?;
+        println!("wrote {} ({} contact rows)", path.display(), clip.foot_contacts.len());
     }
     if let Some(path) = dump_mesh {
         if let Some(pose) = clip.poses.first() {
@@ -2713,6 +2828,228 @@ fn bench(frames: usize, repeat: usize, json: Option<PathBuf>) -> Result<()> {
     if let Some(path) = json {
         let text = serde_json::to_string_pretty(&rows).context("serialize benchmark")?;
         std::fs::write(&path, text)?;
+        println!("wrote {}", path.display());
+    }
+    Ok(())
+}
+/// Which correction passes a replay runs.
+struct ReplayFlags {
+    no_correction: bool,
+    no_foot: bool,
+    hand_lock: bool,
+    no_leg_ik: bool,
+    no_pose_plan: bool,
+    no_live_lock: bool,
+    joint_sole: bool,
+}
+
+fn read_f32(path: &std::path::Path) -> Result<Vec<f32>> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    anyhow::ensure!(bytes.len() % 4 == 0, "{} is not a f32 dump", path.display());
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+/// Rotation vector (axis * angle) of a rotation matrix, the inverse of the
+/// forward pass's `rotvec`.
+fn matrix_rotvec(m: &[f64; 9]) -> [f32; 3] {
+    let trace = m[0] + m[4] + m[8];
+    let cosine = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0);
+    let angle = cosine.acos();
+    if angle < 1e-6 {
+        return [0.0; 3];
+    }
+    let axis = [m[7] - m[5], m[2] - m[6], m[3] - m[1]];
+    let length = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+    if length < 1e-9 {
+        return [0.0; 3];
+    }
+    [
+        (axis[0] / length * angle) as f32,
+        (axis[1] / length * angle) as f32,
+        (axis[2] / length * angle) as f32,
+    ]
+}
+
+/// Rebuild a clip from dumped skeletons and run the correction on it.
+///
+/// The poses are recovered from the world rotations exactly (`local =
+/// parent^T · world`), so the replay sees the same motion the inference wrote —
+/// only the network is skipped.
+fn replay_clip(
+    joints: &std::path::Path,
+    rotations: &std::path::Path,
+    model: &std::path::Path,
+    betas_path: Option<&std::path::Path>,
+    contacts_path: Option<&std::path::Path>,
+    fps: f32,
+    floor: f32,
+    dump_joints: Option<&std::path::Path>,
+    dump_soles: Option<&std::path::Path>,
+    flags: ReplayFlags,
+) -> Result<()> {
+    use velomocap_body::{BodyModel, Pose};
+
+    let body = BodyModel::load(model, 10)?;
+    let positions = read_f32(joints)?;
+    let rotation_values = read_f32(rotations)?;
+    let count = body.num_joints;
+    anyhow::ensure!(
+        positions.len() % (count * 3) == 0,
+        "{} does not hold {count}-joint frames",
+        joints.display()
+    );
+    let frames = positions.len() / (count * 3);
+    anyhow::ensure!(
+        rotation_values.len() >= frames * count * 9,
+        "{} is shorter than {frames} frames",
+        rotations.display()
+    );
+    let betas = match betas_path {
+        Some(path) => read_f32(path)?,
+        None => vec![0.0; 10],
+    };
+    let foot_contacts: Vec<[f32; 4]> = match contacts_path {
+        Some(path) => {
+            let values = read_f32(path)?;
+            anyhow::ensure!(
+                values.len() % 4 == 0,
+                "{} is not a frames x 4 contact dump",
+                path.display()
+            );
+            values
+                .chunks_exact(4)
+                .map(|row| [row[0], row[1], row[2], row[3]])
+                .collect()
+        }
+        None => Vec::new(),
+    };
+
+    let mut poses = Vec::with_capacity(frames);
+    let rest = body.rest_joints(&betas);
+    for frame in 0..frames {
+        let mut pose = Pose::neutral(count, betas.len());
+        pose.betas = betas.clone();
+        let at = frame * count * 3;
+        let rotation = |joint: usize| -> [f64; 9] {
+            let base = (frame * count + joint) * 9;
+            let mut out = [0.0; 9];
+            out.copy_from_slice(&rotation_values[base..base + 9].iter().map(|v| *v as f64).collect::<Vec<f64>>());
+            out
+        };
+        pose.root = matrix_rotvec(&rotation(0));
+        // `world_transforms` puts the root at `translation + rest[0]` — the rest
+        // offset is **not** rotated for the root — so take it back out here.
+        let rest0 = [rest[0] as f64, rest[1] as f64, rest[2] as f64];
+        let rotated = rest0;
+        pose.translation = [
+            positions[at] - rotated[0] as f32,
+            positions[at + 1] - rotated[1] as f32,
+            positions[at + 2] - rotated[2] as f32,
+        ];
+        for joint in 1..count {
+            let parent = match body.parents[joint] {
+                value if value >= 0 => value as usize,
+                _ => 0,
+            };
+            let local = velomocap_core::math::tmul3(&rotation(parent), &rotation(joint));
+            pose.set_joint(joint, matrix_rotvec(&local));
+        }
+        poses.push(pose);
+    }
+    let skeletons = poses.iter().map(|pose| body.forward_joints(pose)).collect();
+    let mut clip = velomocap_motion::FlowClip {
+        fps,
+        poses,
+        skeletons,
+        rot6d: Vec::new(),
+        trans: vec![[0.0; 3]; frames],
+        betas,
+        foot_contacts,
+        floor,
+        floor_from_contacts: false,
+        offset: [0.0; 3],
+        source_frames: (0..frames).collect(),
+        anchors: 0,
+        anchor_residual: [0.0; 3],
+    };
+
+    let settings = velomocap_motion::correction::CorrectionSettings {
+        enabled: !flags.no_correction,
+        foot: !flags.no_foot,
+        hand: flags.hand_lock,
+        floor,
+        leg_ik: !flags.no_leg_ik,
+        pose_plan: !flags.no_pose_plan,
+        live_lock: !flags.no_live_lock,
+        mesh_sole: !flags.joint_sole,
+        ..Default::default()
+    };
+    let report = velomocap_motion::correction::apply(&mut clip, &body, &settings)?;
+    println!("replay: {} frames at {fps:.2} fps, floor {floor:.3} m", clip.poses.len());
+    println!("{}", report.line());
+    println!(
+        "feet: {}",
+        velomocap_motion::metrics::FootMetrics::delta_line(&report.feet_before, &report.feet_after)
+    );
+
+    if let Some(path) = dump_joints {
+        let mut bytes = Vec::new();
+        for skeleton in &clip.skeletons {
+            for value in &skeleton.positions {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        std::fs::write(path, bytes)?;
+        println!("wrote {} ({} frames)", path.display(), clip.skeletons.len());
+    }
+    if let Some(path) = dump_soles {
+        let mut text = String::new();
+        text.push_str(&format!(
+            "# floor {:.4} m (resolved {:.4})\n# before: {}\n# after:  {}\n",
+            settings.floor,
+            clip.floor,
+            report.feet_before.line(),
+            report.feet_after.line()
+        ));
+        text.push_str("# which frame foot patch x y z active probability\n");
+        for (label, rows) in [("before", &report.soles_before), ("after", &report.soles)] {
+            for frame in 0..rows.len() {
+                for foot in 0..2 {
+                    let active = report
+                        .active
+                        .get(frame)
+                        .map(|mask| mask[foot])
+                        .unwrap_or(false);
+                    let probability = clip
+                        .foot_contacts
+                        .get(frame)
+                        .copied()
+                        .unwrap_or([f32::NAN; 4]);
+                    for patch in 0..2 {
+                        let at = rows[frame][foot][patch];
+                        text.push_str(&format!(
+                            "{} {} {} {} {:.5} {:.5} {:.5} {} {:.4} {:.4} {:.4} {:.4}\n",
+                            label,
+                            frame,
+                            foot,
+                            patch,
+                            at[0],
+                            at[1],
+                            at[2],
+                            if active { 1 } else { 0 },
+                            probability[0],
+                            probability[1],
+                            probability[2],
+                            probability[3]
+                        ));
+                    }
+                }
+            }
+        }
+        std::fs::write(path, &text)?;
         println!("wrote {}", path.display());
     }
     Ok(())

@@ -103,6 +103,7 @@ pub enum LockPreset {
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CorrectionSettings {
     pub enabled: bool,
     pub mode: CorrectionMode,
@@ -137,6 +138,14 @@ pub struct CorrectionSettings {
     /// reference's fifth vertical step, after the drop, lift, offset and
     /// clearance.
     pub pose_plan: bool,
+    /// Run the reference's **causal** foot constraint as the last pass
+    /// (`pear/foot_lock.py`'s `LiveFootLock`): a hysteresis state machine per
+    /// foot, the two-bone solve with the observability gate and the continued
+    /// knee pole, the 50 ms one-pole on the applied correction, and the bounded
+    /// pelvis compensation. On by default: it is what makes the reference's feet
+    /// look still, because it never lets a contact flicker on and off between
+    /// frames.
+    pub live_lock: bool,
 }
 
 impl Default for CorrectionSettings {
@@ -151,6 +160,7 @@ impl Default for CorrectionSettings {
             pelvis_offset: 0.0,
             leg_ik: true,
             pose_plan: true,
+            live_lock: true,
             mesh_sole: true,
             smoothing: 0.0,
         }
@@ -217,6 +227,10 @@ pub struct CorrectionReport {
     pub hand_contacts: usize,
     pub max_shift: f32,
     pub ik_frames: usize,
+    /// Frames the causal live lock re-solved a leg on (`LiveFootLock.apply`).
+    pub live_frames: usize,
+    /// Worst distance left between a live-solved ankle and its lock target.
+    pub live_residual: f32,
     /// Worst distance between a solved wrist and its pinned target.
     pub max_hand_error: f32,
     /// Largest vertical correction applied by the root pass.
@@ -302,6 +316,13 @@ impl CorrectionReport {
             self.jitter_before * 1000.0,
             self.jitter_after * 1000.0
         );
+        if self.live_frames > 0 {
+            out.push_str(&format!(
+                "; live lock re-solved {} leg(s), worst residual {:.1} mm",
+                self.live_frames,
+                self.live_residual * 1000.0
+            ));
+        }
         if self.root_jitter_before > 0.0 {
             out.push_str(&format!(
                 " (root {:.1}->{:.1} mm)",
@@ -453,6 +474,12 @@ pub fn apply_with_locks(
     if settings.foot && contacts && settings.leg_ik {
         leg_ik(sole.as_ref(), clip, body, settings, &thresholds, &foot, &mut report);
     }
+    // The reference's live stabiliser, last: it decides contact timing causally
+    // and re-solves the legs with its own two-bone solver, so a stance whose
+    // detection flickered is still held still frame to frame.
+    if settings.foot && contacts && settings.live_lock {
+        live_foot_lock(sole.as_ref(), clip, body, settings, &mut report);
+    }
 
     clip.skeletons = clip
         .poses
@@ -603,6 +630,7 @@ fn root_jitter(skeletons: &[Skeleton]) -> f32 {
 }
 
 
+/// 99th percentile of the second difference of the joints the correction moves,
 /// in metres. This is the number that tracks what reads as twitching.
 ///
 /// Exposed because the report quotes it and a dump has to be checkable against
@@ -616,13 +644,16 @@ fn jitter_score(skeletons: &[Skeleton]) -> f32 {
     if count < 3 {
         return 0.0;
     }
-    let mut values = Vec::with_capacity((count - 2) * 52);
+    let mut values = Vec::with_capacity((count - 2) * CORRECTION_JOINTS.len());
     for frame in 1..count - 1 {
         let previous = &skeletons[frame - 1].positions;
         let current = &skeletons[frame].positions;
         let next = &skeletons[frame + 1].positions;
         let joints = current.len() / 3;
-        for joint in 0..joints {
+        for joint in CORRECTION_JOINTS {
+            if joint >= joints {
+                continue;
+            }
             let second = second_difference(previous, current, next, joint);
             values.push(
                 (second[0] * second[0] + second[1] * second[1] + second[2] * second[2]).sqrt(),
@@ -636,6 +667,15 @@ fn jitter_score(skeletons: &[Skeleton]) -> f32 {
     let index = ((values.len() as f32 * 0.99) as usize).min(values.len() - 1);
     values[index]
 }
+
+/// The joints the correction actually moves, for the "do no harm" gate.
+///
+/// Measuring **every** joint made that gate useless on a clip with a fast arm:
+/// the racket arm alone sets a 99th percentile of 144 mm, so a pass that cut the
+/// planted foot's float from 17 mm to 1 mm still tripped "jitter" and was thrown
+/// away — which is exactly what a viewer sees as a foot that will not stay put.
+/// The gate has to look where the pass acts: the root, the hips and the legs.
+const CORRECTION_JOINTS: [usize; 9] = [0, 1, 2, 4, 5, 7, 8, 10, 11];
 
 /// `previous - 2·current + next` for one joint: the frame at `current` is the
 /// middle one, so it is the term that gets doubled.
@@ -1409,6 +1449,355 @@ fn leg_ik(
         }
     }
 
+}
+
+/// `pear/foot_lock.py`'s `Contact`: one foot's causal contact state machine.
+///
+/// Everything above decides contact timing from the **whole clip** — it can see
+/// which frames a stance spans, so its pins are exact. The reference's live
+/// stabiliser cannot look ahead: it decides from the past only, and that is why
+/// its feet look still on takes where a frame-by-frame detector flickers. A
+/// contact needs 75 ms of low, slow evidence to lock, and once locked it stays
+/// locked until the foot is clearly high (65 mm above the floor), clearly fast
+/// (0.30 m/s) or clearly drifting (120 mm from its anchor). The 160 ms Hermite
+/// hand-over carries the offset across those transitions instead of dropping it.
+#[derive(Clone, Copy)]
+struct LiveContact {
+    locked: bool,
+    candidate: f64,
+    age: f64,
+    offset: [f64; 3],
+    offset_v: [f64; 3],
+    anchor: Option<[f64; 3]>,
+    input: Option<[f64; 3]>,
+    speed: f64,
+    strength: f64,
+    strength_v: f64,
+}
+
+impl Default for LiveContact {
+    fn default() -> Self {
+        Self {
+            locked: false,
+            candidate: 0.0,
+            // The reference starts its fade at 1.0, i.e. no hand-over in force.
+            age: 1.0,
+            offset: [0.0; 3],
+            offset_v: [0.0; 3],
+            anchor: None,
+            input: None,
+            speed: 0.0,
+            strength: 0.0,
+            strength_v: 0.0,
+        }
+    }
+}
+
+impl LiveContact {
+    /// Advance one frame and return the sole target the foot is held at.
+    ///
+    /// All three heights are relative to the floor, so a clip on a raised floor
+    /// behaves like one on the reference's ground plane.
+    fn update(&mut self, p: [f64; 3], dt: f64, floor: f64, enabled: bool) -> [f64; 3] {
+        let y = p[1] - floor;
+        let velocity = match self.input {
+            Some(input) => [
+                (p[0] - input[0]) / dt,
+                (p[1] - input[1]) / dt,
+                (p[2] - input[2]) / dt,
+            ],
+            None => [0.0; 3],
+        };
+        self.input = Some(p);
+        // 45 ms one-pole on the speed: the lock cannot be released by a single
+        // noisy frame, and it cannot be held by one either.
+        self.speed += (1.0 - (-dt / 0.045).exp()) * (length3(velocity) - self.speed);
+        // Contact evidence always comes from the uncorrected input, never the lock.
+        if enabled && y > -0.06 && y < 0.045 && self.speed < 0.18 {
+            self.candidate += dt;
+        } else {
+            self.candidate = 0.0;
+        }
+        let mut locked = self.locked;
+        if !locked && self.candidate >= 0.075 {
+            locked = true;
+        }
+        if locked
+            && (!enabled
+                || y > 0.065
+                || self.speed > 0.30
+                || self
+                    .anchor
+                    .map(|anchor| distance3(p, anchor) > 0.12)
+                    .unwrap_or(false))
+        {
+            locked = false;
+        }
+
+        let duration = 0.16;
+        self.age += dt;
+        let t = (self.age / duration).min(1.0);
+        let h0 = 2.0 * t * t * t - 3.0 * t * t + 1.0;
+        let h1 = t * t * t - 2.0 * t * t + t;
+        let (base, base_v) = if self.locked {
+            (self.anchor.unwrap_or(p), [0.0; 3])
+        } else {
+            (p, velocity)
+        };
+        let value = [
+            base[0] + h0 * self.offset[0] + h1 * duration * self.offset_v[0],
+            base[1] + h0 * self.offset[1] + h1 * duration * self.offset_v[1],
+            base[2] + h0 * self.offset[2] + h1 * duration * self.offset_v[2],
+        ];
+        let speed = [
+            base_v[0] + (6.0 * t * t - 6.0 * t) / duration * self.offset[0]
+                + (3.0 * t * t - 4.0 * t + 1.0) * self.offset_v[0],
+            base_v[1] + (6.0 * t * t - 6.0 * t) / duration * self.offset[1]
+                + (3.0 * t * t - 4.0 * t + 1.0) * self.offset_v[1],
+            base_v[2] + (6.0 * t * t - 6.0 * t) / duration * self.offset[2]
+                + (3.0 * t * t - 4.0 * t + 1.0) * self.offset_v[2],
+        ];
+        if locked != self.locked {
+            self.locked = locked;
+            if locked {
+                // The anchor keeps the height it was locked at, so the pin is a
+                // horizontal hold; the floor handles the vertical.
+                self.anchor = Some([p[0], floor, p[2]]);
+            }
+            let (next_base, next_base_v) = if locked {
+                (self.anchor.unwrap_or(p), [0.0; 3])
+            } else {
+                (p, velocity)
+            };
+            // Re-express the value being handed over relative to the new base, so
+            // the target is continuous exactly at the transition.
+            self.offset = [
+                value[0] - next_base[0],
+                value[1] - next_base[1],
+                value[2] - next_base[2],
+            ];
+            self.offset_v = [
+                speed[0] - next_base_v[0],
+                speed[1] - next_base_v[1],
+                speed[2] - next_base_v[2],
+            ];
+            self.age = 0.0;
+        }
+
+        // A separate continuous activation also hands the pelvis displacement
+        // back to free feet; ending an IK pass must not drop that displacement.
+        let goal = if locked { 1.0 } else { 0.0 };
+        let omega = 24.0;
+        let decay = (-omega * dt).exp();
+        let x = self.strength - goal;
+        let v = self.strength_v;
+        self.strength = goal + (x + (v + omega * x) * dt) * decay;
+        self.strength_v = (v - omega * (v + omega * x) * dt) * decay;
+        value
+    }
+}
+
+/// The reference's `smooth_correction`: a 50 ms one-pole on the **applied**
+/// rotation correction. The solve chases a noisy target; this does not.
+fn smooth_rotation(previous: &mut [f64; 9], target: &[f64; 9], dt: f64) -> [f64; 9] {
+    let error = axis_angle(&math::mul_t3(target, previous));
+    let alpha = 1.0 - (-dt / 0.05).exp();
+    let correction = rotvec_to_matrix([
+        error[0] as f64 * alpha,
+        error[1] as f64 * alpha,
+        error[2] as f64 * alpha,
+    ]);
+    *previous = math::mul3(&correction, previous);
+    *previous
+}
+
+/// The reference's `LiveFootLock.apply`, run as the last correction pass.
+///
+/// It re-locks the feet causally (see [`LiveContact`]) and re-solves the legs
+/// with the reference's own two-bone solver: the observability gate near full
+/// extension, the knee pole continued from the previous frame, the toe carried
+/// by the ankle's displacement and the foot's own orientation left untouched.
+/// The pelvis may come down by up to 4 cm — critically damped, so it cannot
+/// oscillate — and never goes up: lifting the body is the root chain's job.
+fn live_foot_lock(
+    sole: Option<&Sole>,
+    clip: &mut FlowClip,
+    body: &BodyModel,
+    settings: &CorrectionSettings,
+    report: &mut CorrectionReport,
+) {
+    let count = clip.skeletons.len();
+    if count < 3 {
+        return;
+    }
+    let fps = clip.fps.max(1.0) as f64;
+    let dt = 1.0 / fps;
+    let floor = settings.floor as f64;
+    let rest = body.rest_joints(&clip.betas);
+    let legs: [(usize, usize, usize, usize); 2] = [(1, 4, 7, 10), (2, 5, 8, 11)];
+    let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    let mut corrections = [[identity; 2]; 2];
+    let mut feet = [LiveContact::default(), LiveContact::default()];
+    let mut poles: [Option<[f64; 3]>; 2] = [None, None];
+    let mut shift = 0.0f64;
+    let mut shift_v = 0.0f64;
+
+    // The material point of the sole each foot's lock tracks: a **constant**
+    // offset in the ankle's own frame, which is what the reference's
+    // `rig.sole_offsets` is. Tracking the rolling support point instead makes the
+    // heel-to-toe roll read as foot speed — the foot then unlocks in the middle of
+    // a stance and re-locks at a new spot a few frames later, which is skating.
+    // The median over the clip is the material point that touches the floor most
+    // often, so it is the one a stance can be held at.
+    let mut offsets = [[0.0f64; 3]; 2];
+    for (side, (_, _, ankle, toe)) in legs.iter().enumerate() {
+        let mut samples = Vec::with_capacity(count);
+        for frame in 0..count {
+            let (world, positions) = crate::anatomical::forward(body, &clip.poses[frame], &rest);
+            let support = support_point(sole, clip, frame, side, *ankle, *toe);
+            samples.push(rotate3(
+                &math::transpose3(&world[*ankle]),
+                sub3(
+                    [support[0] as f64, support[1] as f64, support[2] as f64],
+                    positions[*ankle],
+                ),
+            ));
+        }
+        offsets[side] = [0, 1, 2].map(|axis| median_f64(&samples, axis));
+    }
+
+    for frame in 0..count {
+        let (world, positions) = crate::anatomical::forward(body, &clip.poses[frame], &rest);
+        // The evidence is the uncorrected input: the tracked sole point, which is
+        // the same material point on every frame and therefore measures the foot
+        // moving, not the foot rolling.
+        let mut points = [[0.0f64; 3]; 2];
+        for (side, (_, _, ankle, _)) in legs.iter().enumerate() {
+            points[side] = add3(positions[*ankle], rotate3(&world[*ankle], offsets[side]));
+        }
+        let targets = [
+            feet[0].update(points[0], dt, floor, true),
+            feet[1].update(points[1], dt, floor, true),
+        ];
+
+        // How far the pelvis has to come down for a locked foot to stay
+        // reachable: the reference's `limit`, bounded to 4 cm and never positive.
+        let mut reach = [0.0f64; 2];
+        let mut limit = 0.0f64;
+        for (side, (hip, knee, ankle, _)) in legs.iter().enumerate() {
+            let a = positions[*hip];
+            let b = positions[*knee];
+            let c = positions[*ankle];
+            let length = distance3(b, a) + distance3(c, b);
+            let maximum = (length - 1e-7).min(distance3(c, a));
+            reach[side] = maximum;
+            if feet[side].strength > 1e-4 {
+                let target = sub3(targets[side], rotate3(&world[*ankle], offsets[side]));
+                let horizontal =
+                    ((target[0] - a[0]).powi(2) + (target[2] - a[2]).powi(2)).sqrt();
+                if horizontal < maximum {
+                    let need = target[1] + (maximum * maximum - horizontal * horizontal).max(0.0).sqrt()
+                        - a[1];
+                    limit = limit.min(need * feet[side].strength);
+                }
+            }
+        }
+        // Critically damped, bounded pelvis compensation. It cannot oscillate.
+        let goal = limit.max(-0.04);
+        let omega = 12.0;
+        let decay = (-omega * dt).exp();
+        let x = shift - goal;
+        let v = shift_v;
+        shift = goal + (x + (v + omega * x) * dt) * decay;
+        shift_v = (v - omega * (v + omega * x) * dt) * decay;
+        if shift.abs() > 1e-9 {
+            clip.poses[frame].translation[1] += shift as f32;
+        }
+
+        for (side, (hip, knee, ankle, _)) in legs.iter().enumerate() {
+            let contact = feet[side];
+            // Fade-out targets stay active until their inertial offset expires.
+            let inactive = !contact.locked && contact.age >= 0.16 && contact.strength < 1e-4;
+            let a = [positions[*hip][0], positions[*hip][1] + shift, positions[*hip][2]];
+            let b = [positions[*knee][0], positions[*knee][1] + shift, positions[*knee][2]];
+            let c = [positions[*ankle][0], positions[*ankle][1] + shift, positions[*ankle][2]];
+            let mut target = sub3(targets[side], rotate3(&world[*ankle], offsets[side]));
+            target[1] += shift * (1.0 - contact.strength);
+            let l1 = distance3(b, a);
+            let l2 = distance3(c, b);
+            if l1.min(l2) < 1e-7
+                || reach[side] < (l1 - l2).abs() + 1e-7
+                || distance3(target, a) < 1e-8
+            {
+                continue;
+            }
+            let axis = normalise3(sub3(target, a));
+            let mut distance = distance3(target, a).clamp((l1 - l2).abs() + 1e-7, reach[side]);
+            // Near full extension, tiny height errors otherwise become a large
+            // square-root knee displacement. Retain the source bend there and
+            // accept foot residual instead of manufacturing crouch/extension.
+            let cosine =
+                ((l1 * l1 + l2 * l2 - reach[side] * reach[side]) / (2.0 * l1 * l2)).clamp(-1.0, 1.0);
+            let flex = 180.0 - cosine.acos().to_degrees();
+            let mut observable = ((flex - 6.0) / 12.0).clamp(0.0, 1.0);
+            observable = observable * observable * (3.0 - 2.0 * observable);
+            distance = reach[side] + observable * (distance - reach[side]);
+            let bone = sub3(b, a);
+            let mut knee_side = sub3(bone, scale3(axis, math::dot3(&bone, &axis)));
+            if length3(knee_side) < 0.001 {
+                // Continue the previous frame's pole rather than re-deriving it
+                // from a nearly straight leg, where it is undefined.
+                knee_side = match poles[side] {
+                    Some(pole) => pole,
+                    None => column3(&world[*hip], 2),
+                };
+                knee_side = sub3(knee_side, scale3(axis, math::dot3(&knee_side, &axis)));
+            }
+            if length3(knee_side) < 1e-8 {
+                knee_side = cross3(axis, least_axis(axis));
+            }
+            let pole = normalise3(knee_side);
+            poles[side] = Some(pole);
+            let along = (l1 * l1 - l2 * l2 + distance * distance) / (2.0 * distance);
+            let new_b = add3(
+                add3(a, scale3(axis, along)),
+                scale3(pole, (l1 * l1 - along * along).max(0.0).sqrt()),
+            );
+            let new_c = add3(a, scale3(axis, distance));
+            let desired = if inactive {
+                [identity; 2]
+            } else {
+                [
+                    math::align(&sub3(b, a), &sub3(new_b, a)),
+                    math::align(&sub3(c, b), &sub3(new_c, new_b)),
+                ]
+            };
+            let applied = [
+                smooth_rotation(&mut corrections[side][0], &desired[0], dt),
+                smooth_rotation(&mut corrections[side][1], &desired[1], dt),
+            ];
+            let solved_b = add3(a, rotate3(&applied[0], sub3(b, a)));
+            let solved_c = add3(solved_b, rotate3(&applied[1], sub3(c, b)));
+            // Publish what the solve produced as parent-relative angles. The
+            // ankle's **world** rotation is kept: the reference never rotates the
+            // ankle, which is what keeps the sole flat, and the toe then follows
+            // the ankle's displacement exactly as it does there.
+            let hip_world = math::mul3(&applied[0], &world[*hip]);
+            let knee_world = math::mul3(&applied[1], &world[*knee]);
+            let parent = match body.parents[*hip] {
+                value if value >= 0 => value as usize,
+                _ => 0,
+            };
+            let hip_local = math::tmul3(&world[parent], &hip_world);
+            let knee_local = math::tmul3(&hip_world, &knee_world);
+            let ankle_local = math::tmul3(&knee_world, &world[*ankle]);
+            clip.poses[frame].set_joint(*hip, axis_angle(&hip_local));
+            clip.poses[frame].set_joint(*knee, axis_angle(&knee_local));
+            clip.poses[frame].set_joint(*ankle, axis_angle(&ankle_local));
+            report.live_frames += 1;
+            report.live_residual = report.live_residual.max(distance3(solved_c, target) as f32);
+        }
+    }
 }
 
 /// Solve one leg pin at one frame and publish it, if the anatomical constraint
@@ -2879,6 +3268,35 @@ fn normalise3(v: [f64; 3]) -> [f64; 3] {
     [v[0] / len, v[1] / len, v[2] / len]
 }
 
+fn add3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn scale3(v: [f64; 3], scale: f64) -> [f64; 3] {
+    [v[0] * scale, v[1] * scale, v[2] * scale]
+}
+
+/// Column `index` of a row-major 3x3 matrix.
+fn column3(matrix: &[f64; 9], index: usize) -> [f64; 3] {
+    [matrix[index], matrix[3 + index], matrix[6 + index]]
+}
+
+/// The unit axis whose component of `v` is smallest, the reference's
+/// `np.eye(3)[np.argmin(abs(v))]`: a degenerate but deterministic fallback.
+fn least_axis(v: [f64; 3]) -> [f64; 3] {
+    let mut best = 0;
+    for index in 1..3 {
+        if v[index].abs() < v[best].abs() {
+            best = index;
+        }
+    }
+    [
+        (best == 0) as u8 as f64,
+        (best == 1) as u8 as f64,
+        (best == 2) as u8 as f64,
+    ]
+}
+
 fn angle_between(a: [f64; 3], b: [f64; 3]) -> f64 {
     let left = normalise3(a);
     let right = normalise3(b);
@@ -2957,6 +3375,21 @@ fn median(values: &[f32]) -> f32 {
         return 0.0;
     }
     let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let middle = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        0.5 * (sorted[middle - 1] + sorted[middle])
+    } else {
+        sorted[middle]
+    }
+}
+
+/// Per-axis median of a set of 3-vectors: the material point a foot rolls over.
+fn median_f64(values: &[[f64; 3]], axis: usize) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted: Vec<f64> = values.iter().map(|value| value[axis]).collect();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let middle = sorted.len() / 2;
     if sorted.len() % 2 == 0 {
@@ -3601,6 +4034,44 @@ mod tests {
             + (hips[2] - hips_before[2]).powi(2))
         .sqrt();
         assert!(drift < 1e-5, "hips drifted {drift}");
+    }
+
+    /// The reference's `Contact`: 75 ms of evidence to lock, never on a foot in
+    /// the air, and a clean release when the foot lifts.
+    #[test]
+    fn the_causal_contact_locks_only_on_slow_ground_evidence() {
+        let dt = 1.0 / 30.0;
+
+        // A low, slow sole: nothing at first, then locked once 75 ms of evidence
+        // has accumulated, with the hold strength ramping in behind it.
+        let mut planted = LiveContact::default();
+        for frame in 0..12 {
+            planted.update([0.001 * frame as f64, 0.01, 0.0], dt, 0.0, true);
+            if (frame as f64 + 1.0) * dt < 0.075 {
+                assert!(!planted.locked, "locked before 75 ms, frame {frame}");
+            }
+        }
+        assert!(planted.locked, "a low, slow sole locks after 75 ms");
+        assert!(planted.strength > 0.5, "hold strength {}", planted.strength);
+
+        // 12 cm above the floor is never a contact, however long it hangs there.
+        let mut airborne = LiveContact::default();
+        for _ in 0..40 {
+            airborne.update([0.0, 0.12, 0.0], dt, 0.0, true);
+        }
+        assert!(!airborne.locked, "a sole 12 cm up must not lock");
+        assert!(airborne.strength < 1e-3, "airborne hold {}", airborne.strength);
+
+        // Lifting a locked foot out of the window releases it.
+        let mut lifted = LiveContact::default();
+        for _ in 0..8 {
+            lifted.update([0.0, 0.01, 0.0], dt, 0.0, true);
+        }
+        assert!(lifted.locked);
+        for _ in 0..4 {
+            lifted.update([0.0, 0.08, 0.0], dt, 0.0, true);
+        }
+        assert!(!lifted.locked, "a foot lifted to 80 mm is not a contact");
     }
 }
 
