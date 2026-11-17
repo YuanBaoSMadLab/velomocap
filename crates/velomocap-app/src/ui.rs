@@ -2606,6 +2606,38 @@ fn correction_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
                     app.correction_dirty = true;
                 }
             });
+            // The network's per-frame noise, before the contacts are detected.
+            // Three levels rather than a number: the parameter is inverted
+            // (smaller is stronger), which no slider label survives.
+            //
+            // Off by default, and that is a measured decision, not caution:
+            // it is the single biggest win on `2月27日` (ankles 34.7 -> 24.6 mm)
+            // and on `短暂` (34.0 -> 28.4), but on `tennis.mp4` it takes the
+            // ankles from 27.8 to 107.2 mm, and the gate now refuses that pass
+            // outright — which leaves the take uncorrected, feet and all.
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(i18n::t("Smoothing")).size(11.0))
+                    .on_hover_text(i18n::t(
+                        "Smooth the generated motion before the contacts are detected. Helps a noisy take, but a fast one can be refused by the correction gate, which leaves it uncorrected",
+                    ));
+                let before = app.correction.smoothing;
+                egui::ComboBox::from_id_salt("smoothing")
+                    .selected_text(if app.correction.smoothing <= 0.0 {
+                        i18n::t("Off")
+                    } else if app.correction.smoothing <= 0.0015 {
+                        i18n::t("Light")
+                    } else {
+                        i18n::t("Medium")
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut app.correction.smoothing, 0.0, i18n::t("Off"));
+                        ui.selectable_value(&mut app.correction.smoothing, 0.001, i18n::t("Light"));
+                        ui.selectable_value(&mut app.correction.smoothing, 0.003, i18n::t("Medium"));
+                    });
+                if app.correction.smoothing != before {
+                    app.correction_dirty = true;
+                }
+            });
             ui.add_space(4.0);
             if ui
                 .checkbox(

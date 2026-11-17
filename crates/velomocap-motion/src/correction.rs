@@ -229,6 +229,10 @@ pub enum SkipReason {
     None,
     /// The joint-based float got worse.
     Float,
+    /// A planted sole went further under the floor than it was already.
+    Sink,
+    /// The ankles ended up shaking more than the pass is allowed to add.
+    Ankle,
     /// The lower foot slid more than 5 % further.
     Slide,
     /// The clip got 50 % jumpier.
@@ -354,15 +358,19 @@ impl CorrectionReport {
         }
         if self.skipped {
             out.push_str(&format!(
-                " (rolled back by {}: float {:.1}->{:.1} mm, slide {:.2}->{:.2} cm/frame, jitter {:.1}->{:.1} mm)",
+                " (rolled back by {}: float {:.1}->{:.1} mm, sink {:.1}->{:.1} mm, slide {:.2}->{:.2} cm/frame, jitter {:.1}->{:.1} mm)",
                 match self.skipped_by {
                     SkipReason::Float => "float",
+                    SkipReason::Sink => "sink",
+                    SkipReason::Ankle => "ankle shake",
                     SkipReason::Slide => "slide",
                     SkipReason::Jitter => "jitter",
                     SkipReason::None => "the gate",
                 },
                 self.float_before,
                 self.float_after,
+                self.feet_before.sink_mm[0].max(self.feet_before.sink_mm[1]),
+                self.feet_after.sink_mm[0].max(self.feet_after.sink_mm[1]),
                 self.slide_before,
                 self.slide_after,
                 self.jitter_before * 1000.0,
@@ -415,13 +423,25 @@ pub fn apply(
 /// *halving*, which is a stricter copy of `slide_helps` and discarded the one
 /// case this exists for: `2月27日.vp` reached `float 62.2 -> 0.7 mm` with
 /// `slide 0.28 -> 0.14` and was rolled back because exactly-half is not half.
-fn sole_gain_wins(slide_before: f32, slide_after: f32, float_before: f32, float_after: f32) -> bool {
+fn sole_gain_wins(
+    slide_before: f32,
+    slide_after: f32,
+    float_before: f32,
+    float_after: f32,
+    sink_before: f32,
+    sink_after: f32,
+) -> bool {
     // `float_before > 0.0` matters: `0.0 * 4.0 <= 0.0` is true, so a clip that
     // was already on the floor used to qualify for the escape hatch and could
     // keep any amount of extra leg motion. There has to be float to give back.
+    //
+    // The sink is a veto, never a gain: a pass that trades 6 cm of hover for a
+    // foot 7 cm underground has not improved the sole, whatever float and slide
+    // say.
     float_before > 0.0
         && float_after * 4.0 <= float_before
         && slide_after <= slide_before * 1.05 + 0.02
+        && sink_after <= sink_before + 10.0
 }
 
 /// Apply the correction with hand-drawn contact timing.
@@ -584,6 +604,14 @@ pub fn apply_with_locks(
     let worst_slide = |metrics: &crate::metrics::FootMetrics| {
         metrics.slide_cm[0].max(metrics.slide_cm[1])
     };
+    // The metric the gate was blind to. `sink` is how far a planted sole goes
+    // *under* the plane, and a pass can improve float and slide while burying
+    // the foot: `--smooth 0.0001` on `2月27日` reached `slide 0.50 -> 0.15`,
+    // `float 55.5 -> 0.4` and `sink 4.1 -> 73.3 mm`, and the gate let it
+    // through. A foot under the floor is worse than a foot hovering over it.
+    let worst_sink = |metrics: &crate::metrics::FootMetrics| {
+        metrics.sink_mm[0].max(metrics.sink_mm[1])
+    };
     let measured = !report.feet_before.empty() && !report.feet_after.empty();
     if measured {
         report.float_before = worst_float(&report.feet_before);
@@ -593,6 +621,18 @@ pub fn apply_with_locks(
     }
     let slide_helps = worst_slide(&report.feet_after) <= worst_slide(&report.feet_before) * 1.05 + 0.02;
     let float_helps = worst_float(&report.feet_after) <= worst_float(&report.feet_before) + 1.0;
+    // One centimetre of slack, not zero: a sole that lands *on* the plane
+    // measures a millimetre or two of penetration from the mesh, and the point
+    // is to catch a foot that went 7 cm into the floor, not to argue about a
+    // millimetre.
+    let sink_helps = worst_sink(&report.feet_after) <= worst_sink(&report.feet_before) + 10.0;
+    // The legs are the other half of the promise, and they are not the same
+    // signal as the whole-body jitter: `tennis.mp4` with `--smooth 0.001` passed
+    // on float, slide and sink while its ankles went 27.8 -> 107.2 mm. 1.5x plus
+    // 15 mm absolute, so a clip whose own ankles are already quiet can still pay
+    // the ~15 mm that pinning costs.
+    let ankle_helps = report.ankle_before <= 0.0
+        || report.ankle_after <= report.ankle_before * 1.5 + 0.025;
     // The 1.5x tolerance is a ratio on a metric that can be a few millimetres, so
     // a 0.3 mm overshoot used to throw away a pass that cut the planted foot's
     // float from 13.5 mm to 3.2 mm (`短暂.mp4`, 105 frames). The absolute slack is
@@ -623,12 +663,18 @@ pub fn apply_with_locks(
             worst_slide(&report.feet_after),
             worst_float(&report.feet_before),
             worst_float(&report.feet_after),
+            worst_sink(&report.feet_before),
+            worst_sink(&report.feet_after),
         );
     let jitter_helps = after.jitter <= before.jitter * 1.5 + 0.003
         // Even a big sole gain may not turn the body into a windmill: the ceiling
-        // is 3x, and the knee spikes on that clip (2.5x) sit under it.
-        || (big_sole_gain && after.jitter <= before.jitter * 3.0);
-    let helps = jitter_helps && (!measured || (slide_helps && float_helps));
+        // is 3x plus 5 mm. The absolute slack is what a *smooth* input needs:
+        // pinning the feet costs the legs the same ~15 mm of second difference
+        // whatever the input did, so on a clip whose own jitter is 7.5 mm that
+        // cost alone is 3x and the relative test alone rolls back a pass that
+        // improves float 46.7 mm -> 0.0 and slide 0.36 -> 0.05.
+        || (big_sole_gain && after.jitter <= before.jitter * 3.0 + 0.005);
+    let helps = jitter_helps && (!measured || (slide_helps && float_helps && sink_helps && ankle_helps));
     // A diagnostic escape hatch: seeing a rolled-back pass's own output is what
     // tells a bad correction apart from a bad gate.
     let helps = helps || std::env::var_os("VELOMOCAP_NO_GATE").is_some();
@@ -641,6 +687,10 @@ pub fn apply_with_locks(
         // tripped.
         report.skipped_by = if measured && !float_helps {
             SkipReason::Float
+        } else if measured && !sink_helps {
+            SkipReason::Sink
+        } else if measured && !ankle_helps {
+            SkipReason::Ankle
         } else if measured && !slide_helps {
             SkipReason::Slide
         } else {
@@ -2132,11 +2182,23 @@ fn apply_leg_pin(
         (target[1] - current[1] as f64) * weight as f64,
         (target[2] - current[2] as f64) * weight as f64,
     ];
-    let length = (want[0] * want[0] + want[1] * want[1] + want[2] * want[2]).sqrt();
-    if length > cap && length > 0.0 {
-        want[0] *= cap / length;
-        want[1] *= cap / length;
-        want[2] *= cap / length;
+    // Cap the **horizontal** step only. `target` already carries the floor lift
+    // from `leg_ik`, and that lift is the part that keeps a sole out of the
+    // plane; clamping it with the same 5 cm is how a foot ends up 7 cm
+    // underground on a clip whose stance needed 9 cm of vertical correction
+    // (measured: `--smooth 0.0001` on `2月27日`, sink 4.1 -> 73.3 mm). Horizontal
+    // stays bounded: that is the part that could drag a foot across the floor.
+    let horizontal = (want[0] * want[0] + want[2] * want[2]).sqrt();
+    if horizontal > cap && horizontal > 0.0 {
+        want[0] *= cap / horizontal;
+        want[2] *= cap / horizontal;
+    }
+    let vertical = want[1].abs();
+    if vertical > cap {
+        // Still bounded, but generously: a vertical correction larger than the
+        // cap is a lift back onto the plane, not a step sideways.
+        let limit = cap * 2.5;
+        want[1] = want[1].clamp(-limit, limit);
     }
     if want[0].abs() + want[1].abs() + want[2].abs() < 1e-5 {
         return;
@@ -4491,16 +4553,23 @@ mod tests {
     /// because the slide only halved, and the viewport showed the raw motion.
     #[test]
     fn a_halved_slide_still_counts_as_a_gain() {
-        assert!(sole_gain_wins(0.28, 0.14, 62.2, 0.7), "the case that failed");
+        assert!(sole_gain_wins(0.28, 0.14, 62.2, 0.7, 0.0, 0.0), "the case that failed");
         // The same pass with the slide left where it was is still a gain: it did
         // not make the foot skate.
-        assert!(sole_gain_wins(0.28, 0.28, 62.2, 0.7));
+        assert!(sole_gain_wins(0.28, 0.28, 62.2, 0.7, 0.0, 0.0));
         // A pass that trades the float for skating is not a gain.
-        assert!(!sole_gain_wins(0.28, 0.45, 62.2, 0.7));
+        assert!(!sole_gain_wins(0.28, 0.45, 62.2, 0.7, 0.0, 0.0));
         // Nor is one that barely moved the float.
-        assert!(!sole_gain_wins(0.28, 0.10, 62.2, 40.0));
+        assert!(!sole_gain_wins(0.28, 0.10, 62.2, 40.0, 0.0, 0.0));
         // A clip with no float to begin with cannot claim the escape hatch.
-        assert!(!sole_gain_wins(0.02, 0.01, 0.0, 0.0));
+        assert!(!sole_gain_wins(0.02, 0.01, 0.0, 0.0, 0.0, 0.0));
+        // A foot buried under the plane is not an improvement, whatever the
+        // float and slide did: `--smooth 0.001` on `2月27日` before the cap was
+        // split reached `float 57.8 -> 0.4` with `sink 0.1 -> 29.2 mm`.
+        assert!(!sole_gain_wins(0.50, 0.17, 57.8, 0.4, 0.1, 29.2));
+        // The same gain while the sink merely stays put is fine: the source
+        // itself stood 14 mm under the plane on one take.
+        assert!(sole_gain_wins(0.40, 0.06, 45.4, 0.0, 14.5, 14.5));
     }
 }
 

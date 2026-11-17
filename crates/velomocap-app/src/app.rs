@@ -2964,17 +2964,58 @@ fn playback_frame(anchor: usize, elapsed: f64, fps: f64, speed: f64, frames: usi
     (anchor + step.max(0.0) as usize) % frames
 }
 
+/// The clock the log timestamps carry, in **local** time.
+///
+/// This used to be `SystemTime` seconds modulo a day, which is UTC: a run at
+/// 22:16 was written as `[14:16:53]` and every "which run was that?" question
+/// started with an eight-hour subtraction. Windows has the local time and the
+/// standard library does not, so ask it directly rather than add a dependency
+/// for one number.
 fn chrono_like_clock() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let seconds = now.as_secs() % 86_400;
-    format!(
-        "{:02}:{:02}:{:02}",
-        seconds / 3600,
-        (seconds % 3600) / 60,
-        seconds % 60
-    )
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct SystemTime {
+            year: u16,
+            month: u16,
+            day_of_week: u16,
+            day: u16,
+            hour: u16,
+            minute: u16,
+            second: u16,
+            milliseconds: u16,
+        }
+        extern "system" {
+            fn GetLocalTime(target: *mut SystemTime);
+        }
+        let mut now = SystemTime {
+            year: 0,
+            month: 0,
+            day_of_week: 0,
+            day: 0,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            milliseconds: 0,
+        };
+        // SAFETY: `GetLocalTime` fills the struct it is given; nothing else
+        // touches it, and every field is a plain `u16`.
+        unsafe { GetLocalTime(&mut now) };
+        return format!("{:02}:{:02}:{:02}", now.hour, now.minute, now.second);
+    }
+    #[cfg(not(windows))]
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let seconds = now.as_secs() % 86_400;
+        format!(
+            "{:02}:{:02}:{:02}",
+            seconds / 3600,
+            (seconds % 3600) / 60,
+            seconds % 60
+        )
+    }
 }
 
 /// Where every log line also goes, so a report outlives the window.
