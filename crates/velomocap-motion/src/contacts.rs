@@ -441,14 +441,24 @@ pub fn prepare(
     // uses, so a slow world-height drift is not mistaken for a lift. The margin is
     // the reference's own `HOLD_NEAR` (4 cm) plus 2 cm of sole-roll slack.
     let foot_height = |frame: usize, foot: usize| height[frame][foot];
+    // A *quantile* of the window, not its minimum: one bad frame (a foot that
+    // dips through the floor for three frames, a reconstruction hiccup) would
+    // otherwise pull the envelope down for the whole 8 s window and turn every
+    // real stance into "lifted".
+    let mut window: Vec<f32> = Vec::new();
     let envelope: Vec<f32> = (0..count)
         .map(|frame| {
-            let mut low = f32::MAX;
-            for offset in -radius..=radius {
-                let at = (frame as isize + offset).clamp(0, count as isize - 1) as usize;
-                low = low.min(height[at][0].min(height[at][1]));
+            window.clear();
+            let first = (frame as isize - radius).max(0) as usize;
+            let last = ((frame as isize + radius) as usize).min(count - 1);
+            // The real index range, not a clamped walk: clamping the offsets would
+            // repeat the first/last frame hundreds of times and pull the quantile
+            // towards it (a clip that opens three frames low reported the whole
+            // floor as low).
+            for at in first..=last {
+                window.push(height[at][0].min(height[at][1]));
             }
-            low
+            quantile(&window, 0.05)
         })
         .collect();
     for frame in 0..count {

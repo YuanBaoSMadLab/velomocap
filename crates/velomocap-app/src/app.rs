@@ -366,6 +366,9 @@ pub struct VeloMocap {
     pub status: String,
     pub error: Option<String>,
     pub export_note: Option<String>,
+    /// The last capture summary already written to the log, so the correction
+    /// report is logged once per run instead of on every paint.
+    pub logged_summary: String,
     /// Hand-drawn contact timing for the selected clip: four sparse tracks of
     /// frame intervals (left foot, right foot, left hand, right hand).
     pub locks: velomocap_motion::ContactTracks,
@@ -567,6 +570,7 @@ impl VeloMocap {
             ort_path,
             cuda_ok,
             export_note: None,
+            logged_summary: String::new(),
             locks: velomocap_motion::ContactTracks::automatic(),
             selected_lock: None,
             lock_undo: Vec::new(),
@@ -2493,6 +2497,14 @@ impl VeloMocap {
         }
         if !summary.is_empty() && self.export_note.is_none() {
             self.export_note = Some(format!("{summary}\n{timings}"));
+        }
+        // The correction report is the only thing that says whether the lock ran,
+        // how many contacts it found and whether the pass was rolled back. It used
+        // to sit in the export note alone, which is the last place anyone looks
+        // when the feet will not stay put.
+        if finished && !summary.is_empty() && self.logged_summary != summary {
+            self.log(summary.clone());
+            self.logged_summary = summary.clone();
         }
         if stage != CaptureStage::Idle && stage != CaptureStage::Failed {
             let _people = if people_count > 0 {

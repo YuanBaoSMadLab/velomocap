@@ -524,7 +524,12 @@ pub fn apply_with_locks(
     }
     let slide_helps = worst_slide(&report.feet_after) <= worst_slide(&report.feet_before) * 1.05 + 0.02;
     let float_helps = worst_float(&report.feet_after) <= worst_float(&report.feet_before) + 1.0;
-    let helps = after.jitter <= before.jitter * 1.5
+    // The 1.5x tolerance is a ratio on a metric that can be a few millimetres, so
+    // a 0.3 mm overshoot used to throw away a pass that cut the planted foot's
+    // float from 13.5 mm to 3.2 mm (`短暂.mp4`, 105 frames). The absolute slack is
+    // the part of the promise that matters: "no more than a millimetre or so of
+    // extra twitch", not "no more than 50 % of a tiny number".
+    let helps = after.jitter <= before.jitter * 1.5 + 0.003
         && (!measured || (slide_helps && float_helps));
     // A diagnostic escape hatch: seeing a rolled-back pass's own output is what
     // tells a bad correction apart from a bad gate.
