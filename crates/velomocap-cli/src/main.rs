@@ -355,6 +355,9 @@ enum Command {
         live_lock: bool,
         #[arg(long)]
         joint_sole: bool,
+        /// Correction mode: `flat` or `multi` (`--lock-mode` in `flow`).
+        #[arg(long, default_value = "flat")]
+        lock_mode: String,
     },
     /// Run the SAM 3D Body TorchScript module through LibTorch.
     SamTorch {
@@ -586,6 +589,7 @@ fn main() -> Result<()> {
             no_pose_plan,
             live_lock,
             joint_sole,
+            lock_mode,
         } => replay_clip(
             &joints,
             &rotations,
@@ -604,6 +608,7 @@ fn main() -> Result<()> {
                 no_pose_plan,
                 live_lock,
                 joint_sole,
+                lock_mode: lock_mode.clone(),
             },
         ),
         Command::Flow {
@@ -2841,6 +2846,8 @@ struct ReplayFlags {
     no_pose_plan: bool,
     live_lock: bool,
     joint_sole: bool,
+    /// `flat` or `multi` (`--lock-mode`), the same option `flow` takes.
+    lock_mode: String,
 }
 
 fn read_f32(path: &std::path::Path) -> Result<Vec<f32>> {
@@ -2985,6 +2992,10 @@ fn replay_clip(
         pose_plan: !flags.no_pose_plan,
         live_lock: flags.live_lock,
         mesh_sole: !flags.joint_sole,
+        mode: match flags.lock_mode.as_str() {
+            "multi" => velomocap_motion::correction::CorrectionMode::MultiLevel,
+            _ => velomocap_motion::correction::CorrectionMode::Flat,
+        },
         ..Default::default()
     };
     let report = velomocap_motion::correction::apply(&mut clip, &body, &settings)?;

@@ -1578,11 +1578,7 @@ fn leg_ik(
                     toe,
                     foot.weights[index][foot_index],
                 );
-                let expected = sole_at[1] as f64 + (target[1] - current[1] as f64);
-                let floor = settings.floor as f64;
-                if expected < floor {
-                    target[1] += floor - expected;
-                }
+                target[1] = keep_sole_on_floor(target[1], current[1] as f64, sole_at[1], settings.floor);
             }
             let hip_f = joint(&clip.skeletons[index], hip).map(|value| value as f64);
             if distance3(target, hip_f) < min_reach * 1.0005 {
@@ -2057,8 +2053,23 @@ fn apply_leg_pin(
     }
 }
 
-/// The ankle target that lands the sole's support point on the contact anchor.
+/// A hand-off target that may lower a foot to the floor, never through it.
 ///
+/// The ankle carries the sole with it, so the sole a target predicts is
+/// `sole_y + (target_y - current_y)`; anything below the plane is lifted back to
+/// it. A release frame keeps its horizontal and forward motion — only the part of
+/// the vertical hand-off that would bury the foot is given up.
+fn keep_sole_on_floor(target_y: f64, current_y: f64, sole_y: f32, floor: f32) -> f64 {
+    let expected = sole_y as f64 + (target_y - current_y);
+    let floor = floor as f64;
+    if expected < floor {
+        target_y + (floor - expected)
+    } else {
+        target_y
+    }
+}
+
+/// The ankle target that lands the sole's support point on the contact anchor.///
 /// `contact_offsets` in the reference: `offsets[active] = (anchors - support -
 /// shift)·strength` and `targets = fk(ankle) + shift + offsets`, which collapses
 /// to this once the root shift cancels at full strength. **All three axes**: the
@@ -4167,6 +4178,35 @@ mod tests {
         for anchor in &path {
             assert!((anchor[0] - 0.09).abs() < 1e-5, "anchor at {}", anchor[0]);
         }
+    }
+
+    /// A release hand-off may lower a foot to the floor, never through it.
+    ///
+    /// `2月27日.mp4` is the case: the take stands ~7 cm above the estimated floor,
+    /// so a stance's vertical residual is ~7 cm, and carrying it out unchanged put
+    /// the sole 56 mm *below* the plane while the foot was already leaving.
+    #[test]
+    fn a_release_never_buries_the_foot() {
+        let floor = 0.0f32;
+        let current = 0.12f64; // ankle height
+        let sole = 0.062f32; // sole height, measured
+
+        // A 70 mm downward hand-off would put the sole at -8 mm.
+        let lifted = keep_sole_on_floor(current - 0.070, current, sole, floor);
+        // The ankle that puts the sole exactly on the floor is 62 mm down.
+        assert!(
+            (lifted - (current - 0.062)).abs() < 1e-6,
+            "target {} should stop the sole at the floor",
+            lifted
+        );
+
+        // A hand-off that keeps the sole above the plane is left alone.
+        let untouched = keep_sole_on_floor(current - 0.020, current, sole, floor);
+        assert!((untouched - (current - 0.020)).abs() < 1e-9);
+
+        // A downward hand-off on a foot already on the floor keeps it there.
+        let flat = keep_sole_on_floor(current - 0.01, current, 0.0, floor);
+        assert!(flat > current - 1e-9, "foot pushed into the floor");
     }
 
     /// `support_weights`: flat foot is 0.5, a rolled foot moves the weight to
