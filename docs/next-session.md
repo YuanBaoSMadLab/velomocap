@@ -132,3 +132,27 @@ cargo build --release -p velomocap-app -p velomocap-cli
 因果锁单独跑明显不如精确 IK（sink 17.8 mm），叠在精确 IK 上才有用（右脚 slide 0.13→0.08）。
 参考里 `LiveFootLock` 只用在 PEAR 实时预览（`pear/multi_worker.py:224`），批处理
 `flow_correction.py` 完全没有它 —— 我们是把它当批处理的最后一级叠加，这是和参考的结构差异。
+
+## 6. 脚抖的真凶：batch 里用了 live 路径的 50 ms 滤波器
+
+`apply_leg_pin` 把求解结果又过了一遍一阶低通（抄自 `pear/foot_lock.py::smooth_correction`）。
+那条滤波在 live 路径是对的（目标是因果猜测，需要阻尼），但 batch 里目标本来就是精确的
+（stance anchor + 规划好的交接），滤波只是让"已解出的纠正"滞后于仍在移动的源。
+
+| 版本 | slide cm/帧 | float mm | sink mm | 整体 jitter | ankle shake |
+|---|---|---|---|---|---|
+| 带滤波（旧） | 0.16 / 0.08 | 0.6 / 0.2 | 3.0 / 1.9 | 35.5 | 42.8 |
+| 直接应用（新） | **0.02 / 0.01** | **0.4 / 0.1** | **0.0 / 0.7** | **28.3** | **34.6** |
+
+tennis 90 帧窗口同样：slide `0.47/0.26 → 0.01/0.02`，float `16.8/8.8 → 0.3/0.5`，
+root 0.842–1.057 m（跳还在），ankle shake 47.5→48.4（几乎不加）。
+
+同时修正两处：
+- `reach_falloff` 改回参考的 `1/(1+(gap/.03)^4)`（gap 以米计、只算"够不着"的部分）。
+- 支撑点用 stance 的平滑脚跟权重（参考 `support_samples` 与 `rolling_anchor` 共用同一份）。
+
+## 7. 显存 20 GB（未解决，先加日志）
+
+16 GB 卡跑出 20 GB 说明分配器已经超订、Windows 在换页——之前的 onnxruntime CUDA 崩溃很可能就是它。
+现在 Log 里每 10 帧、以及每个阶段边界都会写一行 `VRAM 1234/16311 MiB · <stage>`，
+问题复现时把这几行贴出来就能定位是哪个阶段在涨。
