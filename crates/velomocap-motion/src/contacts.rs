@@ -32,6 +32,15 @@ pub const GATE_HEIGHT: f32 = 0.12;
 pub const HOLD_SPEED: f32 = 0.25;
 /// How far from the floor a held stance may sit.
 pub const HOLD_NEAR: f32 = 0.04;
+/// How far above the **local floor** a sole may be and still count as planted.
+///
+/// The reference never needs this: its contact head reports a raised foot. The
+/// FlowHMR head is confident on airborne feet too (a serve take averages 0.91),
+/// and the `geometry` gate only compares the two feet with each other, so a jump
+/// shorter than `airborne_excursions`'s 15 cm arc would stay "planted" and be
+/// pushed back onto the floor. `HOLD_NEAR` plus 2 cm of sole-roll slack.
+pub const CONTACT_LIFT: f32 = 0.06;
+
 /// A bridging stage only touches gaps at most this wide, in the reference's
 /// two-foot step test (`|Δxz| < .04` between the two sides of the gap).
 pub const BRIDGE_STEP: f32 = 0.04;
@@ -418,6 +427,37 @@ pub fn prepare(
             active[frame] = [false; 2];
         }
     }
+    let reach = count.min((fps * 4.0).round().max(2.0) as usize);
+    let radius = reach as isize;
+
+    // A foot well above the local floor is not in contact, whatever the network's    // contact head says. `airborne_excursions` catches a *bounded* arc that clears
+    // 15 cm above both sides; a smaller hop — or one whose landing is not visible
+    // in the take — stays "planted" for the geometry gate (both feet being at the
+    // same height is what `geometry` tests), and then the grounding pass presses
+    // the whole body down to put that "planted" foot on the floor: the jump is
+    // flattened, which is exactly what "跳起来却被摁在地上" looks like.
+    //
+    // The envelope is the local lower surface, the same shape `airborne_excursions`
+    // uses, so a slow world-height drift is not mistaken for a lift. The margin is
+    // the reference's own `HOLD_NEAR` (4 cm) plus 2 cm of sole-roll slack.
+    let foot_height = |frame: usize, foot: usize| height[frame][foot];
+    let envelope: Vec<f32> = (0..count)
+        .map(|frame| {
+            let mut low = f32::MAX;
+            for offset in -radius..=radius {
+                let at = (frame as isize + offset).clamp(0, count as isize - 1) as usize;
+                low = low.min(height[at][0].min(height[at][1]));
+            }
+            low
+        })
+        .collect();
+    for frame in 0..count {
+        for foot in 0..2 {
+            if active[frame][foot] && foot_height(frame, foot) - envelope[frame] > CONTACT_LIFT {
+                active[frame][foot] = false;
+            }
+        }
+    }
 
     let mut values: Vec<f32> = Vec::new();
     for frame in 0..count {
@@ -487,10 +527,42 @@ mod tests {
         assert!(prepared.active.iter().all(|row| row[0]));
     }
 
+    /// A slow hop that clears less than the reference's 15 cm jump arc is still
+    /// "planted" for the geometry gate — both feet rise together — so it needs the
+    /// floor-proximity gate. Without it the grounding pass would press the body
+    /// back down onto the floor and the jump would disappear.
+    #[test]
+    fn a_slow_hop_is_not_a_stance() {
+        let count = 40;
+        let mut probes = Vec::with_capacity(count);
+        for frame in 0..count {
+            // 8 cm up over five frames (0.48 m/s vertical), five frames at the
+            // top, then back down.
+            let lift = match frame {
+                10..=14 => (frame - 9) as f32 * 0.016,
+                15..=19 => 0.08,
+                20..=24 => (30 - frame) as f32 * 0.016,
+                _ => 0.0,
+            };
+            let mut row = planted(0.0 + lift);
+            row[1] = row[0];
+            probes.push(row);
+        }
+        let probabilities = vec![[0.99f32; 4]; count];
+        let prepared = prepare(&probes, &probabilities, 30.0, &Config::normal(), None);
+        for frame in 14..=20 {
+            assert!(
+                !prepared.active[frame][0] && !prepared.active[frame][1],
+                "frame {frame} is {:.3} m up but was called planted",
+                0.08
+            );
+        }
+        assert!(prepared.active[0][0] && prepared.active[0][1], "the ground frames stay planted");
+    }
+
     /// A foot sliding at 1 m/s passes the height gate but not the speed gate.
     #[test]
-    fn a_sliding_foot_is_not_a_contact() {
-        let count = 30;
+    fn a_sliding_foot_is_not_a_contact() {        let count = 30;
         let probes: Vec<Probes> = (0..count)
             .map(|frame| {
                 let mut row = planted(0.08);
