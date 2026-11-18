@@ -970,3 +970,37 @@ Still open from this: when the picked body is retired *and* a bystander is the
 best `continues` match, that bystander is adopted into the pick's own slot -
 a few frames of the wrong body rather than a second person. ByteTrack's
 `with_reid` is what the reference uses to avoid it.
+
+## 23. Leaving the app (exit, unsaved work, recovery)
+
+Reported: after closing the window the process stayed behind, invisible and
+holding the GPU and the executable's file lock. That is what the earlier
+`velomocap-app.running-*.exe` files were: a build cannot replace an exe that a
+leftover process still maps.
+
+Cause: not the close, but the teardown. Workers own CUDA and ONNX Runtime
+contexts, and `run_native` returned while a thread was still in a driver call;
+`main` finished, the process did not. `main` now exits with `process::exit`
+once the window is gone, so nothing waits for destructors that may never run.
+
+Close with unsaved work now asks: the close request is intercepted
+(`ViewportCommand::CancelClose`), and `VeloMocap::dirty()` answers "is anything
+on screen that a `.vp` does not hold?" from a workspace fingerprint - no hook
+at every widget that can change the scene. A running reconstruction counts as
+unsaved too. "Save and close" only leaves when the write reported success.
+
+Recovery: `%TEMP%\VeloMocap\autosave.vp`, written right after a capture and
+then every three minutes, atomically on a worker; `session.lock` holds the pid
+of the live session. No marker = clean exit; marker + pid alive = another
+window; marker + pid gone = the last session died, and the next launch offers
+the autosave. `VELOMOCAP_RECOVERY_DIR` moves all of it for tests, and headless
+runs (`--capture`, `--save-project`, exports) take no part, so a verification
+run cannot look like a crash.
+
+Checked on a real window: clean close exits by itself and removes the marker;
+close with 4 baked clips stops the close and shows the dialog; `taskkill`
+leaves the marker and the next launch shows the recovery dialog.
+
+Not done: a click on the dialog buttons was not exercised end to end (synthetic
+input into an egui window is unreliable); the handlers are six lines each and
+visual, unit-test and file-state checks cover the rest.
