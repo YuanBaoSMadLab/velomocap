@@ -929,3 +929,44 @@ the sole at +16 mm median, and adding the raw foot-thickness difference
 Stage 2 (target-side two-bone contact solve, ~120 lines) is the next real step,
 and `--measure-soles` is its acceptance test: planted tilt -> ~0, and the
 lowest-sole median -> 0 with a tight spread.
+
+## 22. The cast grew while the take ran (fixed)
+
+Reported: "one person selected at the start, three by the end; I tested the
+previous version". Not reproducible on a 4-frame run - it needs a frame where
+the picked track is *not* detected.
+
+The old rule, per frame:
+
+* frame 0 kept every track overlapping a seed box;
+* every other frame kept the seeded tracks, and - when none of them had a
+  detection that frame - *all* the tracks that passed `continues(last_box)`:
+  overlap > 0.15, or a centre within 0.6 body sizes of the box the person was
+  last seen in. Each accepted id got its own `PersonTrack`.
+
+So one missed detection of the picked body, with three people standing around
+it, produced four people in that single frame. That is the "1 -> 3" jump.
+
+Now (`selection_tests`):
+
+* `picks[seed]` holds the identity; `slots[seed]` is the one `PersonTrack` its
+  frames land in, whatever the track id becomes.
+* While the track coasts (`missing <= max_missing`) the identity is held, so no
+  other body can answer for it. A replacement is only looked for once the
+  tracker has retired the track (`missing > max_missing`).
+* A track owned by another pick cannot be taken over.
+
+Evidence: the legacy rule replayed on the same scripted frames (1 picked body,
+3 bystanders, one missed detection) creates 4 people; the new rule creates 1.
+That assertion was run once and then deleted, since keeping the old rule in the
+tree would mean keeping dead logic around. Real clip, 4 people on screen,
+`--select 1`, 30 frames: one seed, one track, one `flow: Person 1`.
+
+Headless runs no longer stay in the window loop: `VELOMOCAP_EXIT_AFTER_CAPTURE=1`
+exits after the report. A leftover process held `velomocap-app.exe` locked, so
+the next `cargo build` could not link.
+
+Still open from this: when the picked body is retired *and* a bystander is the
+best `continues` match, that bystander is adopted into the pick's own slot -
+a few frames of the wrong body rather than a second person. ByteTrack's
+`with_reid` is what the reference uses to avoid it.
