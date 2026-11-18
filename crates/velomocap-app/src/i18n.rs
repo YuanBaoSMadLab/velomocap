@@ -216,6 +216,8 @@ pub fn t(english: &'static str) -> &'static str {
         "Offset from the automatic pelvis height; positive gives back the reach drop, negative lowers the body" => "相对自动骨盆高度的偏移；正值只把自动压低的部分还回来，负值压低身体",
         "Pin planted feet and resting hands after the motion is generated" => "动作生成后锁定着地的脚和静止的手",
         "Reconstruct this person when the run starts" => "开始重建时包含此人",
+        "Select all" => "全选",
+        "Select none" => "全不选",
         "Select this person: the box over the clip is drawn in this colour" => "选中此人：视频上的框会用这个颜色标出",
         "One take per video in this build; the reference's multi-take scene is not implemented" => "此版本每个视频一个 take；参考里的多 take 场景尚未实现",
         "The only reconstruction backend in this build; ExMR, GVHMR, PEAR, MAMMA, PromptHMR and GEM-X are not ported" => "此版本只有一个重建后端；ExMR、GVHMR、PEAR、MAMMA、PromptHMR、GEM-X 均未移植",

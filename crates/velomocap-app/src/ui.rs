@@ -887,6 +887,22 @@ fn people_list(app: &mut VeloMocap, ui: &mut egui::Ui) {
                             let selected =
                                 app.candidates.iter().filter(|c| c.selected).count();
                             ui.add_space(4.0);
+                            // One-click casting: a crowded frame can list a dozen
+                            // people, and ticking them one by one is a dozen
+                            // clicks for a choice that is usually "all" or "none".
+                            ui.horizontal(|ui| {
+                                if ui.small_button(i18n::t("Select all")).clicked() {
+                                    for candidate in &mut app.candidates {
+                                        candidate.selected = true;
+                                    }
+                                }
+                                if ui.small_button(i18n::t("Select none")).clicked() {
+                                    for candidate in &mut app.candidates {
+                                        candidate.selected = false;
+                                    }
+                                }
+                            });
+                            ui.add_space(4.0);
                             if ui
                                 .add_enabled(
                                     selected > 0,

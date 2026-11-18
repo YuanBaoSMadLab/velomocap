@@ -365,6 +365,66 @@ fn person_box(bbox: [f32; 4]) -> ([f32; 2], [f32; 2]) {
     (center, [width, height])
 }
 
+/// One track per seed box, by overlap.
+///
+/// The seed boxes are the people the user ticked, so each one answers to exactly
+/// one track: a box that overlaps two people (or two tracks for one body) must
+/// not double the cast. A seed with no detection is simply absent for now — the
+/// continuation clause looks for it again on later frames.
+fn seed_track_ids(detections: &[(usize, [f32; 4])], seeds: &[[f32; 4]]) -> Vec<usize> {
+    let mut ids = Vec::with_capacity(seeds.len());
+    for seed in seeds {
+        let mut best: Option<(usize, f32)> = None;
+        for (id, box_) in detections {
+            let score = box_overlap(*box_, *seed);
+            if score <= 0.2 {
+                continue;
+            }
+            if best.map_or(true, |(_, top)| score > top) {
+                best = Some((*id, score));
+            }
+        }
+        if let Some((id, _)) = best {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// Does a detection continue the box a picked person was last seen in?
+fn continues(previous: [f32; 4], detection: Detection) -> bool {
+    let center = [
+        0.5 * (detection.x0 + detection.x1),
+        0.5 * (detection.y0 + detection.y1),
+    ];
+    let before = [
+        0.5 * (previous[0] + previous[2]),
+        0.5 * (previous[1] + previous[3]),
+    ];
+    let scale = (previous[2] - previous[0])
+        .max(previous[3] - previous[1])
+        .max(1.0);
+    let distance =
+        ((center[0] - before[0]).powi(2) + (center[1] - before[1]).powi(2)).sqrt();
+    distance < 0.6 * scale || overlap(&detection, previous) > 0.15
+}
+
+/// IoU of two plain boxes.
+fn box_overlap(a: [f32; 4], b: [f32; 4]) -> f32 {
+    let inter = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0)
+        * (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
+    let area_a = (a[2] - a[0]).max(0.0) * (a[3] - a[1]).max(0.0);
+    let area_b = (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0);
+    let union = area_a + area_b - inter;
+    if union <= 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
+}
+
 /// The full loop, with hooks for the UI.
 /// IoU of a detection with a plain box: the "is this the same body?" test used to
 /// follow a picked person across a track-id change.
@@ -517,33 +577,36 @@ pub fn capture_people_with(
         timings.detect += detect_start.elapsed().as_secs_f64();
         tracker.update(&detections);
 
-        // Restrict to the people the user picked: on the first frame keep only
-        // detections that overlap a seed box, then only those track ids.
+        // Restrict to the people the user picked: on the first frame keep **one**
+        // track per seed box, then only those track ids — plus, when a picked
+        // person's id drops out, the single track that continues their box.
+        //
+        // The first frame used to keep *every* track overlapping a seed, and the
+        // continuation clause accepted any track that merely sat near the last
+        // box. A second person standing beside the picked one therefore came in
+        // through both doors: one seed, two reconstructed people.
         if !config.seed_boxes.is_empty() && index == 0 {
-            seeded_ids = tracker
+            let boxes: Vec<(usize, [f32; 4])> = tracker
                 .tracks
                 .iter()
-                .filter(|track| {
+                .filter_map(|track| {
                     track
                         .boxes
                         .get(index)
                         .and_then(|slot| *slot)
                         .map(|detection| {
-                            config
-                                .seed_boxes
-                                .iter()
-                                .any(|seed| overlap(&detection, *seed) > 0.2)
+                            (track.id, [detection.x0, detection.y0, detection.x1, detection.y1])
                         })
-                        .unwrap_or(false)
                 })
-                .map(|track| track.id)
                 .collect();
+            seeded_ids = seed_track_ids(&boxes, &config.seed_boxes);
             if std::env::var_os("VELOMOCAP_DEBUG_SEEDS").is_some() {
                 eprintln!(
-                    "[seeds] {} detections, {} tracks, {} seeded, first detection {:?}",
+                    "[seeds] {} detections, {} tracks, {} seeded {:?}, first detection {:?}",
                     detections.len(),
                     tracker.tracks.len(),
                     seeded_ids.len(),
+                    seeded_ids,
                     detections.first().map(|d| (d.x0, d.y0, d.x1, d.y1))
                 );
                 for seed in &config.seed_boxes {
@@ -552,6 +615,14 @@ pub fn capture_people_with(
             }
         }
 
+        // Is a picked person on screen this frame? A replacement track is only
+        // considered when none is, so two bodies can never answer to one seed.
+        let seeded_present = tracker.tracks.iter().any(|track| {
+            seeded_ids.contains(&track.id)
+                && track.missing == 0
+                && track.boxes.get(index).and_then(|slot| *slot).is_some()
+        });
+
         let mut candidates: Vec<(usize, Detection)> = tracker
             .tracks
             .iter()
@@ -559,6 +630,9 @@ pub fn capture_people_with(
             .filter(|track| {
                 if config.seed_boxes.is_empty() || seeded_ids.contains(&track.id) {
                     return true;
+                }
+                if seeded_present {
+                    return false;
                 }
                 // Same body, new id: accept it when it continues the box the person
                 // was last seen in — overlapping it, or with its centre within
@@ -570,23 +644,7 @@ pub fn capture_people_with(
                     .boxes
                     .get(index)
                     .and_then(|slot| *slot)
-                    .map_or(false, |detection| {
-                        let center = [
-                            0.5 * (detection.x0 + detection.x1),
-                            0.5 * (detection.y0 + detection.y1),
-                        ];
-                        let before = [
-                            0.5 * (previous[0] + previous[2]),
-                            0.5 * (previous[1] + previous[3]),
-                        ];
-                        let scale = (previous[2] - previous[0])
-                            .max(previous[3] - previous[1])
-                            .max(1.0);
-                        let distance = ((center[0] - before[0]).powi(2)
-                            + (center[1] - before[1]).powi(2))
-                        .sqrt();
-                        distance < 0.6 * scale || overlap(&detection, previous) > 0.15
-                    })
+                    .map_or(false, |detection| continues(previous, detection))
             })
             .filter_map(|track| {
                 track
@@ -605,6 +663,12 @@ pub fn capture_people_with(
             detection.height() >= config.min_box_height * frame.height as f32
         });
         candidates.truncate(config.max_people);
+        // The user's selection is the whole cast: one seed never yields two
+        // people, however many tracks happen to be in the room.
+        if !config.seed_boxes.is_empty() {
+            let cast = config.seed_boxes.len().max(1).min(config.max_people);
+            candidates.truncate(cast);
+        }
 
         // Follow the body, not the id: adopt whichever track continues the box the
         // person was last seen in, so a re-detection after a dropout keeps the take
@@ -612,7 +676,9 @@ pub fn capture_people_with(
         // the video still moves).
         if !config.seed_boxes.is_empty() {
             if let Some((id, detection)) = candidates.first() {
-                if !seeded_ids.contains(id) {
+                // A new id is adopted only when the picked person is not on
+                // screen; otherwise this is somebody else in the room.
+                if !seeded_ids.contains(id) && !seeded_present {
                     seeded_ids.push(*id);
                 }
                 last_box = Some([detection.x0, detection.y0, detection.x1, detection.y1]);
@@ -846,5 +912,68 @@ mod tests {
             );
             assert!(depth > 0.1 && depth < 100.0, "implausible depth {depth}");
         }
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    fn detection(box_: [f32; 4]) -> Detection {
+        Detection {
+            x0: box_[0],
+            y0: box_[1],
+            x1: box_[2],
+            y1: box_[3],
+            score: 1.0,
+            class_id: 0,
+        }
+    }
+
+    /// One ticked person is one track, even when a box on screen overlaps two
+    /// of them: the seed decides the cast, the overlap only decides which body.
+    #[test]
+    fn one_seed_answers_to_one_track() {
+        let detections = [
+            (7, [100.0, 100.0, 200.0, 400.0]),
+            (9, [120.0, 110.0, 210.0, 400.0]),
+        ];
+        let seeds = [[105.0, 100.0, 205.0, 400.0]];
+        let ids = seed_track_ids(&detections, &seeds);
+        assert_eq!(ids.len(), 1, "one seed, one track: {ids:?}");
+        assert_eq!(ids[0], 7, "the better overlap wins");
+    }
+
+    #[test]
+    fn two_seeds_answer_to_two_tracks() {
+        let detections = [
+            (7, [100.0, 100.0, 200.0, 400.0]),
+            (9, [400.0, 100.0, 500.0, 400.0]),
+        ];
+        let seeds = [
+            [100.0, 100.0, 200.0, 400.0],
+            [400.0, 100.0, 500.0, 400.0],
+        ];
+        let mut ids = seed_track_ids(&detections, &seeds);
+        ids.sort();
+        assert_eq!(ids, vec![7, 9]);
+    }
+
+    /// A seed whose body has not been detected yet seeds nothing, rather than
+    /// borrowing somebody else's track.
+    #[test]
+    fn a_seed_with_no_overlap_seeds_nothing() {
+        let detections = [(7, [0.0, 0.0, 10.0, 10.0])];
+        let seeds = [[500.0, 500.0, 600.0, 700.0]];
+        assert!(seed_track_ids(&detections, &seeds).is_empty());
+    }
+
+    /// The continuation follows the body, so a box that is clearly a different
+    /// person standing beside the picked one does not qualify.
+    #[test]
+    fn a_neighbour_does_not_continue_the_picked_box() {
+        let picked = [100.0, 100.0, 200.0, 400.0];
+        assert!(continues(picked, detection([102.0, 102.0, 202.0, 402.0])));
+        assert!(!continues(picked, detection([300.0, 100.0, 400.0, 400.0])));
     }
 }
