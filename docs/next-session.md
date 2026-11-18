@@ -461,3 +461,202 @@ slide/float/jitter/ankle 全不变。审计里那三条 sink 爆表的记录（2
 - **VRM 目标骨架那一级**（P5 第一条）：这是剩下最大的缺口，单独一轮。
 - **`.vp` 不存 `source`**，载入后 `can_apply_correction` 为 false，每次验证只能
   走 replay。要存 source（或存"未校正的 pose 序列"）才能让工程内直接重解。
+
+## 16. After the sink/ankle gate: where the shaking is (2026-11-18)
+
+The gate fix works — the 22:57 run keeps its pass with `sink 0.0/0.0`,
+`float 0.0/0.0`, `slide 0.03/0.05 cm/frame`, and my replay reproduces the
+same shape. The remaining complaint ("feet and legs still shake") is **inside
+the leg chain**, and it is the pin's own motion.
+
+### Per-joint second difference, p99, source -> corrected
+
+Replay of `2月27日` (`feb-joints.bin` -> `new-d014.bin`, floor 0.014, preset
+normal, mesh sole, pose plan). `probe/joint_jitter.py`:
+
+| joint | src | out | delta |
+|---|---|---|---|
+| toe.R (11) | 18.35 | 39.68 | **+21.3** |
+| ankle.R (8) | 18.84 | 38.13 | **+19.3** |
+| knee.L (4) | 14.62 | 32.11 | **+17.5** |
+| toe.L (10) | 27.16 | 41.48 | **+14.3** |
+| ankle.L (7) | 25.51 | 37.55 | **+12.0** |
+| knee.R (5) | 12.65 | 24.07 | **+11.4** |
+| elbow/wrist/shoulder | — | — | +0.3 each |
+| every other joint | — | — | within +-0.5 |
+
+All-joint p99: 94.96 -> 93.49. So the pass adds no noise anywhere except the
+three leg joints per side. That is the shaking the user sees, and no sole
+metric can see it: the *sole point* is held to 0.3 mm while the foot rotates
+around it.
+
+### Why: the ankle rotation is kept, so the ankle has to move
+
+`RGBMoCapAnatomical.h:33` ("Output changes only hip/knee/ankle. Ankle world
+direction is retained") is ported faithfully. Consequence, measured with
+`probe/foot_turn.py` on planted frames (low sole, slow ankle):
+
+| | src planted | out planted |
+|---|---|---|
+| foot turn deg/frame p99 (L/R) | 7.48 / 3.26 | 7.02 / 5.45 |
+| shin turn deg/frame p99 | 7.27 / 3.17 | 6.12 / 3.51 |
+| ankle move mm/frame p99 | 24.68 / 15.45 | 16.98 / 13.24 |
+
+The pin cuts the ankle's *slow* drift by ~30 % and leaves its *high frequency*
+untouched: the ankle has to travel 17 mm/frame to keep a foot that is turning
+7 deg/frame in place. A character's shoe is rigidly attached to that foot, so
+it pivots about the pinned sole — which reads as a trembling foot even though
+nothing slides.
+
+### The added shake is the frame-to-frame jump of the correction
+
+`probe/correction_filter.py`: take the applied displacement
+`c = out_ankle - src_ankle`, filter it along time with a **zero-phase**
+gaussian (the batch path can look ahead; the reverted `smooth_rotation`
+one-pole could not, which is why it lagged), and re-measure.
+
+| sigma (frames) | ankle p99 | toe p99 |
+|---|---|---|
+| 0 (today) | 38.13 | 41.48 |
+| 1.0 | 25.27 | 27.27 |
+| 1.5 | 24.39 | 25.95 |
+| 2.0 | 24.74 | 27.17 |
+
+The sole's own motion on planted frames does not get worse (17.9 -> 18.4-19.2
+mm on the joint proxy, within noise). So ~13 mm of ankle shake and ~14 mm of
+toe shake are pure per-frame correction jumps, not motion. (This filters joint
+*positions* offline; the implementation belongs on the *target offsets* before
+`apply_leg_pin` solves them.)
+
+### What the reference has that we do not
+
+- Its **batch SMPL correction is the same design** (`SolveLegs` keeps the ankle
+  world rotation; the target is `ankle + (anchor - support) * strength`). So the
+  same trembling exists on its SMPL preview — this is not a porting slip.
+- Its **character stage** has a second solve that we do not have at all:
+  `retarget/pipeline.py:39-58` -> `bounded_stabilizer.solve` (imported by
+  `measured.py:4`). A global least squares on the *target's knee flexion* per
+  frame with: contact term `contact_sigma = 0.00005` (0.05 mm) to the contact
+  goals, temporal term on the flexion's second difference with
+  `physical_sigma = 0.008`, and `stable_pole` against knee flips
+  (`bounded_stabilizer.py:52-202`). It even reports the metrics for this exact
+  symptom — stance-interior flexion rms and boundary p95
+  (`bounded_stabilizer.py:204-214`).
+- Our character path is world-rotation delta plus a one-time `ground_offset`.
+  Everything the pin does to the ankle and the knee is displayed raw.
+
+### The smoothing setting is wired on the wrong side
+
+`crate::temporal::smooth` runs at `correction.rs:471-478`, **before
+`detect()`**, so it rewrites the input the contact detector sees. Measured on
+the same replay:
+
+- `--smooth 0.001`: ankle gate veto (7.4 -> 40.1 mm), contacts 25 -> 13, no
+  correction at all.
+- `--smooth 0.003`: passes, and it *is* effective (planted foot turn
+  7.5 -> 3.9 deg, ankle 38 -> 17.7, thigh 6.1 -> 2.4) — but it changed the plan
+  to 14 stance runs and a root shift of 0 -> 0.182 m, i.e. it did not smooth
+  the motion so much as re-detect the contacts.
+
+The reference states it explicitly: `flow_correction.py:3` "No inference,
+SMPL-X conversion, upstream smoothing or second target IK pass." Its smoothing
+lives in the character-stage solver. Anything that filters before detection
+will keep changing the contact plan.
+
+### Order for next round
+
+1. Zero-phase filter on the pin's target offsets (sigma ~1 frame) — removes
+   the 13-14 mm the pin adds, leaves the sole metrics alone.
+2. Character-stage stabiliser, the `bounded_stabilizer` shape: knee flexion
+   temporal term + contact term + stable pole.
+3. Then either delete the smoothing setting or re-point it at (1).
+
+## 17. Testing the target-offset filter: it does not hold, and the split says why (2026-11-18)
+
+Section 16 proposed filtering the pin's per-frame target offsets with a
+zero-phase gaussian, on the reading that the added shake is the frame-to-frame
+jump of the correction and that all of it sits on the ankle, knee and toe. It
+was implemented exactly that way — the filter runs on `target - current_ankle`
+for every frame of a stance, before `apply_leg_pin`, with σ in frames — and
+measured end to end with `--dump-joints` on four clips: the user's `.vp`
+recovery (`vp-feb`), `2月27日` (`feb2`), `短暂` (`brief3`), `tennis` (`full`).
+
+### What it costs
+
+`vp-feb`, the clip the proposal came from:
+
+| σ (frames) | slide cm/frame | float mm | sink mm | ankle shake | knee.L p99 | ankle.R p99 |
+|---|---|---|---|---|---|---|
+| 0 (shipped) | 0.04 / 0.07 | 0.1 / 0.0 | 0.0 / 0.0 | 43.1 | 35.35 | 36.37 |
+| 1.0 | 0.14 / 0.15 | 0.3 / 0.2 | **4.6 / 4.1** | 44.7 | 35.41 | 30.98 |
+| 1.5 | 0.17 / 0.18 | 0.4 / 0.3 | 7.5 / 5.7 | 46.8 | 35.94 | 31.76 |
+| 2.0 | 0.20 / 0.20 | 0.6 / 0.5 | 9.9 / 6.8 | 48.0 | 35.94 | 32.55 |
+
+The pin gives up its exactness (`slide` x3.5, `sink` 0 -> 4.6 mm) and the leg
+joints do not get quieter: `knee.L` is unchanged to a hundredth, `ankle.R`
+improves 5 mm, and the aggregate `ankle shake` gets *worse*. The other three
+clips agree — σ=1.0: `feb2` slide 0.02/0.04 -> 0.04/0.06 with sink 0.0 -> 1.1 mm
+and the ankle unchanged; `brief3` slide 0.01/0.00 -> 0.11/0.10, sink -> 1.5 mm;
+`full` slide 0.00 -> 0.19/0.12, sink -> 4.6/1.7 mm.
+
+### Why: the shake is not in the stance
+
+`probe/ankle_when.py` splits every joint's second difference by the contact
+state the pass itself used (`--dump-soles`):
+
+| joint | planted p99 (src -> out) | edge p99 | swing p99 |
+|---|---|---|---|
+| ankle.L | 13.22 -> **8.37** | 65.67 | 37.93 |
+| ankle.R | 13.86 -> **7.27** | 62.88 | 23.38 |
+| toe.L | 13.70 -> **4.74** | 72.53 | 39.60 |
+| toe.R | 12.54 -> **2.52** | 62.91 | 25.32 |
+| knee.L | 12.16 -> **17.92** | 65.96 | 49.05 |
+| knee.R | 11.33 -> 11.47 | 40.83 | 17.30 |
+
+Frame counts: 441/460 planted, 42 edge, 77/58 swing. On planted frames the pin
+makes the ankle and the toe **quieter than the source** — the opposite of
+"moved onto the ankle". The p99 the proposal measured lands on the 42 edge
+frames, whose values are 60-72 mm, and on the swing. A filter applied only
+inside a stance can never reach those frames; all it can do is loosen the pin.
+
+The one genuine plant-level regression is the **left knee**, 12.16 -> 17.92 mm,
+and it has a different cause: this take's pins run at `d/max = 0.95-0.99` of
+the leg's reach (from `VELOMOCAP_DEBUG_PIN`), and near full extension the
+two-bone solve converts a millimetre of ankle motion into centimetres of knee
+motion. That is the conditioning the reference's `stable_pole` exists for, in
+the character layer, not a filter on the target.
+
+### Why the edges are unavoidable on this clip
+
+At the release the pin unwinds the whole correction the stance accumulated
+(`[pin] f48..50 TRANSITION offset=(0.016,-0.074,-0.002) .. (0.021,-0.075,0.030)`,
+i.e. **71 mm horizontally**), and the swing it has to unwind in is **3 frames**
+(the right foot is airborne on frames 48-50 only). `add_transitions` already
+uses every frame available and the reference's own rate — `extent =
+clamp(|offset|*fps/0.8, 0.12 s, 0.5 s)`, `contact_offsets` — which for 71 mm at
+30 fps is 3 frames. Nothing smooths 71 mm over 3 frames.
+
+That is the price of holding a foot the network slides 0.32 cm/frame through a
+40-frame stance: the correction grows to the size of the drift, and the release
+has to shed it. Weakening the pin trades the slide for the pop; the reference
+makes the same trade.
+
+### Decision
+
+- The target-offset filter is **reverted**. `--dump-joints` output is byte-identical
+  to `b93132d` on all four clips, so nothing else moved.
+- The pre-detection smoothing setting is **removed entirely** (`CorrectionSettings::smoothing`,
+  `flow --smooth`, `replay --smooth`, the sidebar combo). It was a re-detection
+  in disguise and the reference does no upstream smoothing (`flow_correction.py:3`).
+  Section 16's item 3 is done; its item 1 is closed as measured-and-rejected.
+
+### Order for next round, revised
+
+1. Character-stage stabiliser — the reference's `bounded_stabilizer` shape:
+   contact term on the ankle goals, temporal term on the knee flexion's second
+   difference, `stable_pole`. This is where the only plant-level regression
+   (`knee.L` +5.8 mm, the near-straight-leg amplification) is fixed, and the
+   reference fixes it there too.
+2. Only if a take still complains about the edges: a hand-off budget that can
+   start *before* the stance ends, i.e. spend a little slide to buy the ramp.
+   Measured tradeoff first — the sole is exact right now.

@@ -3064,7 +3064,7 @@ pub fn correction_line(settings: &velomocap_motion::correction::CorrectionSettin
     use velomocap_motion::correction::{CorrectionMode, LockPreset};
     format!(
         "correction config: {} mode={} foot={} hand={} preset={} floor={:+.3} m \
-         pelvis_offset={:+.3} m smoothing={} mesh_sole={} leg_ik={} pose_plan={} live_lock={}",
+         pelvis_offset={:+.3} m mesh_sole={} leg_ik={} pose_plan={} live_lock={}",
         if settings.enabled { "enabled" } else { "DISABLED" },
         match settings.mode {
             CorrectionMode::Flat => "flat",
@@ -3079,7 +3079,6 @@ pub fn correction_line(settings: &velomocap_motion::correction::CorrectionSettin
         },
         settings.floor,
         settings.pelvis_offset,
-        settings.smoothing,
         settings.mesh_sole,
         settings.leg_ik,
         settings.pose_plan,

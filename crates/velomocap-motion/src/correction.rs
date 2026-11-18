@@ -116,10 +116,6 @@ pub struct CorrectionSettings {
     /// only give back the reach drop `root_height` applied; negative lowers the
     /// body, faded by the contact strength so an airborne take is not moved.
     pub pelvis_offset: f32,
-    /// Temporal smoothing weight applied before the contact passes. Smaller is
-    /// stronger (0 turns it off); 1e-3 removes the network's per-frame noise
-    /// while keeping a 0.5 s arm swing intact.
-    pub smoothing: f64,
     /// Use the skinned foot-mesh sole points instead of the joint approximation.
     ///
     /// **On by default**, because it is what the reference does (`SoleGeometry`):
@@ -176,7 +172,6 @@ impl Default for CorrectionSettings {
             pose_plan: true,
             live_lock: false,
             mesh_sole: true,
-            smoothing: 0.0,
         }
     }
 }
@@ -468,14 +463,14 @@ pub fn apply_with_locks(
         None
     };
 
-    // Smooth the network's per-frame noise before the contacts are detected: the
-    // reference plans its root and targets with an acceleration term, and our
-    // FlowHMR output needs the same treatment or a swinging arm moves 10 cm in a
-    // frame. Contacts are then detected on the smoothed motion, so the pins below
-    // stay exact.
-    if settings.smoothing > 0.0 {
-        crate::temporal::smooth(clip, body, settings.smoothing)?;
-    }
+    // No upstream smoothing, on purpose: `flow_correction.py` says the reference
+    // does none ("No inference, SMPL-X conversion, upstream smoothing or second
+    // target IK pass"), and filtering the clip here rewrites the contact
+    // detection itself — `--smooth 0.001` on `2月27日` took the stances from 25 to
+    // 13, and `0.003` passed the gate but had turned the plan into 14 stances and
+    // a 0.182 m root translation. The per-frame twitch those weights were for is
+    // not in the stance at all; see `leg_ik` below and section 17 of
+    // `docs/next-session.md`, where filtering it was measured and dropped.
 
     // Do no harm: a correction that makes the clip jumpier than the network's own
     // motion is worse than no correction at all, and turning clips are exactly
@@ -1670,11 +1665,17 @@ fn leg_ik(
                 // component of the offset is what puts the sole *on* the plane
                 // instead of leaving the network's height error in place.
                 //
-                // The goal itself is *not* smoothed along the stance: that was
-                // tried and it let the foot skate (0.26 cm/frame) and float. The
-                // reference filters the applied *correction* instead
-                // (`smooth_correction` underneath), which keeps the pin exact and
-                // only removes the per-frame twitch.
+                // The goal itself is *not* smoothed along the stance, and neither
+                // is the per-frame offset that reaches it. Filtering the offset
+                // was measured on the user's own project clip, where the ankle's
+                // p99 is 36.4 mm against a source of 18.8: it is not the stance
+                // that shakes (planted ankles are 8.4/7.3 mm p99, *better* than
+                // the source's 13.2/13.9), it is the release, where the whole
+                // correction a stance accumulated (71 mm horizontally on that
+                // take) has to be unwound in a three-frame swing. Filtering the
+                // stance offsets cannot reach those frames, and it pays for
+                // nothing: `slide 0.04 -> 0.14 cm/frame`, `sink 0.0 -> 4.6 mm`
+                // and `knee.L 35.4 -> 35.4 mm`.
                 let hold = foot.holds[index][foot_index] as f64;
                 let mut target = contact_target(anchors[offset], sole_at, current, hold);
                 if settings.mode == CorrectionMode::Flat {

@@ -257,9 +257,6 @@ enum Command {
         /// Use the skinned foot-mesh sole points as the contact source.
         #[arg(long)]
         joint_sole: bool,
-        /// Temporal smoothing weight (0 = off, smaller is stronger).
-        #[arg(long, default_value_t = 0.0)]
-        smooth: f64,
         /// Lock preset: tight, normal or loose.
         #[arg(long, default_value = "normal")]
         lock_preset: String,
@@ -343,10 +340,6 @@ enum Command {
         dump_joints: Option<PathBuf>,
         #[arg(long)]
         dump_soles: Option<PathBuf>,
-        /// Temporal smoothing weight applied before the contacts (0 = off,
-        /// smaller is stronger), the same knob `flow --smooth` sets.
-        #[arg(long, default_value_t = 0.0)]
-        smooth: f64,
         #[arg(long)]
         no_correction: bool,
         #[arg(long)]
@@ -591,7 +584,6 @@ fn main() -> Result<()> {
             floor,
             dump_joints,
             dump_soles,
-            smooth,
             no_correction,
             no_foot,
             hand_lock,
@@ -619,7 +611,6 @@ fn main() -> Result<()> {
                 no_pose_plan,
                 live_lock,
                 joint_sole,
-                smooth,
                 lock_mode: lock_mode.clone(),
                 lock_preset: lock_preset.clone(),
             },
@@ -656,7 +647,6 @@ fn main() -> Result<()> {
             no_pose_plan,
             live_lock,
             joint_sole,
-            smooth,
             lock_preset,
             lock_mode,
             floor,
@@ -726,7 +716,6 @@ fn main() -> Result<()> {
             no_pose_plan,
             live_lock,
             joint_sole,
-            smooth,
             &lock_preset,
             &lock_mode,
             floor,
@@ -1333,7 +1322,6 @@ fn flow_report(
     no_pose_plan: bool,
     live_lock: bool,
     joint_sole: bool,
-    smoothing: f64,
     lock_preset: &str,
     lock_mode: &str,
     floor: f32,
@@ -1576,7 +1564,6 @@ fn flow_report(
         pose_plan: !no_pose_plan,
         live_lock,
         mesh_sole: !joint_sole,
-        smoothing,
     };
     // Hand-drawn contact timing, in the same document the app writes next to a
     // clip. A document from another clip is reported and dropped rather than
@@ -2859,8 +2846,6 @@ struct ReplayFlags {
     no_pose_plan: bool,
     live_lock: bool,
     joint_sole: bool,
-    /// Temporal smoothing weight applied before the contacts (`--smooth`).
-    smooth: f64,
     /// `flat` or `multi` (`--lock-mode`), the same option `flow` takes.
     lock_mode: String,
     /// `tight`, `normal` or `loose` (`--lock-preset`), the same option `flow` takes.
@@ -3009,7 +2994,6 @@ fn replay_clip(
         pose_plan: !flags.no_pose_plan,
         live_lock: flags.live_lock,
         mesh_sole: !flags.joint_sole,
-        smoothing: flags.smooth,
         mode: match flags.lock_mode.as_str() {
             "multi" => velomocap_motion::correction::CorrectionMode::MultiLevel,
             _ => velomocap_motion::correction::CorrectionMode::Flat,
