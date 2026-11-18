@@ -793,3 +793,59 @@ absolute is the ceiling, not 90.
 - `knee.L` on planted frames (12.2 -> 17.9 mm) is the near-straight leg
   (`d/max = 0.95-0.99`), i.e. the character-layer `stable_pole` problem from
   section 16, and this change does not touch it.
+
+## 20. Correction to §19, and the near-extension trade measured (2026-11-18)
+
+§19 concluded that subtracting the root shift from the hand-off "double-counts"
+because `leg_ik` re-derives its anchors post-shift. That is too broad, and the
+experiment behind it put the subtraction in the wrong place.
+
+`leg_ik` re-derives the anchor per frame (`rolling_anchor` over the current
+clip), so the *stance* target is already vertical-correct. `add_transitions`
+does not: it reads `pass.targets`, which `foot_lock` wrote once before the root
+chain moved anything (`correction.rs:2737`, called at `:520`, root chain at
+`:530-533`), so the residual it stores is missing `-s` at the **stance
+endpoints**.
+
+The mistake was applying `-s` to the Hermite's *output*, i.e. to a value that
+had already faded to 9 mm at f301 — which turns the "fade to zero" point into
++78 mm and puts the target 70 mm above the frames on either side. The shift
+belongs on the endpoints, once:
+
+```text
+lvalue' = lvalue - s[first-1]      // the stance edge, the only place it exists
+rvalue' = rvalue - s[end]
+```
+
+On this take the stance-edge residual becomes about `-80 + 78 = -2 mm` (the
+same order as the +5 mm this note first estimated), the Hermite fades that to
+zero, and nothing else changes. Interpolating world targets instead does not
+work either: at the free end the interpolated target is the *pre-shift* foot
+position. The two clean forms are endpoint subtraction, or moving
+`add_transitions` after the root chain — which then needs `pose_plan_window` to
+read `targets`, since it currently reads `pinned`/`offsets`.
+
+The shipped clamp (`offset[1].max(0.0)`) is within ~5 mm of that correct value
+on this clip, so it stays; the difference is only visible as the `短暂` jitter
+`29.0 -> 35.1`, where the approach can no longer pre-lower the foot and the
+stance does the settling instead.
+
+### Near-extension softening: measured, not worth it
+
+`VELOMOCAP_PIN_SOFTEN=<d/max>` (a diagnostic build, not shipped) faded the pin
+out as the leg straightened, which is the cheap half of a `stable_pole`. On the
+planted frames of `2月27日`:
+
+| | knee.L plant | ankle.L plant | sink | slide |
+|---|---|---|---|---|
+| shipped clamp | 17.92 | 8.37 | 0.0 / 0.0 mm | 0.04 / 0.07 cm/frame |
+| soften at 0.95 | **12.77** | 11.31 | **8.3 / 8.2 mm** | **0.20 / 0.15** |
+| soften at 0.93 | gate rolled back (sink) | | | |
+| soften at 0.90 | gate rolled back (sink) | | | |
+
+It does fix the knee amplification (17.9 -> 12.8, back to the source's 12.2), and
+it costs the sole the one thing the pin exists for: the ankle stops reaching the
+plane, so the foot floats 8 mm and skates 3x as much. The exchange rate is bad
+because at `d/max >= 0.95` the pin's contribution to the sole is a few
+millimetres while its contribution to the knee is ~6 mm of second difference.
+Rejected as a default; the character-stage solve is the place to buy this back.
