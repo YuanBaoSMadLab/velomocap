@@ -144,6 +144,21 @@ pub struct Character {
     pub inherit: Vec<Option<Inherit>>,
     /// How much the bind space was scaled to bring the character to human size.
     pub scale: f32,
+    /// Per side, `F_source · F_characterᵀ`: premultiplied onto the ankle and toe
+    /// world rotations so this character's own sole plane matches the clip's
+    /// sole plane (`retarget/foot_calibration.py::corrected_world`).
+    ///
+    /// The clip keeps the SMPL ankle's world rotation, so the *source* sole is
+    /// flat on the floor by construction. A VRM's foot bone is not parallel to
+    /// its shoe sole, so copying that rotation leaves the shoe tilted and the
+    /// shoe's sole offset from the contact point — the character-side foot
+    /// problem in one sentence. Identity until [`Character::calibrate`] runs.
+    pub calibration: [[f32; 9]; 2],
+    /// Constant added to the root so this character's sole sits where the
+    /// clip's sole sits: `(source sole − source ankle) − (character sole −
+    /// character ankle)`, metres. `ground_offset` aligns the *ankles*, which is
+    /// a different quantity from the foot's thickness.
+    pub sole_lift: f32,
 }
 
 impl Character {
@@ -1091,6 +1106,19 @@ impl Character {
                 continue;
             }
             delta[canonical] = multiply(&world[joint], &transpose(&rest[joint]));
+            // The ankle and the toe are carried by the side's own calibration:
+            // `Q = F_clip · F_characterᵀ` turns the character's sole plane onto
+            // the clip's before the clip's motion is applied
+            // (`foot_calibration.corrected_world`, which writes
+            // `world[:, j] = native[:, j] @ C` for j in {7, 8, 10, 11}).
+            let side = match canonical {
+                46 | 47 => Some(0),
+                50 | 51 => Some(1),
+                _ => None,
+            };
+            if let Some(side) = side {
+                delta[canonical] = multiply(&delta[canonical], &self.calibration[side]);
+            }
             // The clip's own parent of this joint, taken from the canonical
             // tree: the joint that drives this bone's canonical parent.
             let parent = velomocap_motion::retarget::PARENTS[canonical]
@@ -1793,6 +1821,425 @@ impl Character {
         // Longer legs mean the character stands too high on the clip's pelvis.
         (bind_hips - bind_ankle - (clip_hips - clip_ankle)).clamp(-0.15, 0.15)
     }
+
+    /// The vertices this model's shoe actually stands on, per side: those bound
+    /// mostly to the ankle and toe bones and below the ankle's own height.
+    ///
+    /// The same set the sole calibration measures, exposed so the viewport and
+    /// the headless probe can ask where the shoe is without re-deriving it.
+    pub fn sole_vertices(&self) -> [Vec<usize>; 2] {
+        let mut out: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+        for side in 0..2 {
+            let Some(ankle) = self
+                .bones
+                .iter()
+                .position(|bone| bone.canonical == Some(46 + 4 * side))
+            else {
+                continue;
+            };
+            let Some(toe) = self
+                .bones
+                .iter()
+                .position(|bone| bone.canonical == Some(47 + 4 * side))
+            else {
+                continue;
+            };
+            let ankle_bind = self.bones[ankle].bind;
+            for vertex in 0..self.vertex_count() {
+                let mut weight = 0.0;
+                for slot in 0..4 {
+                    let joint = self.joints[vertex][slot] as usize;
+                    if joint == ankle || joint == toe {
+                        weight += self.weights[vertex][slot];
+                    }
+                }
+                if weight > 0.7 && self.rest[vertex * 3 + 1] < ankle_bind[1] + 0.02 {
+                    out[side].push(vertex);
+                }
+            }
+        }
+        out
+    }
+
+    /// How far the posed sole plane is from the floor, in degrees: 0 is flat.
+    ///
+    /// A shoe whose sole is not parallel to the floor while the foot is planted is
+    /// exactly the "tilted shoe" the sole calibration exists for, and no height
+    /// statistic can see it.
+    pub fn sole_tilt(&self, posed: &[f32], side: usize) -> Option<f32> {
+        let vertices = self.sole_vertices();
+        let points: Vec<[f32; 3]> = vertices[side]
+            .iter()
+            .map(|vertex| {
+                [
+                    posed[vertex * 3],
+                    posed[vertex * 3 + 1],
+                    posed[vertex * 3 + 2],
+                ]
+            })
+            .collect();
+        // The bottom 6 mm of the foot, not the whole shoe: a plane through the
+        // upper, the laces and the heel is not the sole.
+        let band = sole_band(&points)?;
+        let mut up = plane_normal(&band)?;
+        if up[1] < 0.0 {
+            up = [-up[0], -up[1], -up[2]];
+        }
+        Some(up[1].clamp(-1.0, 1.0).acos().to_degrees())
+    }
+
+    /// This character's own sole patch for one side, measured at its bind pose.
+    fn sole_patch(&self, side: usize) -> Option<SolePatch> {
+        let ankle_bone = self
+            .bones
+            .iter()
+            .find(|bone| bone.canonical == Some(46 + 4 * side))?;
+        let toe_bone = self
+            .bones
+            .iter()
+            .find(|bone| bone.canonical == Some(47 + 4 * side))?;
+        let (ankle_bind, toe_bind) = (ankle_bone.bind, toe_bone.bind);
+        let soles = self.sole_vertices();
+        if soles[side].len() < 6 {
+            return None;
+        }
+        let vertices: Vec<[f32; 3]> = (0..self.vertex_count())
+            .map(|vertex| {
+                [
+                    self.rest[vertex * 3],
+                    self.rest[vertex * 3 + 1],
+                    self.rest[vertex * 3 + 2],
+                ]
+            })
+            .collect();
+        // The eligibility rule is already applied by `sole_vertices`.
+        let eligible: Vec<bool> = {
+            let mut mask = vec![false; self.vertex_count()];
+            for vertex in &soles[side] {
+                mask[*vertex] = true;
+            }
+            mask
+        };
+        sole_patch(
+            &vertices,
+            |vertex| eligible[vertex],
+            ankle_bind,
+            toe_bind,
+        )
+    }
+
+    /// Align this character's soles with the clip's, and put its sole at the
+    /// height the clip's sole stands at.
+    ///
+    /// `retarget/foot_calibration.py::corrected_world` in full: per side, the
+    /// character's own sole plane `F_c` is measured from its own skin weights and
+    /// vertices, the clip's `F_s` from the neutral body, and `Q = F_s · F_cᵀ` is
+    /// premultiplied onto the ankle's and toe's world rotation. The clip then
+    /// carries that alignment through the motion, so the shoe stays *on* its sole
+    /// instead of pivoting about the ankle.
+    ///
+    /// Returns false when either rig has no measurable sole — fewer than four
+    /// sole vertices, or a model without ankle/toe bones.
+    pub fn calibrate(&mut self, body: &velomocap_body::BodyModel) -> bool {
+        // The reference measures the source from a **cached neutral** mesh
+        // (`foot_calibration.source_reference`), not from the take's betas: the
+        // calibration belongs to the two rigs, not to the video.
+        let neutral = vec![0.0f32; 16];
+        let source_vertices = body.shaped_vertices(&neutral);
+        let source_rest = body.rest_joints(&neutral);
+        let count = source_vertices.len() / 3;
+        let weights = body.lbs_weights();
+        let mut lifts = Vec::new();
+        for side in 0..2 {
+            let ankle = 7 + side;
+            let toe = 10 + side;
+            let at = |joint: usize| -> [f32; 3] {
+                [
+                    source_rest[joint * 3],
+                    source_rest[joint * 3 + 1],
+                    source_rest[joint * 3 + 2],
+                ]
+            };
+            let (source_ankle, source_toe) = (at(ankle), at(toe));
+            let vertices: Vec<[f32; 3]> = (0..count)
+                .map(|vertex| {
+                    [
+                        source_vertices[vertex * 3],
+                        source_vertices[vertex * 3 + 1],
+                        source_vertices[vertex * 3 + 2],
+                    ]
+                })
+                .collect();
+            let Some(source_patch) = sole_patch(
+                &vertices,
+                |vertex| weights[ankle * count + vertex] + weights[toe * count + vertex] > 0.7,
+                source_ankle,
+                source_toe,
+            ) else {
+                continue;
+            };
+            let Some(target_patch) = self.sole_patch(side) else {
+                continue;
+            };
+            self.calibration[side] = multiply(
+                &source_patch.frame.matrix(),
+                &transpose(&target_patch.frame.matrix()),
+            );
+            if std::env::var_os("VELOMOCAP_DEBUG_SOLE").is_some() {
+                let q = &self.calibration[side];
+                let trace = q[0] + q[4] + q[8];
+                eprintln!(
+                    "calib: side {side} source up {:?} forward {:?} | target up {:?} forward {:?} | Q turns {:.1} deg",
+                    source_patch.frame.up, source_patch.frame.forward,
+                    target_patch.frame.up, target_patch.frame.forward,
+                    ((trace - 1.0) * 0.5).clamp(-1.0, 1.0).acos().to_degrees()
+                );
+            }
+            // An ankle's height is not its sole's: the foot has thickness, and
+            // `ground_offset` only aligns the ankles.
+            let target_ankle = self
+                .bones
+                .iter()
+                .find(|bone| bone.canonical == Some(46 + 4 * side))
+                .map(|bone| bone.bind[1]);
+            if let Some(target_ankle) = target_ankle {
+                lifts.push(
+                    (source_patch.floor - source_ankle[1]) - (target_patch.floor - target_ankle),
+                );
+            }
+        }
+        if lifts.is_empty() {
+            return false;
+        }
+        self.sole_lift = lifts.iter().sum::<f32>() / lifts.len() as f32;
+        true
+    }
+}
+
+/// One foot's sole plane: three world-space axes, `right`, `up` and `forward`.
+///
+/// `retarget/foot_calibration.py::frame`: the normal is the smallest-variance
+/// direction of the sole patch, `forward` runs heel to toe inside that plane,
+/// and the third axis closes a right-handed basis.
+#[derive(Clone, Copy)]
+struct SoleFrame {
+    right: [f32; 3],
+    up: [f32; 3],
+    forward: [f32; 3],
+}
+
+impl SoleFrame {
+    /// The basis with `right`, `up`, `forward` as **columns**, in this file's
+    /// row-major `[f32; 9]` convention.
+    fn matrix(&self) -> [f32; 9] {
+        [
+            self.right[0], self.up[0], self.forward[0],
+            self.right[1], self.up[1], self.forward[1],
+            self.right[2], self.up[2], self.forward[2],
+        ]
+    }
+}
+
+/// A measured sole: its plane, and the 1st-percentile height the reference calls
+/// the patch's floor.
+struct SolePatch {
+    frame: SoleFrame,
+    floor: f32,
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn normalize3(v: [f32; 3]) -> Option<[f32; 3]> {
+    let length = dot3(v, v).sqrt();
+    (length > 1e-7).then(|| [v[0] / length, v[1] / length, v[2] / length])
+}
+
+fn mean3(points: &[[f32; 3]]) -> [f32; 3] {
+    let mut sum = [0.0f32; 3];
+    for point in points {
+        for axis in 0..3 {
+            sum[axis] += point[axis];
+        }
+    }
+    let count = points.len().max(1) as f32;
+    [sum[0] / count, sum[1] / count, sum[2] / count]
+}
+
+/// The direction a point patch varies least in: the sole's normal.
+///
+/// A Jacobi sweep over the 3x3 covariance, which is all the reference's `SVD`
+/// is used for here (the `V[-1]` of the same matrix). f64 inside: the
+/// covariance of a few hundred vertices is a small matrix with large entries,
+/// and f32 Jacobi is not reliably convergent on it.
+fn plane_normal(points: &[[f32; 3]]) -> Option<[f32; 3]> {
+    if points.len() < 3 {
+        return None;
+    }
+    let centre = mean3(points);
+    let mut values = [[0.0f64; 3]; 3];
+    for point in points {
+        let d = [
+            (point[0] - centre[0]) as f64,
+            (point[1] - centre[1]) as f64,
+            (point[2] - centre[2]) as f64,
+        ];
+        for row in 0..3 {
+            for column in 0..3 {
+                values[row][column] += d[row] * d[column];
+            }
+        }
+    }
+    let mut vectors = [[1.0f64, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    for _ in 0..32 {
+        let (mut p, mut q, mut largest) = (0usize, 1usize, 0.0f64);
+        for row in 0..3 {
+            for column in row + 1..3 {
+                if values[row][column].abs() > largest {
+                    largest = values[row][column].abs();
+                    p = row;
+                    q = column;
+                }
+            }
+        }
+        let scale = values[0][0].abs() + values[1][1].abs() + values[2][2].abs();
+        if largest <= 1e-12 * scale.max(1e-12) {
+            break;
+        }
+        let angle = 0.5 * (2.0 * values[p][q]).atan2(values[q][q] - values[p][p]);
+        let (sin, cos) = angle.sin_cos();
+        for row in 0..3 {
+            let (sp, sq) = (values[row][p], values[row][q]);
+            values[row][p] = cos * sp - sin * sq;
+            values[row][q] = sin * sp + cos * sq;
+        }
+        for column in 0..3 {
+            let (sp, sq) = (values[p][column], values[q][column]);
+            values[p][column] = cos * sp - sin * sq;
+            values[q][column] = sin * sp + cos * sq;
+        }
+        for row in 0..3 {
+            let (vp, vq) = (vectors[row][p], vectors[row][q]);
+            vectors[row][p] = cos * vp - sin * vq;
+            vectors[row][q] = sin * vp + cos * vq;
+        }
+    }
+    let mut smallest = 0usize;
+    for axis in 1..3 {
+        if values[axis][axis] < values[smallest][smallest] {
+            smallest = axis;
+        }
+    }
+    normalize3([
+        vectors[0][smallest] as f32,
+        vectors[1][smallest] as f32,
+        vectors[2][smallest] as f32,
+    ])
+}
+
+/// The flat-bottom band of a foot: the 1st percentile of its heights plus 6 mm.
+fn sole_band(points: &[[f32; 3]]) -> Option<Vec<[f32; 3]>> {
+    if points.len() < 6 {
+        return None;
+    }
+    let heights: Vec<f32> = points.iter().map(|point| point[1]).collect();
+    let floor = velomocap_motion::contacts::quantile(&heights, 0.01);
+    let band: Vec<[f32; 3]> = points
+        .iter()
+        .copied()
+        .filter(|point| point[1] < floor + 0.006)
+        .collect();
+    (band.len() >= 4).then_some(band)
+}
+
+/// The sole patch of one foot, and the frame it defines.
+///
+/// The reference's rule, for both rigs: vertices weighted mostly to the ankle and
+/// toe and below `ankle.y + 2 cm`; the 1st percentile of their heights is the
+/// patch's floor; the bottom 6 mm of them are the sole; and the median along the
+/// foot's forward axis splits heel from toe.
+fn sole_patch(
+    vertices: &[[f32; 3]],
+    is_sole: impl Fn(usize) -> bool,
+    ankle: [f32; 3],
+    toe: [f32; 3],
+) -> Option<SolePatch> {
+    let eligible: Vec<usize> = (0..vertices.len())
+        .filter(|vertex| is_sole(*vertex) && vertices[*vertex][1] < ankle[1] + 0.02)
+        .collect();
+    if eligible.len() < 6 {
+        return None;
+    }
+    let heights: Vec<f32> = eligible.iter().map(|vertex| vertices[*vertex][1]).collect();
+    let floor = velomocap_motion::contacts::quantile(&heights, 0.01);
+    let bottom: Vec<usize> = eligible
+        .into_iter()
+        .filter(|vertex| vertices[*vertex][1] < floor + 0.006)
+        .collect();
+    if bottom.len() < 4 {
+        return None;
+    }
+    let forward = normalize3([toe[0] - ankle[0], 0.0, toe[2] - ankle[2]])?;
+    let mut along: Vec<(f32, usize)> = bottom
+        .iter()
+        .map(|vertex| {
+            let point = vertices[*vertex];
+            (
+                (point[0] - ankle[0]) * forward[0] + (point[2] - ankle[2]) * forward[2],
+                *vertex,
+            )
+        })
+        .collect();
+    along.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let middle = along[along.len() / 2].0;
+    let heel: Vec<[f32; 3]> = along
+        .iter()
+        .filter(|(at, _)| *at <= middle)
+        .map(|(_, vertex)| vertices[*vertex])
+        .collect();
+    let fore: Vec<[f32; 3]> = along
+        .iter()
+        .filter(|(at, _)| *at > middle)
+        .map(|(_, vertex)| vertices[*vertex])
+        .collect();
+    let patch: Vec<[f32; 3]> = bottom.iter().map(|vertex| vertices[*vertex]).collect();
+    let mut up = plane_normal(&patch)?;
+    if up[1] < 0.0 {
+        up = [-up[0], -up[1], -up[2]];
+    }
+    let toe_centre = mean3(&fore);
+    let heel_centre = mean3(&heel);
+    let raw = [
+        toe_centre[0] - heel_centre[0],
+        toe_centre[1] - heel_centre[1],
+        toe_centre[2] - heel_centre[2],
+    ];
+    // Flatten onto the sole plane: a foot's heel and toe are not the same height.
+    let flat = [
+        raw[0] - up[0] * dot3(up, raw),
+        raw[1] - up[1] * dot3(up, raw),
+        raw[2] - up[2] * dot3(up, raw),
+    ];
+    let forward = normalize3(flat)?;
+    let right = normalize3(cross3(up, forward))?;
+    let up = cross3(forward, right);
+    Some(SolePatch {
+        frame: SoleFrame {
+            right,
+            up,
+            forward,
+        },
+        floor,
+    })
 }
 
 /// A little-endian cursor over a PMX byte stream. PMX has no alignment, so every
@@ -1984,6 +2431,8 @@ fn finalize(
         face_texture,
         inherit: Vec::new(),
         scale,
+        calibration: [identity(), identity()],
+        sole_lift: 0.0,
     }
 }
 
@@ -3654,6 +4103,8 @@ mod tests {
             face_texture: Vec::new(),
             inherit: Vec::new(),
             scale: 1.0,
+            calibration: [identity(), identity()],
+            sole_lift: 0.0,
         }
     }
 

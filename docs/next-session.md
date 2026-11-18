@@ -849,3 +849,83 @@ plane, so the foot floats 8 mm and skates 3x as much. The exchange rate is bad
 because at `d/max >= 0.95` the pin's contribution to the sole is a few
 millimetres while its contribution to the knee is ~6 mm of second difference.
 Rejected as a default; the character-stage solve is the place to buy this back.
+
+## 21. The character stage: an instrument, the calibration port, and what it says (2026-11-18)
+
+Section 16 and the audits agreed the last missing layer is the *target* skeleton:
+our character path copies the clip'"'"'s world rotations (`character.rs`
+`delta[canonical] = world · restᵀ`) plus one `ground_offset`, while the reference
+runs `foot_calibration.corrected_world`, a two-bone contact solve, and a
+`bounded_stabilizer` over the knee flexion. Nothing in the clip'"'"'s own metrics can
+see any of that: the SMPL sole is pinned to 0.1 mm, and the character'"'"'s shoe is
+bound to its own foot bone.
+
+### The instrument
+
+`velomocap-app --measure-soles <character> <project> <out>` poses every frame of
+a saved take on a character and writes the lowest sole vertex per foot, plus two
+summaries:
+
+- **sole tilt** on planted frames (lowest sole < 8 mm): the angle between the
+  sole band'"'"'s plane normal and the floor. A shoe that pivots about the ankle
+  while the foot is planted shows up here and nowhere else.
+- **lowest sole** per frame over the whole clip: `p05 / median / p95 / max`, in
+  metres above the floor. This is what the eye calls "the foot floats" or "the
+  foot sinks".
+
+`Character::sole_vertices` is the vertex set both are measured on: bound mostly
+to the ankle/toe bones (canonical 46/47, 50/51) and below the ankle, the same
+selection the reference uses for `eval_pins`.
+
+### Baseline, on the user'"'"'s VRM and their own take
+
+`2月27日.vp`, 562 frames, `vrm.vrm` (110148 vertices):
+
+| | planted tilt (L/R) | lowest sole p05 / median / p95 / max |
+|---|---|---|
+| as shipped | 3.8 / 4.3 deg | -48.9 / **+15.7** / +44.2 / +58.5 mm |
+| `VELOMOCAP_FOOT_CALIBRATION=1` | 5.8 / 5.5 deg | -62.1 / **+9.6** / +38.2 / +55.7 mm |
+
+The clip'"'"'s own sole is on the floor by construction, so a planted character
+should read ~0. It reads a **+16 mm median with a ±50 mm spread**: the shoe is
+neither flat nor still, and the spread is the character'"'"'s own leg geometry, which
+no rotation copy can fix — that is stage 2 (a target-side two-bone solve against
+the contact points).
+
+### The calibration port, and why it is off by default
+
+`Character::calibrate` is `corrected_world` faithfully: per side, measure the
+character'"'"'s own sole frame `F_c` from its vertices and weights, the clip'"'"'s `F_s`
+from the neutral body, and premultiply `Q = F_s · F_cᵀ` onto the ankle'"'"'s and
+toe'"'"'s delta (`world · restᵀ · Q`, derived in the same way as the reference'"'"'s
+`native · C`). The rotation *is* applied and does move the shoe — but on this
+pair it makes the shoe **more** tilted (3.8 -> 5.8 deg) and the p05 worse
+(-48.9 -> -62.1), for a 6 mm better median.
+
+The defect is upstream of the calibration: the **source** sole frame is wrong on
+one foot. Measured with `VELOMOCAP_DEBUG_SOLE=1`:
+
+```text
+calib: side 0 source up [-0.0015, 0.99999, -0.0049] forward [0.9238, 0.0032, 0.3829]  Q turns 67.5 deg
+calib: side 1 source up [-0.0015, 0.99956, 0.0297]  forward [-0.2648, -0.0290, 0.9639] Q turns 15.6 deg
+```
+
+The left foot'"'"'s `forward` is mostly **+x** — sideways — where the right one is
+`+z`. Both come from `toe − ankle` with the clip'"'"'s joint indices (7 -> 10,
+8 -> 11), so either the body model'"'"'s joint order is not the clip'"'"'s, or the
+weight row lookup (`weights[joint * vertices + vertex]`) does not match the
+patch on this model. Until that is settled the switch stays off: a 67-degree
+rotation on one foot would be visible, and the honest state is "the instrument
+is in, the calibration is not trusted yet".
+
+### What this changes for the plan
+
+Stage 1 as ordered ("C + a sole-height constant") cannot reach 2-3 mm on its own:
+the constant only shifts the median, and the ±50 mm spread is the missing
+target-side solve. The constant was measured too — `ground_offset` already puts
+the sole at +16 mm median, and adding the raw foot-thickness difference
+(+29 mm) made it +23.9 mm, i.e. worse; it was dropped.
+
+Stage 2 (target-side two-bone contact solve, ~120 lines) is the next real step,
+and `--measure-soles` is its acceptance test: planted tilt -> ~0, and the
+lowest-sole median -> 0 with a tight spread.

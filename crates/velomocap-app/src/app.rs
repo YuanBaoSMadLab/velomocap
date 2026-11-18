@@ -490,6 +490,7 @@ impl VeloMocap {
             export_asset,
             export_animated,
             render_pose,
+            measure_soles,
             save_project,
             open_project,
             storage_precision,
@@ -696,6 +697,14 @@ impl VeloMocap {
             }
             std::process::exit(0);
         }
+        if let Some((file, project, out)) = measure_soles.clone() {
+            let model = app.smplh_model.display().to_string();
+            if let Err(error) = crate::probe::measure_soles(&model, &file, &project, &out) {
+                eprintln!("measure-soles failed: {error:#}");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
         app.log("VeloMocap native core ready.");
         // A session header, so the file log can be read on its own: which build,
         // which binary, and what the correction was asked to do. Without it a
@@ -852,7 +861,8 @@ impl VeloMocap {
             return Some(index);
         }
         match crate::character::Character::load(&path) {
-            Ok(character) => {
+            Ok(mut character) => {
+                self.calibrate_soles(&mut character);
                 let bones = character.bones.len();
                 let matched = character.matched();
                 let vertices = character.vertex_count();
@@ -1322,7 +1332,8 @@ impl VeloMocap {
                 continue;
             }
             match crate::character::Character::load(&file) {
-                Ok(character) => {
+                Ok(mut character) => {
+                    self.calibrate_soles(&mut character);
                     if self.character_rest.is_none() {
                         let (rotations, positions, parents) = self.rest_pose();
                         self.character_rest = rotations;
@@ -1337,6 +1348,27 @@ impl VeloMocap {
                 Err(error) => self.log(format!("characters: {error:#}")),
             }
         }
+    }
+
+    /// Align an imported character's soles with the clip's own, once, at load.
+    ///
+    /// The reference's foot calibration (retarget/foot_calibration.py): the shoe
+    /// is bound to the foot bone, and a VRM's foot bone is not parallel to its
+    /// sole, so without this the shoe stays tilted and pivots about the ankle the
+    /// clip's motion drives.
+    fn calibrate_soles(&self, character: &mut crate::character::Character) {
+        // Off until the source sole patch is trustworthy: measured on the user's
+        // VRM the source's own forward axis comes out sideways on the left foot
+        // (Q turns 67.5 deg there against 15.6 on the right), which is a patch
+        // selection problem, not a calibration one. The instrument below measures
+        // it; the switch is here so the two can be compared.
+        if std::env::var_os("VELOMOCAP_FOOT_CALIBRATION").is_none() {
+            return;
+        }
+        let Ok(body) = velomocap_body::BodyModel::load(&self.smplh_model, 16) else {
+            return;
+        };
+        character.calibrate(&body);
     }
 
     /// The body model's rest orientation and joint positions, which turn a clip
@@ -1807,11 +1839,14 @@ impl VeloMocap {
                 continue;
             }
             match crate::character::Character::load(path) {
-                Ok(character) => self.characters.push(LibraryCharacter {
-                    builtin: is_builtin_path(path),
-                    path: path.clone(),
-                    character: Arc::new(character),
-                }),
+                Ok(mut character) => {
+                    self.calibrate_soles(&mut character);
+                    self.characters.push(LibraryCharacter {
+                        builtin: is_builtin_path(path),
+                        path: path.clone(),
+                        character: Arc::new(character),
+                    })
+                }
                 Err(error) => notes.push(format!("{}: {error:#}", path.display())),
             }
         }
@@ -3125,6 +3160,7 @@ fn cli_args() -> CliArgs {
     let mut export_asset: Option<(String, String)> = None;
     let mut export_animated: Option<(String, String, String)> = None;
     let mut render_pose: Option<(String, String, usize, String)> = None;
+    let mut measure_soles: Option<(String, String, String)> = None;
     let mut select: Option<usize> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -3173,6 +3209,14 @@ fn cli_args() -> CliArgs {
                     (file, project, frame, out)
                 {
                     render_pose = Some((file, project, frame, out));
+                }
+            }
+            "--measure-soles" => {
+                let file = args.next();
+                let project = args.next();
+                let out = args.next();
+                if let (Some(file), Some(project), Some(out)) = (file, project, out) {
+                    measure_soles = Some((file, project, out));
                 }
             }
             "--play-check" => {
@@ -3237,6 +3281,7 @@ fn cli_args() -> CliArgs {
         export_asset,
         export_animated,
         render_pose,
+        measure_soles,
         save_project,
         open_project,
         storage_precision,
@@ -3256,6 +3301,7 @@ struct CliArgs {
     export_asset: Option<(String, String)>,
     export_animated: Option<(String, String, String)>,
     render_pose: Option<(String, String, usize, String)>,
+    measure_soles: Option<(String, String, String)>,
     save_project: Option<PathBuf>,
     open_project: Option<PathBuf>,
     storage_precision: Option<crate::project::Precision>,

@@ -214,6 +214,129 @@ pub fn render_pose(
     rasterize(&character, &verts, out)
 }
 
+/// How high a character's own sole rides above the floor, frame by frame.
+///
+/// The clip's sole is on the floor by construction (the correction pins it
+/// there). The character's is not: its shoe is bound to its own foot bone, so
+/// the only thing that decides where the shoe stands is the calibration from
+/// `Character::calibrate`. This prints the lowest sole vertex of each foot per
+/// frame — the number a viewer actually sees — so the character layer can be
+/// judged without a window.
+pub fn measure_soles(
+    model: &str,
+    character_path: &str,
+    project_path: &str,
+    out: &str,
+) -> anyhow::Result<()> {
+    let mut character =
+        crate::character::Character::load(std::path::Path::new(character_path))?;
+    let project = crate::project::Project::load(std::path::Path::new(project_path))?;
+    let document = &project.document;
+    let clip = document.flow.first().context("the project has no clip")?;
+    let numbers = project.view();
+    let positions = numbers.f32s(&clip.positions);
+    let rotations = numbers.f32s(&clip.rotations);
+    let joints = clip.joints;
+    anyhow::ensure!(joints > 1 && clip.skeleton_count > 0, "the clip is empty");
+    let body = velomocap_body::BodyModel::load(std::path::Path::new(model), 16)?;
+    if std::env::var_os("VELOMOCAP_NO_FOOT_CALIBRATION").is_none()
+        && std::env::var_os("VELOMOCAP_FOOT_CALIBRATION").is_some()
+    {
+        let calibrated = character.calibrate(&body);
+        eprintln!(
+            "measure-soles: calibration {}",
+            if calibrated { "applied" } else { "not applicable" }
+        );
+    } else {
+        eprintln!("measure-soles: calibration disabled");
+    }
+    let neutral = body.forward_joints(&velomocap_body::Pose::neutral(body.num_joints, 16));
+    let mut rest: Vec<[f32; 9]> = Vec::with_capacity(joints);
+    let mut rest_positions: Vec<[f32; 3]> = Vec::with_capacity(joints);
+    for joint in 0..joints {
+        let mut rotation = [0.0f32; 9];
+        rotation.copy_from_slice(&neutral.rotations[joint * 9..joint * 9 + 9]);
+        rest.push(rotation);
+        rest_positions.push([
+            neutral.positions[joint * 3],
+            neutral.positions[joint * 3 + 1],
+            neutral.positions[joint * 3 + 2],
+        ]);
+    }
+    let bind = character
+        .bones
+        .iter()
+        .find(|bone| bone.canonical == Some(0))
+        .or_else(|| character.bones.first())
+        .map(|bone| bone.bind)
+        .unwrap_or([0.0; 3]);
+    let soles = character.sole_vertices();
+    let mut lines = String::from("frame,left,right\n");
+    let mut lowest = Vec::with_capacity(clip.skeleton_count);
+    let mut tilts: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+    for index in 0..clip.skeleton_count {
+        let at = index * joints;
+        let world: Vec<[f32; 9]> = (0..joints)
+            .map(|joint| {
+                let mut rotation = [0.0f32; 9];
+                rotation.copy_from_slice(&rotations[(at + joint) * 9..(at + joint) * 9 + 9]);
+                rotation
+            })
+            .collect();
+        let translation = [
+            positions[at * 3] - bind[0],
+            positions[at * 3 + 1] - bind[1],
+            positions[at * 3 + 2] - bind[2],
+        ];
+        let posed = character.pose(&world, &rest, &rest_positions, &clip.bvh.names, translation);
+        let mut heights = [f32::INFINITY; 2];
+        for (side, vertices) in soles.iter().enumerate() {
+            for vertex in vertices {
+                heights[side] = heights[side].min(posed[vertex * 3 + 1]);
+            }
+        }
+        for side in 0..2 {
+            if heights[side] < 0.008 {
+                if let Some(tilt) = character.sole_tilt(&posed, side) {
+                    tilts[side].push(tilt);
+                }
+            }
+        }
+        lowest.push(heights[0].min(heights[1]));
+        lines.push_str(&format!(
+            "{index},{:.6},{:.6}\n",
+            heights[0], heights[1]
+        ));
+    }
+    std::fs::write(out, lines)?;
+    let mut sorted = lowest.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let at = |q: f32| -> f32 { sorted[((sorted.len() - 1) as f32 * q) as usize] * 1000.0 };
+    let mean = lowest.iter().sum::<f32>() / lowest.len().max(1) as f32;
+    for side in 0..2 {
+        let mut values = tilts[side].clone();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if !values.is_empty() {
+            eprintln!(
+                "measure-soles: foot {side} sole tilt on {} planted frames: median {:.1} deg, p90 {:.1}",
+                values.len(),
+                values[values.len() / 2],
+                values[(values.len() - 1) * 9 / 10]
+            );
+        }
+    }
+    eprintln!(
+        "measure-soles: lowest sole over {} frames: mean {:+.1} mm, p05 {:+.1}, median {:+.1}, p95 {:+.1}, max {:+.1}",
+        lowest.len(),
+        mean * 1000.0,
+        at(0.05),
+        at(0.5),
+        at(0.95),
+        at(1.0)
+    );
+    Ok(())
+}
+
 /// Write a character and the take it is playing as one animated asset: `.glb`
 /// or `.fbx`, picked by the extension.
 pub fn export_animation(
