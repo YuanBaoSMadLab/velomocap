@@ -1737,6 +1737,21 @@ fn leg_ik(
                 continue;
             }
             let current = joint(&clip.skeletons[index], ankle);
+            // The hand-off residual is a *relative* correction, measured against
+            // the ankle of the frame it came from, so the root chain can move the
+            // body underneath it without changing what it asks for.
+            //
+            // Vertically it may carry a foot **up, never down**: "A free foot may
+            // be lifted by its own leg ... Never lower a swing foot"
+            // (`correction.py:396`). On `2月27日` the release carried a 74 mm
+            // downward residual into a foot that was already off the ground,
+            // `keep_sole_on_floor` stopped it exactly at the plane, and the swing
+            // sole sat within 10 mm of the floor on 66 of 89 frames (median 0.0 mm
+            // against 89.1 mm in the source) — a foot sliding along the floor
+            // instead of stepping. The horizontal half is still handed over, and
+            // that is what keeps the ankle from snapping sideways at the edge.
+            let mut offset = offset;
+            offset[1] = offset[1].max(0.0);
             let mut target = [
                 current[0] as f64 + offset[0] as f64,
                 current[1] as f64 + offset[1] as f64,
@@ -1749,7 +1764,7 @@ fn leg_ik(
             // plane (measured: 56 mm below) and straightens the knee to get there.
             // The reference keeps a free sole out of the floor the same way
             // (`contact_offsets`'s `floor_lift` on the non-contact frames): the
-            // hand-off may lower the ankle, but only until the sole touches.
+            // hand-off may lift the ankle, but the sole never touches early.
             if settings.mode == CorrectionMode::Flat {
                 let sole_at = support_point_with(
                     sole,
@@ -2864,7 +2879,9 @@ fn add_transitions(pass: &mut FootPass, clip: &FlowClip, detection: &Detection) 
         if stances.is_empty() {
             continue;
         }
-        // The correction still owed at each stance frame, in the shifted clip.
+        // The correction still owed at each stance frame, in the shifted clip, and
+        // the hold behind it: `leg_ik` needs the hold to scale the root shift it
+        // subtracts, because the residual already carries it.
         let mut residual = vec![[0.0f32; 3]; count];
         for (begin, end) in &stances {
             for index in *begin..*end {

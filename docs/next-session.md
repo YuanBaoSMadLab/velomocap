@@ -660,3 +660,136 @@ makes the same trade.
 2. Only if a take still complains about the edges: a hand-off budget that can
    start *before* the stance ends, i.e. spend a little slide to buy the ramp.
    Measured tradeoff first — the sole is exact right now.
+
+## 18. The hand-off is computed before the root chain and applied after it (2026-11-18)
+
+Section 17 read the `[pin] f48..50 TRANSITION offset=(0.016,-0.074,-0.002)` line as
+"71 mm horizontally" of accumulated stance slide. It is not: `y = -0.074` is
+**vertical**, and the horizontal part is `|(0.016, -0.002)| = 16 mm`. That vector
+is not slide either. It is the root chain's own translation, leaking into the
+hand-off because the hand-off is built before the root moves the body.
+
+### Where it happens
+
+- `foot_lock` builds `pass.targets` in world space (`correction.rs:2731-2738`) and
+  calls `add_transitions` at `:2821`, both **before** `grounding_pass` (`:530`),
+  `root_height_pass` (`:531`) and `pose_plan_window` (`:533`).
+- `add_transitions` stores `residual = pass.targets - current_ankle` (`:2873`), a
+  *relative* vector measured on the pre-shift clip.
+- A world-space target is invariant under a rigid root translation; a relative
+  correction is not: after a shift `s` the same foot needs `residual - s`.
+- The reference does exactly that subtraction: `contact_trajectory.py:164`,
+  `offsets[active] = (anchors - support - shift) * strength`.
+- Measured net root shift on this take: `y = -0.0848 m` median (range
+  `-0.019 .. -0.121`). So the `-0.074` above should be about `+0.011 m` -- a
+  small lift of the free foot, which is what the reference's own
+  "never lower a swing foot" rule (`correction.py:396-407`) asks for. It is
+  applied as a 74 mm press instead.
+
+### What it does to the free foot
+
+`--dump-soles` on fixed `2月27日` replay (`n2-soles.txt`), lowest sole patch above
+the floor, on the frames the pass itself flags `active = 0`:
+
+| | swing frames | median | p10 | max | within 10 mm of the floor |
+|---|---|---|---|---|---|
+| before (source) | 89 / 74 | 99.9 / 106.5 mm | 56.2 / 68.8 | 261 / 229 | 0 / 0 |
+| after, hand-off on | 89 / 74 | **0.0 / 0.0 mm** | 0.0 / 0.0 | 173 / 137 | **66 / 51** |
+| after, `VELOMOCAP_NO_HANDOFF=1` | 89 / 74 | 6.3 / 17.0 mm | -7.5 / 1.8 | 173 / 137 | 55 / 21 |
+
+The correction presses the free foot onto the plane and `keep_sole_on_floor`
+stops it there, so it is glued rather than buried. That matches the swing-frame
+regression in section 17's own table: `knee.L` 21.08 -> 70.18 mm with the
+hand-off, 40.24 mm without it, and `toe.L` 35.45 -> 45.99 / 44.34.
+
+Note the clamp hides the size of the error but not the motion: the leg is still
+asked to reach a target 85 mm lower than it should be, which is why a
+near-straight swing leg turns it into a centimetre of knee movement.
+
+### The two fixes this points at
+
+1. Make the hand-off shift-invariant: interpolate `pass.targets` (world,
+   invariant) instead of the residual and take `target - current` at apply time
+   inside `leg_ik`'s transition branch, or move the `add_transitions` call after
+   the root chain. Either way the stored quantity must not contain the root's
+   translation.
+2. Add the reference's free-foot rule as a clamp, not as a wish: the vertical
+   part of a transition offset may lift a free sole and never lower it below the
+   clearance the source had after the shift.
+
+### Check after the fix, on the same dumps
+
+- swing-frame sole clearance back to roughly `source clearance + shift`
+  (~10-15 mm on this take), not 0;
+- stance edge p99 no worse than now (25-66 mm), so the hand-off keeps the edge
+  benefit it currently has;
+- `knee.L` swing p99 near the no-hand-off 40 mm rather than 70;
+- `--dump-joints` slide/float/sink unchanged.
+
+Until this is in, the character-stage stabiliser is the wrong next module on
+this take: `stable_pole` cannot undo a target that is 85 mm low.
+
+## 19. Both halves of section 18, implemented and measured: one is wrong (2026-11-18)
+
+Section 18 proposed two things: make the hand-off shift-invariant, and clamp the
+free foot so it is never lowered. The first was implemented exactly as written —
+`foot.root` recorded where the residuals were built, and
+`target = current + offset - (root_now - root_then) * hold` in `leg_ik` — and it
+is **wrong for this pipeline**. The second holds up and is kept.
+
+### Why the subtraction double-counts
+
+`[pin] f301 leg0 TRANSITION offset=(0.001,-0.009,0.001) shift=(+0.0000,-0.0778,+0.0000)`
+on `2月27日`: the residual has already faded to 9 mm while the root has moved
+78 mm, so the corrected target lands at `y = 0.153` — **70 mm above the stance
+frames on either side of it** (the pin puts those at 0.076-0.085). Result:
+`ankle shake 26.9 -> 74.0 mm`, whole-body jitter `21.5 -> 67.1`, and the gate
+rolled the pass back on the ankle term.
+
+The cause is that our anchor is not the reference's. The reference computes
+`anchors`, `support` and `shift` **once** and then builds the target as
+`fk(ankle) + shift + (anchors - support - shift) * strength`. We recompute the
+anchor inside `leg_ik` from the **post-shift** clip (`rolling_anchor`), and its
+vertical is the floor, so the stance target already carries the subtraction:
+
+```text
+reference:  T = fk(ankle) + shift + (A - S - shift) * strength      (shift applied to the pose first)
+ours:       T = ankle_now + (A - S_now) * hold,  S_now = S - shift
+```
+
+Both give the same `T`. The residual `T - ankle` is therefore a difference of two
+quantities that moved together, i.e. it is body-relative and the stance branch
+already uses it correctly (measured: at the last stance frame the pin lands
+within 2-4 mm of its target, both before and after this change). Subtracting the
+root translation a second time asks for a lift nobody needs.
+
+### What the vertical clamp alone buys
+
+`offset[1] = max(offset[1], 0)` in the transition branch — the cast of
+`correction.py:396` "Never lower a swing foot". `--dump-soles`, lowest sole patch
+above the floor, on the frames the pass flags inactive:
+
+| `2月27日` | swing frames | median | p10 | within 10 mm |
+|---|---|---|---|---|
+| source | 97 / 79 | 89.1 / 93.5 mm | 45.4 / 62.6 | 0 / 0 |
+| before this change | 97 / 79 | **2.5 / 0.0 mm** | 0.0 / 0.0 | **66 / 51** |
+| after | 97 / 79 | **6.7 / 17.5 mm** | 0.0 / 1.0 | 53 / 24 |
+
+Sole metrics are untouched (`slide 0.32/0.38 -> 0.04/0.07 cm/frame`,
+`float 63.0/60.5 -> 0.1/0.0 mm`, `sink 0.0/0.0 -> 0.0/0.0 mm`), the ankles pay
+`43.1 -> 48.7 mm` and the whole-body jitter `37.2 -> 40.2`. The other three takes:
+`feb2` identical, `full` better (`48.8 -> 45.8`), `brief3` worse
+(`29.0 -> 35.1`, still inside the gate).
+
+There is not much more to recover on this take: its *own* swing clearance over
+the planted foot is only ~26 mm (89 mm swing against 63 mm float), so 10-15 mm
+absolute is the ceiling, not 90.
+
+### What is still not fixed
+
+- The contact-edge p99 (65-72 mm on the ankles, 41-66 on the knees) is unchanged:
+  it is the stance's accumulated *horizontal* correction being unwound, not the
+  vertical press.
+- `knee.L` on planted frames (12.2 -> 17.9 mm) is the near-straight leg
+  (`d/max = 0.95-0.99`), i.e. the character-layer `stable_pole` problem from
+  section 16, and this change does not touch it.
