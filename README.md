@@ -1,156 +1,156 @@
 # VeloMocap
 
-**Markerless motion capture from ordinary RGB video, written in Rust and C++ — no Python at runtime.**
+**Single-camera RGB video to 3D human motion, as a native Windows application in Rust and C++.**
 
-VeloMocap turns a phone clip into a rigged, animated 3D human: detect people, reconstruct
-their bodies with a 3D body model, estimate camera motion, generate temporally coherent
-motion, and export the avatar as one animated **.glb** — mesh, skeleton, materials and take — that drops straight into Blender, Unity or Unreal.
+VeloMocap takes one ordinary clip and returns a rigged, animated character: person
+detection and tracking, 3D body reconstruction (SAM 3D Body / MHR), camera estimation,
+FlowHMR motion generation, foot-contact cleanup, and export as an animated `.glb`, BVH or
+binary FBX. It is a from-scratch re-implementation of the
+[RGB MoCap](https://github.com/toyxyz/toyxyz_RGBMocap) pipeline, not a wrapper around it:
+every stage is code in this repository, and the app runs without Python.
 
 ![The VeloMocap workspace](assets/screenshot.png)
+
+## Facts
+
+```yaml
+name: VeloMocap
+version: 0.1.0
+platform: Windows x64
+runtime: native (Rust + C++), no Python at run time
+input: single-camera RGB video
+output: animated .glb, BVH, binary FBX 7.4
+inference: ONNX Runtime (CUDA) + LibTorch TorchScript
+ui: egui desktop app, Chinese and English; headless CLI
+license: Apache-2.0 (source only, model weights excluded)
+```
+
+## Pipeline
 
 ```text
 video ─► YOLOv8 detector ─► IoU tracker
                               │
                               ▼
-       SAM 3D Body (one TorchScript module through LibTorch, ONNX fallback)
-       body pass → both hands → fusion → MHR mesh  18 439 v / 36 874 t
-                              │  features: body + left hand + right hand (3072)
+        SAM 3D Body (TorchScript through LibTorch, ONNX fallback)
+        body ─► both hands ─► fusion ─► MHR mesh
+                              │  features: body + left hand + right hand
                               ▼
-       VGGT-Omega camera (ONNX) ─► FlowHMR MMDiT (ONNX) + a Rust sampler
-                              │  SMPL-H  6 890 v / 52 joints
+        VGGT-Omega camera ─► FlowHMR MMDiT ─► SMPL-H solver ─► foot lock
+                              │
                               ▼
-       contact cleanup ─► 3D viewport · animated .glb
+        viewport · animated .glb · BVH · binary FBX
 ```
 
-| Stage | Implementation | Measured (RTX 5060 Ti) |
+## Compared with the Python way
+
+| | Python pipelines (the reference implementation and similar projects) | VeloMocap |
 | --- | --- | --- |
-| Decode / seek | ffmpeg pipe, any codec | ~60 ms per seek |
-| Person detection | YOLOv8x, ONNX Runtime CUDA | 1 ms/frame after warmup |
-| Identity tracking | Rust, IoU + coast | 4 people across 90 frames |
-| **SAM 3D Body (full)** | **TorchScript via LibTorch** | **0.44 s/person-frame**, parity 1.5e-05 vs PyTorch |
-| SAM 3D Body (fallback) | 11 ONNX graphs driven from Rust | 0.26 s/person-frame |
-| **FlowHMR motion** | VGGT + MMDiT ONNX, sampler in Rust | 20 Euler steps, 30 fps output |
-| Body model | pure Rust SMPL-H / SMPL-X | 6 890 verts, 52 joints |
-| Viewport | CPU rasteriser, z-buffer, Gouraud | 147 k triangles ≈ 3 ms |
-| **Export** | character asset .glb: mesh, skin, materials, take | 105 368 v / 67 bones in 30.0 MB |
+| Run time | Python interpreter + venv; an install script fetches runtimes | one native executable; no interpreter |
+| Each stage | research repositories glued together with Python | detector, tracker, body, camera, motion, foot lock, exporters — all here |
+| Deployment | pip/conda environment; a version drift breaks the chain | a folder: executable + DLLs + model path |
+| Scripting | needs a Python process | `velomocap-cli`, one command per job |
+| Inference | PyTorch / ONNX | LibTorch TorchScript by default, ONNX Runtime as a fallback, same weights |
+| UI toolkit | Qt (PySide6) | egui, immediate mode |
+| Export | depends on plugins | animated `.glb` (mesh, skin, materials, take), BVH, binary FBX |
 
-## Why it exists
+## What it does
 
-Most video-to-motion pipelines are a Python stack of PyTorch, OpenCV and a dozen
-research repositories. VeloMocap re-implements the whole chain as a normal Windows
-application: one folder, no interpreter, no environment variables, deterministic
-timings. It is a re-implementation of the **RGB MoCap** pipeline
-([toyxyz_RGBMocap](https://github.com/toyxyz/toyxyz_RGBMocap), MIT), not a wrapper
-around it.
+- **Import → detect → tick → reconstruct.** One detection pass, then only the people you
+  ticked are reconstructed; a tick survives the tracker re-numbering a body mid-take.
+- **Project and recovery.** One `.vp` file holds the video reference, the bodies, the mesh,
+  the baked motion, the avatars and the hand-drawn locks. A take is also autosaved into
+  `%TEMP%` and offered back if the last session did not exit cleanly.
+- **Multi-person.** Every person gets an identity, a colour, its own mesh and motion clip.
+- **Streaming playback.** The video plays through one ffmpeg process whose frames drive the
+  playhead, so picture and animation never drift apart.
+- **Characters.** Import VRM, Unreal or Mixamo-rigged glTF/FBX/GLB and the take drives them
+  in the viewport with their own materials; the library is shared by every project.
+- **Export.** Character asset window writes one `.glb` per person (mesh, skin, materials
+  and animation, textures embedded); the CLI also writes BVH and binary FBX.
+- **Foot lock.** The reference's contact correction, ported, with a per-frame report
+  (slide, float, sink, jitter) and a gate that rolls a correction back when it makes the
+  feet worse.
+- **Self-checks.** Parity checks (`tools/torch/*_check.py`) compare the exported SAM module
+  against the PyTorch reference; the crate tests cover the exporters, the project file and
+  the contact-planner's acceptance numbers.
 
-## Features
+## Build from source
 
-* **Native desktop app** (egui/eframe) with the original workspace layout: movie clip,
-  3D viewport, timeline, person list, settings sidebar, Chinese and English UI.
-* **Import → detect → select → reconstruct**: importing a clip runs one detection pass,
-  you tick who to capture, and only those people are reconstructed.
-* **Streaming playback**: the video plays through a single ffmpeg process whose frames
-  drive the playhead, so picture and animation never drift apart.
-* **Multi-person**: every person gets an identity, a colour and its own motion clip.
-* **Exports**: the character asset export above is the app's export. The `velomocap-cli` binary
-  can also write a bare skeleton as BVH (Character Studio bone names, a uniform
-  `Zrotation Xrotation Yrotation` encoding) or binary FBX 7.4 in centimetres.
-* **Characters**: import a **VRM** avatar, an **Unreal Engine** body, or any
-  **Mixamo-rigged** glTF/FBX/GLB, and the generated clip drives it in the viewport with its own
-  materials and textures. `UE5_Manny_Simple`, `UE5_Quinn_Simple` and `Mixamo_Remy` ship in
-  `models/characters/`, so a fresh install already has three rigs to export to. The library is
-  shared by every project: import once, use everywhere.
-* **Character asset export**: one window sized like a DCC export panel — tick mesh/skin,
-  materials and animation, give each character its own file name, and browse for the output
-  folder. It writes the model that is on screen as a single **.glb**, so Blender, Unity or
-  Unreal import a skeletal mesh with its take instead of motion that has to be re-skinned;
-  the textures travel inside the file.
-* **MMD (experimental)**: PMX models load with their materials, 付与 (inherit) links and
-  deform bones; the rigid-body physics that moves MMD hair and cloth is not simulated yet.
-* **Self-checking**: SAM parity tests run the PyTorch reference and the exported module
-  in one process; an exported `.glb` is checked by importing it into Blender and comparing
-  the rebuilt skeleton — rest poses and every animated frame — against the file's own data.
-
-## Install
-
-Two ways to run it:
-
-1. **Portable release** — download the archive, unzip, run `VeloMocap.cmd`. Everything
-   (LibTorch, ONNX Runtime, ffmpeg, models) is inside the folder; nothing to install.
-2. **From source** — Rust 1.80+ and the Visual C++ toolchain:
+Requires Rust (stable) with the MSVC toolchain, and Windows x64.
 
 ```powershell
 cargo build --release -p velomocap-app -p velomocap-cli
-
-# optional: run SAM 3D Body through LibTorch (2.4x faster and with hands)
-$env:VELOMOCAP_LIBTORCH = "1"
-$env:PATH = "<torch>\lib;$env:PATH"
 ```
 
-Model weights are **not** part of this repository. `tools/fetch_models.py` lists every
-file the app looks for, and `models/manifest.json` carries sizes and SHA-256 hashes.
-SMPL-H must be downloaded from
+LibTorch is optional; with it, SAM 3D Body runs through TorchScript (faster, and with
+hands). Without it the ONNX chain is used.
+
+```powershell
+$env:VELOMOCAP_LIBTORCH = "1"
+$env:PATH = "<torch>\lib;$env:PATH"
+cargo build --release -p velomocap-app -p velomocap-cli
+```
+
+## Run
+
+Run from the folder that holds `models/`:
+
+```powershell
+velomocap-app.exe                           # desktop app
+velomocap-app.exe clip.mp4 --detect-only    # detection pass, prints candidates
+velomocap-app.exe clip.mp4 --capture        # reconstruct and bake, headless
+velomocap-cli flow clip.mp4 --person 1 --bvh out.bvh --fbx out.fbx
+```
+
+## Models are not in this repository
+
+`models/` and `runtime/` are ignored by git: SAM 3D Body, FlowHMR, VGGT-Omega, YOLOv8 and
+the ONNX Runtime / LibTorch / ffmpeg binaries keep their own licenses and are obtained
+separately. The app resolves them from `models/` and `runtime/` beside the executable;
+`tools/check_models.py` verifies what is installed against the manifest the app uses,
+and the model registry in the
+[reference repository](https://github.com/toyxyz/toyxyz_RGBMocap) lists where each
+weight comes from. SMPL-H must be downloaded from
 [smpl.is.tue.mpg.de](https://smpl.is.tue.mpg.de/) after registration and placed at
 `models/body_models/smplh/neutral/model.npz`.
 
-## Use
+## Releases
 
-```powershell
-VeloMocap.cmd                               # GUI
-VeloMocap.cmd clip.mp4 --capture            # reconstruct everyone, headless
-VeloMocap.cmd clip.mp4 --play               # open and play
-VeloMocap.cmd clip.mp4 --detect-only        # detection pass only, prints candidates
-```
+Tags mark the source that produced a working build. No binaries, archives or installers are
+published — build from source as above.
 
-![The SMPL-H body model](assets/body-generated.png)
+## Scope
 
-*The body model behind every take — SMPL-H, 6 890 vertices and 52 joints, in a
-neutral A-pose from the front, three-quarter and profile, next to its skeleton.*
-
-Command line:
-
-```powershell
-velomocap-cli flow clip.mp4 --person 1 --frames 60 --bvh out.bvh --fbx out.fbx
-velomocap-cli people clip.mp4 --ply out/          # one mesh per person
-velomocap-cli ort                                 # execution provider report
-```
-
-## Verified, not claimed
-
-| Check | Result |
-| --- | --- |
-| SAM 3D Body vs the PyTorch reference (bf16) | verts 1.3e-03 m, kps2d 0.6 px, camera 1.0e-03 |
-| SAM 3D Body vs the PyTorch reference (fp32) | verts 1.5e-05 m |
-| FlowHMR feature rows | all 3072 columns filled (body + both hands) |
-| BVH export | 52 bones, uniform ZXY, Character Studio names |
-| FBX export | 52 bones, 159 curves, cm units, re-parsed and compared to the source |
-| FBX rotation fidelity | frame 0 exact; worst 0.035 across 12 frames (matrix element) |
-| End-to-end | 90 frames × 4 people in 21 min on one GPU |
+Single-camera RGB only. The reference implementation also covers multi-camera capture,
+streaming into Blender and live preview with several model backends; none of that is
+implemented here. MMD models load with materials and inherit links, but the rigid-body
+physics that moves MMD hair and cloth is not simulated.
 
 ## Repository layout
 
-```
-crates/velomocap-app      egui workspace, software viewport, i18n
-crates/velomocap-motion   capture, FlowHMR features, cleanup, BVH/FBX
+```text
+crates/velomocap-app      egui workspace, software viewport, i18n, project and recovery
+crates/velomocap-motion   capture, tracking, FlowHMR features, cleanup, BVH/FBX
 crates/velomocap-infer    ONNX sessions, detector, tracker, SAM chain, mesh topology
 crates/velomocap-body     SMPL-H / SMPL-X parsing and skinning
 crates/velomocap-core     BVH, FBX, contact planning, math, C++ kernels
 crates/velomocap-video    ffmpeg decode / seek / streaming
 crates/velomocap-cpp      LibTorch bridge (C ABI) for the SAM TorchScript module
 crates/velomocap-models   model manifest and verification
-tools/torch, tools/onnx   offline export scripts for the TorchScript / ONNX models
+crates/velomocap-cli      headless pipeline
+tools/                    offline model export, comparisons, fetching
 ```
+
+## Keywords
+
+motion capture · markerless mocap · video to animation · pose estimation · 3D human ·
+SAM 3D Body · MHR · SMPL-H · SMPL · FlowHMR · VGGT · YOLOv8 · ONNX Runtime · LibTorch ·
+TorchScript · Rust · C++ · egui · BVH · FBX · glTF · VRM · retargeting · Windows
 
 ## License
 
-**Apache License 2.0** — see [LICENSE](LICENSE). It covers the code in this repository
-only. Model weights, SMPL/SMPL-H and the third-party binaries keep their own licenses;
-[NOTICE](NOTICE) lists them and the exclusions.
-
-## Topics
-
-`motion-capture` · `pose-estimation` · `3d-human` · `smpl` · `smplx` · `bvh` · `fbx` ·
-`rust` · `cpp` · `onnxruntime` · `libtorch` · `gpu` · `computer-vision` ·
-`markerless-mocap` · `egui` · `video-to-animation` · `retargeting`
+Apache License 2.0 — see [LICENSE](LICENSE). It covers the source in this repository only;
+[NOTICE](NOTICE) lists the model weights, body models and third-party binaries that keep
+their own licenses.
 
 中文说明见 [README-zh.md](README-zh.md)。

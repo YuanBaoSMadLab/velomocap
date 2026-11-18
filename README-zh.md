@@ -1,139 +1,143 @@
 # VeloMocap
 
-**普通 RGB 视频转三维动作捕捉，Rust + C++ 实现，运行时不依赖 Python。**
+**单机位 RGB 视频 → 3D 人体动作，原生 Windows 应用，Rust + C++ 实现。**
 
-VeloMocap 把一段手机视频变成可用的三维动作：检测人物、重建人体、估计相机运动、生成时间连贯的动作，
-最后把角色导出成一个带动作的 **.glb**——网格、骨骼、材质和动画都在里面，直接拖进 Blender、Unity、Unreal。
+导入一段普通视频，得到可直接驱动的动画角色：人物检测与跟踪、3D 人体重建（SAM 3D Body /
+MHR）、相机估计、FlowHMR 动作生成、脚部接触清理，最终导出带动画的 `.glb`、BVH 或二进制
+FBX。本项目是 [RGB MoCap](https://github.com/toyxyz/toyxyz_RGBMocap) 流程的**重写实现**，
+不是它的封装：每个阶段都是本仓库里的代码，运行期不需要 Python。
 
 > English README: [README.md](README.md)
 
 ![VeloMocap 工作区](assets/screenshot.png)
 
+## 基本信息
+
+```yaml
+名称: VeloMocap
+版本: 0.1.0
+平台: Windows x64
+运行方式: 原生程序（Rust + C++），运行期无 Python
+输入: 单机位 RGB 视频
+输出: 带动画的 .glb、BVH、二进制 FBX 7.4
+推理: ONNX Runtime (CUDA) + LibTorch TorchScript
+界面: egui 桌面程序，中英双语；另有命令行
+许可: Apache-2.0（仅源码，模型权重不包含）
+```
+
+## 处理流程
+
 ```text
 视频 ─► YOLOv8 检测 ─► IoU 跟踪
                         │
                         ▼
-      SAM 3D Body（一个 TorchScript 模块，走 LibTorch；无 CUDA 时回退 ONNX）
-      躯干 → 双手裁剪 → 融合 → MHR 网格  18 439 顶点 / 36 874 面
-                        │  特征：躯干 + 左手 + 右手（3072 维）
+      SAM 3D Body（LibTorch 跑 TorchScript，ONNX 回退）
+      身体 ─► 双手 ─► 融合 ─► MHR 网格
+                        │  特征：身体 + 左手 + 右手
                         ▼
-      VGGT-Omega 相机（ONNX）─► FlowHMR MMDiT（ONNX）+ Rust 采样器
-                        │  SMPL-H  6 890 顶点 / 52 关节
+      VGGT-Omega 相机 ─► FlowHMR MMDiT ─► SMPL-H 解算 ─► 脚部锁定
+                        │
                         ▼
-      接触清理 ─► 3D 视口 · 带动画的 .glb
+      视口 · 带动画 .glb · BVH · 二进制 FBX
 ```
 
-| 环节 | 实现 | 实测（RTX 5060 Ti） |
+## 与 Python 方案（原版及同类项目）相比
+
+| | Python 方案 | VeloMocap |
 | --- | --- | --- |
-| 解码 / 定位 | ffmpeg 管道，任意编码 | 定位一次约 60 ms |
-| 人物检测 | YOLOv8x，ONNX Runtime CUDA | 预热后 1 ms/帧 |
-| 身份跟踪 | Rust，IoU + 惯性 | 90 帧内 4 人稳定 |
-| **SAM 3D Body（完整）** | **LibTorch 加载 TorchScript** | **0.44 秒/人帧**，与 PyTorch 偏差 1.5e-05 |
-| SAM 3D Body（回退） | Rust 驱动 11 个 ONNX 图 | 0.26 秒/人帧 |
-| **FlowHMR 动作** | VGGT + MMDiT ONNX，采样器 Rust | 20 步欧拉，输出 30 fps |
-| 人体模型 | 纯 Rust SMPL-H / SMPL-X | 6 890 顶点，52 关节 |
-| 视口 | CPU 光栅化，z-buffer，Gouraud | 14.7 万三角形约 3 ms |
-| **导出** | 角色资产 .glb：网格、蒙皮、材质、动作 | 10.5 万顶点 / 67 骨，30.0 MB |
+| 运行时 | Python 解释器 + venv，由安装脚本拉运行时 | 单个原生程序，不需要解释器 |
+| 每个阶段 | 多个研究仓库用 Python 拼起来 | 检测、跟踪、人体、相机、动作、脚锁、导出，全部在本仓库 |
+| 部署 | pip/conda 环境，版本一变就跑不起来 | 一个文件夹：程序 + DLL + 模型路径 |
+| 脚本化 | 需要一个 Python 进程 | `velomocap-cli`，一条命令一个任务 |
+| 推理 | PyTorch / ONNX | 默认 LibTorch TorchScript，ONNX Runtime 回退，同一份权重 |
+| 界面框架 | Qt（PySide6） | egui 即时模式 |
+| 导出 | 取决于插件 | 带动画的 `.glb`（网格 + 蒙皮 + 材质 + 动作）、BVH、二进制 FBX |
 
-## 特点
+## 功能
 
-* **原生桌面程序**（egui/eframe），布局对齐原版工作台：视频片段、3D 视口、时间轴、
-  人物列表、设置侧栏，中文/英文界面。
-* **导入 → 检测 → 勾选 → 重建**：导入视频先做一次检测，你勾要捕捉的人，只重建他们。
-* **流式播放**：播放时只起一个 ffmpeg 进程顺序读帧，由解码出的帧驱动播放头，画面与动作不会漂移。
-* **多人**：每个人有独立身份、颜色和自己的一段动作。
-* **导出**：应用里的导出就是下面的「角色资产导出」。`velomocap-cli` 仍可另外写出裸骨架的 BVH
-  （Character Studio 骨骼名，统一 `Zrotation Xrotation Yrotation` 编码）和厘米单位的二进制
-  FBX 7.4。
-* **角色**：可导入 **VRM** 虚拟形象、**虚幻引擎**身体（`models/characters/` 里带 `UE5_Manny_Simple`、`UE5_Quinn_Simple`、
-  `Mixamo_Remy`），以及任意 **Mixamo 骨骼** 的 glTF/FBX/GLB；片段会用它自己的材质和贴图
-  驱动角色。角色库存在本机，导入一次所有工程共用。
-* **角色资产导出**：一个照 DCC 导出面板做的窗口——勾上网格/蒙皮、材质、动画，给每个角色
-  单独起文件名，输出目录点「浏览…」选。写出的就是视口里那个模型，一个 **.glb** 装下网格、
-  骨骼、材质和动作，导入 Blender / Unity / Unreal 直接得到「骨骼网格体 + 动画序列」，而不是
-  只有需要重新蒙皮的动作；贴图就在文件里面，不会掉。
-* **MMD（实验性）**：PMX 能加载材质、付与（继承）和变形骨；MMD 用刚体物理驱动的头发、裙摆
-  还没有模拟。
-* **可自证**：SAM 的比对测试在同一个进程里同时跑 PyTorch 原版和导出模块；导出的 `.glb`
-  会被丢进 Blender 重新导入，把重建出来的骨架（绑定姿态和每一帧动作）与文件自身的数据
-  逐骨对比。
+- **导入 → 检测 → 勾选 → 重建**：只跑一遍检测，然后只重建勾选的人；中途跟踪器给人换了
+  id，勾选的人还是同一个人，不会变成两个。
+- **工程与恢复**：一个 `.vp` 存下视频引用、人物、网格、烘焙好的动作、角色和手工锁定区间；
+  工作区还会自动存到 `%TEMP%`，上次没正常退出时下次启动会问你要不要恢复。
+- **多人物**：每个人都有独立身份、颜色、网格和动作片段。
+- **流式播放**：视频由一个 ffmpeg 进程解码并驱动播放头，画面和动画不会错位。
+- **角色**：可导入 VRM、Unreal 或 Mixamo 绑定规范的 glTF/FBX/GLB，动作直接驱动角色，带
+  自己的材质贴图；角色库全局共享，导入一次所有工程可用。
+- **导出**：角色资产窗口按人生成一个 `.glb`（网格、蒙皮、材质、动作，贴图内嵌）；命令行
+  还能写 BVH 和二进制 FBX。
+- **脚部锁定**：移植原版的接触校正，并逐帧输出指标（滑步、浮空、下沉、抖动），校正让脚
+  更差时整段回滚。
+- **自检**：`tools/torch/*_check.py` 把导出的 SAM 模块与 PyTorch 参考实现逐项对齐；各 crate
+  的测试覆盖导出器、工程文件以及接触规划的验收指标。
 
-## 安装
+## 从源码构建
 
-两种方式：
-
-1. **便携版** —— 解压即用，双击 `VeloMocap.cmd`。LibTorch、ONNX Runtime、ffmpeg、模型都在文件夹里，
-   不需要安装任何东西，也不需要配置环境变量。
-2. **从源码构建** —— 需要 Rust 1.80+ 与 Visual C++ 工具链：
+需要 Rust（stable）+ MSVC 工具链，Windows x64。
 
 ```powershell
 cargo build --release -p velomocap-app -p velomocap-cli
+```
 
-# 可选：让 SAM 走 LibTorch（快 2.4 倍，且包含手部）
+LibTorch 可选。带上时 SAM 3D Body 走 TorchScript（更快，且包含双手）；不带则走 ONNX。
+
+```powershell
 $env:VELOMOCAP_LIBTORCH = "1"
 $env:PATH = "<torch>\lib;$env:PATH"
+cargo build --release -p velomocap-app -p velomocap-cli
 ```
 
-**模型权重不在本仓库内。** `tools/fetch_models.py` 列出了程序会查找的全部文件，
-`models/manifest.json` 记录了大小与 SHA-256。SMPL-H 需要自行到
-[smpl.is.tue.mpg.de](https://smpl.is.tue.mpg.de/) 注册下载，放到
+## 运行
+
+在放着 `models/` 的目录里运行：
+
+```powershell
+velomocap-app.exe                           # 桌面程序
+velomocap-app.exe clip.mp4 --detect-only    # 只跑检测，打印候选人物
+velomocap-app.exe clip.mp4 --capture        # 无界面直接重建
+velomocap-cli flow clip.mp4 --person 1 --bvh out.bvh --fbx out.fbx
+```
+
+## 模型不在本仓库
+
+`models/` 与 `runtime/` 被 git 忽略：SAM 3D Body、FlowHMR、VGGT-Omega、YOLOv8，以及
+ONNX Runtime / LibTorch / ffmpeg 二进制各有自己的许可，需要单独获取。程序从可执行文件旁边
+的 `models/`、`runtime/` 读取；`tools/check_models.py` 会按程序使用的清单校验已装的文件，
+各权重的下载地址在[原版仓库](https://github.com/toyxyz/toyxyz_RGBMocap)的模型清单里。
+SMPL-H 需要在 [smpl.is.tue.mpg.de](https://smpl.is.tue.mpg.de/) 注册后下载，放到
 `models/body_models/smplh/neutral/model.npz`。
 
-## 使用
+## 发布说明
 
-```powershell
-VeloMocap.cmd                               # 图形界面
-VeloMocap.cmd clip.mp4 --capture            # 无界面重建所有人
-VeloMocap.cmd clip.mp4 --play               # 打开并播放
-VeloMocap.cmd clip.mp4 --detect-only        # 只做检测，打印候选人物
-```
+Tag 只标注对应的源码。**不发布任何二进制、压缩包或安装程序**，请按上面的步骤自行构建。
 
-![SMPL-H 人体模型](assets/body-generated.png)
+## 范围
 
-*每条动作背后的身体模型 —— SMPL-H，6 890 顶点、52 关节，以中性 A 姿态的正面、
-四分之三、侧面三视图，以及它的骨架。*
+只做单机位 RGB。原版还包含多机位采集、实时串流到 Blender、多种模型后端的实时预览，这些
+本项目没有实现。MMD 模型可以带材质和 付与（inherit）关系加载，但驱动头发衣物的刚体物理
+没有模拟。
 
-命令行：
+## 目录
 
-```powershell
-velomocap-cli flow clip.mp4 --person 1 --frames 60 --bvh out.bvh --fbx out.fbx
-velomocap-cli people clip.mp4 --ply out/          # 每人一个 PLY
-velomocap-cli ort                                 # 执行后端报告
-```
-
-## 已验证
-
-| 检查项 | 结果 |
-| --- | --- |
-| SAM 3D Body 对比 PyTorch 原版（bf16） | 顶点 1.3e-03 m，2D 关键点 0.6 px，相机 1.0e-03 |
-| SAM 3D Body 对比 PyTorch 原版（fp32） | 顶点 1.5e-05 m |
-| FlowHMR 特征 | 3072 列全部填充（躯干 + 双手） |
-| BVH 导出 | 52 骨、统一 ZXY、Character Studio 命名 |
-| FBX 导出 | 52 骨、159 条曲线、厘米单位、重新解析并与源骨架比对 |
-| FBX 旋转保真 | 第 0 帧完全一致；12 帧内最大 0.035（矩阵元素） |
-| 端到端 | 90 帧 × 4 人，单卡 21 分钟 |
-
-## 仓库结构
-
-```
-crates/velomocap-app      egui 工作区、软件视口、多语言
-crates/velomocap-motion   捕获、FlowHMR 特征、接触清理、BVH/FBX
+```text
+crates/velomocap-app      egui 工作区、软件视口、中英文、工程与恢复
+crates/velomocap-motion   采集、跟踪、FlowHMR 特征、清理、BVH/FBX
 crates/velomocap-infer    ONNX 会话、检测器、跟踪器、SAM 链、网格拓扑
 crates/velomocap-body     SMPL-H / SMPL-X 解析与蒙皮
 crates/velomocap-core     BVH、FBX、接触规划、数学、C++ 内核
-crates/velomocap-video    ffmpeg 解码 / 定位 / 流式播放
-crates/velomocap-cpp      LibTorch 桥（C ABI）
+crates/velomocap-video    ffmpeg 解码 / 定位 / 流式
+crates/velomocap-cpp      LibTorch 桥（C ABI），跑 SAM TorchScript
 crates/velomocap-models   模型清单与校验
-tools/torch, tools/onnx   离线导出 TorchScript / ONNX 模型的脚本
+crates/velomocap-cli      无界面流程
+tools/                    离线模型导出、对比、下载
 ```
+
+## 关键词
+
+动作捕捉 · 无标记动捕 · 视频转动画 · 姿态估计 · 3D 人体 · SAM 3D Body · MHR · SMPL-H ·
+SMPL · FlowHMR · VGGT · YOLOv8 · ONNX Runtime · LibTorch · TorchScript · Rust · C++ ·
+egui · BVH · FBX · glTF · VRM · 重定向 · Windows
 
 ## 许可
 
-**Apache License 2.0** —— 见 [LICENSE](LICENSE)。许可范围**仅限本仓库的代码**；
-模型权重、SMPL/SMPL-H 与第三方二进制各自保留其许可，详见 [NOTICE](NOTICE)。
-
-## 标签
-
-`motion-capture` · `pose-estimation` · `3d-human` · `smpl` · `smplx` · `bvh` · `fbx` ·
-`rust` · `cpp` · `onnxruntime` · `libtorch` · `gpu` · `computer-vision` ·
-`markerless-mocap` · `egui` · `video-to-animation` · `retargeting`
+Apache License 2.0，见 [LICENSE](LICENSE)。只覆盖本仓库的源码；模型权重、人体模型和第三方
+二进制各有自己的许可，见 [NOTICE](NOTICE)。
