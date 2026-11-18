@@ -799,6 +799,12 @@ fn run_flow(
         state.flow = clips;
         state.smplh_faces = Some(faces);
     }
+    // Headless verification: the report is on stderr, so stop here instead of
+    // sitting in the window loop. A run that is left behind holds the executable
+    // locked (which blocks the next build) and keeps a GPU context alive per run.
+    if std::env::var_os("VELOMOCAP_EXIT_AFTER_CAPTURE").is_some() {
+        std::process::exit(0);
+    }
     Ok(())
 }
 

@@ -68,9 +68,11 @@ pub struct SamConfig {
     /// has LibTorch, the person pass runs through it instead of the ONNX chain —
     /// hands and fusion included, at ~1.1 s/frame on a 5060 Ti.
     pub torch_weights: Option<PathBuf>,
-    /// Boxes the user picked after the detection pass. When non-empty, only the
-    /// tracks that start on one of these boxes are reconstructed, so a clip is
-    /// not rebuilt for bystanders the user did not ask for.
+    /// Boxes the user picked after the detection pass. When non-empty, the cast is
+    /// exactly these people: one seed answers to one track on the first frame,
+    /// follows that body if the tracker re-numbers it, and its frames always land
+    /// in the same `PersonTrack`. Bystanders are never reconstructed, and one tick
+    /// can never produce two people.
     pub seed_boxes: Vec<[f32; 4]>,
 }
 
@@ -371,26 +373,137 @@ fn person_box(bbox: [f32; 4]) -> ([f32; 2], [f32; 2]) {
 /// one track: a box that overlaps two people (or two tracks for one body) must
 /// not double the cast. A seed with no detection is simply absent for now — the
 /// continuation clause looks for it again on later frames.
-fn seed_track_ids(detections: &[(usize, [f32; 4])], seeds: &[[f32; 4]]) -> Vec<usize> {
-    let mut ids = Vec::with_capacity(seeds.len());
-    for seed in seeds {
-        let mut best: Option<(usize, f32)> = None;
-        for (id, box_) in detections {
-            let score = box_overlap(*box_, *seed);
-            if score <= 0.2 {
-                continue;
+fn seed_assignments(detections: &[(usize, [f32; 4])], seeds: &[[f32; 4]]) -> Vec<Option<usize>> {
+    seeds
+        .iter()
+        .map(|seed| {
+            let mut best: Option<(usize, f32)> = None;
+            for (id, box_) in detections {
+                let score = box_overlap(*box_, *seed);
+                if score <= 0.2 {
+                    continue;
+                }
+                if best.map_or(true, |(_, top)| score > top) {
+                    best = Some((*id, score));
+                }
             }
-            if best.map_or(true, |(_, top)| score > top) {
-                best = Some((*id, score));
+            best.map(|(id, _)| id)
+        })
+        .collect()
+}
+
+/// What the per-frame selection needs to know about one tracker track.
+#[derive(Clone, Copy, Debug)]
+struct Seen {
+    id: usize,
+    /// Consecutive frames without a detection, as the tracker counts it.
+    missing: usize,
+    /// Box in this frame; `None` while the track coasts.
+    detection: Option<Detection>,
+}
+
+/// One picked person's identity for the whole take.
+#[derive(Clone, Debug)]
+struct Pick {
+    /// Track id currently answering to this person, if any.
+    track: Option<usize>,
+    /// The box the person was last seen in.
+    last_box: [f32; 4],
+}
+
+/// Which picked person each track belongs to this frame.
+///
+/// One seed is one person, for the whole take:
+///
+/// * While a pick's track *coasts* (`missing <= max_missing`) the identity is
+///   held. It is not up for grabs: a bystander detected in the same frame used to
+///   be accepted as "the same body", which is how one selected person grew into
+///   two and three people half-way through a take.
+/// * Only once the tracker has retired that track (`missing > max_missing`, so it
+///   can never come back) is the body looked for again under a new id — and then
+///   with `continues`, i.e. the box the person was last seen in.
+/// * A track already answering to another pick cannot be taken over.
+///
+/// Returns `(seed, track, detection)` for the picks seen this frame.
+fn select_seeded(seen: &[Seen], picks: &mut [Pick], max_missing: usize) -> Vec<(usize, usize, Detection)> {
+    let mut out = Vec::new();
+    let mut claimed: Vec<usize> = picks.iter().filter_map(|pick| pick.track).collect();
+
+    for (seed, pick) in picks.iter_mut().enumerate() {
+        let Some(id) = pick.track else { continue };
+        match seen.iter().find(|track| track.id == id) {
+            Some(track) if track.detection.is_some() => {
+                let detection = track.detection.unwrap();
+                pick.last_box = [detection.x0, detection.y0, detection.x1, detection.y1];
+                out.push((seed, id, detection));
             }
-        }
-        if let Some((id, _)) = best {
-            if !ids.contains(&id) {
-                ids.push(id);
+            // Coasting: the tracker still expects this body back, so nobody else
+            // may step into its place.
+            Some(track) if track.missing <= max_missing => {}
+            // Retired: the same body, if it is still in shot, now has a new id.
+            _ => {
+                pick.track = None;
+                claimed.retain(|id_| *id_ != id);
             }
         }
     }
-    ids
+
+    for (seed, pick) in picks.iter_mut().enumerate() {
+        if pick.track.is_some() {
+            continue;
+        }
+        let mut best: Option<(usize, f32, Detection)> = None;
+        for track in seen {
+            let Some(detection) = track.detection else { continue };
+            if claimed.contains(&track.id) {
+                continue;
+            }
+            if !continues(pick.last_box, detection) {
+                continue;
+            }
+            let score = overlap(&detection, pick.last_box);
+            if best.map_or(true, |(_, top, _)| score > top) {
+                best = Some((track.id, score, detection));
+            }
+        }
+        if let Some((id, _, detection)) = best {
+            claimed.push(id);
+            pick.track = Some(id);
+            pick.last_box = [detection.x0, detection.y0, detection.x1, detection.y1];
+            out.push((seed, id, detection));
+        }
+    }
+
+    out
+}
+
+/// The single `PersonTrack` a picked seed's frames belong to, created on first
+/// sight. A track-id change lands in the same slot, so one ticked person stays one
+/// reconstructed person however many times the tracker re-numbers them.
+fn seed_slot(
+    slots: &mut Vec<Option<usize>>,
+    people: &mut Vec<PersonTrack>,
+    seed: usize,
+    track: usize,
+    index: usize,
+) -> usize {
+    if slots.len() <= seed {
+        slots.resize(seed + 1, None);
+    }
+    if let Some(slot) = slots[seed] {
+        return slot;
+    }
+    people.push(PersonTrack {
+        id: track,
+        name: format!("Person {}", people.len() + 1),
+        frames: Vec::new(),
+        first_frame: index,
+        last_frame: index,
+        hits: 0,
+    });
+    let slot = people.len() - 1;
+    slots[seed] = Some(slot);
+    slot
 }
 
 /// Does a detection continue the box a picked person was last seen in?
@@ -550,18 +663,18 @@ pub fn capture_people_with(
     };
     let intrinsics = default_intrinsics(width, height);
     let mut tracker = Tracker::new(0.3, config.max_missing);
-    let mut seeded_ids: Vec<usize> = Vec::new();
 
     let mut people: Vec<PersonTrack> = Vec::new();
     let mut timings = Timings::default();
     let mut meshes_stored = 0usize;
     let mut dropped_meshes = 0usize;
     let mut decoded = 0usize;
-    // The last box the picked person was seen in. A dropout longer than
-    // `max_missing` gives the same body a new track id, and following the *id*
-    // alone ends the take where the id changed: the viewport then has no frames
-    // to draw and the character disappears while the video still moves.
-    let mut last_box: Option<[f32; 4]> = None;
+    // One identity per picked person, and one `PersonTrack` slot per identity. A
+    // dropout longer than `max_missing` gives the same body a new track id; the
+    // pick keeps following the *body*, and its frames keep landing in the same
+    // slot, so the cast cannot grow past the number of seeds.
+    let mut picks: Vec<Pick> = Vec::new();
+    let mut slots: Vec<Option<usize>> = Vec::new();
 
     while let Some(frame) = decoder.next_frame()? {
         if (hooks.cancelled)() {
@@ -577,130 +690,103 @@ pub fn capture_people_with(
         timings.detect += detect_start.elapsed().as_secs_f64();
         tracker.update(&detections);
 
-        // Restrict to the people the user picked: on the first frame keep **one**
-        // track per seed box, then only those track ids — plus, when a picked
-        // person's id drops out, the single track that continues their box.
-        //
-        // The first frame used to keep *every* track overlapping a seed, and the
-        // continuation clause accepted any track that merely sat near the last
-        // box. A second person standing beside the picked one therefore came in
-        // through both doors: one seed, two reconstructed people.
-        if !config.seed_boxes.is_empty() && index == 0 {
-            let boxes: Vec<(usize, [f32; 4])> = tracker
-                .tracks
-                .iter()
-                .filter_map(|track| {
-                    track
-                        .boxes
-                        .get(index)
-                        .and_then(|slot| *slot)
-                        .map(|detection| {
-                            (track.id, [detection.x0, detection.y0, detection.x1, detection.y1])
-                        })
-                })
-                .collect();
-            seeded_ids = seed_track_ids(&boxes, &config.seed_boxes);
-            if std::env::var_os("VELOMOCAP_DEBUG_SEEDS").is_some() {
-                eprintln!(
-                    "[seeds] {} detections, {} tracks, {} seeded {:?}, first detection {:?}",
-                    detections.len(),
-                    tracker.tracks.len(),
-                    seeded_ids.len(),
-                    seeded_ids,
-                    detections.first().map(|d| (d.x0, d.y0, d.x1, d.y1))
-                );
-                for seed in &config.seed_boxes {
-                    eprintln!("[seeds] seed {:?}", seed);
-                }
-            }
-        }
-
-        // Is a picked person on screen this frame? A replacement track is only
-        // considered when none is, so two bodies can never answer to one seed.
-        let seeded_present = tracker.tracks.iter().any(|track| {
-            seeded_ids.contains(&track.id)
-                && track.missing == 0
-                && track.boxes.get(index).and_then(|slot| *slot).is_some()
-        });
-
-        let mut candidates: Vec<(usize, Detection)> = tracker
+        // Every picked person answers to exactly one identity for the whole take:
+        // `picks[seed]` follows that body across track-id changes, `slots[seed]` is
+        // the one `PersonTrack` its frames land in. The cast is therefore fixed by
+        // the seeds before a single mesh is run.
+        let seen: Vec<Seen> = tracker
             .tracks
             .iter()
-            .filter(|track| track.missing <= config.max_missing)
-            .filter(|track| {
-                if config.seed_boxes.is_empty() || seeded_ids.contains(&track.id) {
-                    return true;
-                }
-                if seeded_present {
-                    return false;
-                }
-                // Same body, new id: accept it when it continues the box the person
-                // was last seen in — overlapping it, or with its centre within
-                // about half a body of it (the box moves while the track was lost).
-                let Some(previous) = last_box else {
-                    return false;
-                };
-                track
-                    .boxes
-                    .get(index)
-                    .and_then(|slot| *slot)
-                    .map_or(false, |detection| continues(previous, detection))
-            })
-            .filter_map(|track| {
-                track
-                    .boxes
-                    .get(index)
-                    .and_then(|slot| *slot)
-                    .map(|detection| (track.id, detection))
+            .map(|track| Seen {
+                id: track.id,
+                missing: track.missing,
+                detection: track.boxes.get(index).and_then(|slot| *slot),
             })
             .collect();
-        candidates.sort_by(|a, b| {
-            b.1.area()
-                .partial_cmp(&a.1.area())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        candidates.retain(|(_, detection)| {
-            detection.height() >= config.min_box_height * frame.height as f32
-        });
-        candidates.truncate(config.max_people);
-        // The user's selection is the whole cast: one seed never yields two
-        // people, however many tracks happen to be in the room.
-        if !config.seed_boxes.is_empty() {
-            let cast = config.seed_boxes.len().max(1).min(config.max_people);
-            candidates.truncate(cast);
-        }
 
-        // Follow the body, not the id: adopt whichever track continues the box the
-        // person was last seen in, so a re-detection after a dropout keeps the take
-        // going instead of ending it (which is what leaves the viewport empty while
-        // the video still moves).
+        let mut jobs: Vec<(usize, Detection)> = Vec::new();
         if !config.seed_boxes.is_empty() {
-            if let Some((id, detection)) = candidates.first() {
-                // A new id is adopted only when the picked person is not on
-                // screen; otherwise this is somebody else in the room.
-                if !seeded_ids.contains(id) && !seeded_present {
-                    seeded_ids.push(*id);
+            if index == 0 {
+                let boxes: Vec<(usize, [f32; 4])> = seen
+                    .iter()
+                    .filter_map(|track| {
+                        track
+                            .detection
+                            .map(|d| (track.id, [d.x0, d.y0, d.x1, d.y1]))
+                    })
+                    .collect();
+                let assigned = seed_assignments(&boxes, &config.seed_boxes);
+                picks = assigned
+                    .iter()
+                    .enumerate()
+                    .take(config.max_people.max(1))
+                    .map(|(seed, id)| Pick {
+                        track: *id,
+                        last_box: id
+                            .and_then(|id| {
+                                boxes
+                                    .iter()
+                                    .find(|(track, _)| *track == id)
+                                    .map(|(_, box_)| *box_)
+                            })
+                            .unwrap_or(config.seed_boxes[seed]),
+                    })
+                    .collect();
+                if std::env::var_os("VELOMOCAP_DEBUG_SEEDS").is_some() {
+                    let seeded: Vec<usize> = assigned.iter().flatten().copied().collect();
+                    eprintln!(
+                        "[seeds] {} detections, {} tracks, {} seeded {:?}, first detection {:?}",
+                        detections.len(),
+                        tracker.tracks.len(),
+                        seeded.len(),
+                        seeded,
+                        detections.first().map(|d| (d.x0, d.y0, d.x1, d.y1))
+                    );
                 }
-                last_box = Some([detection.x0, detection.y0, detection.x1, detection.y1]);
+            }
+            for (seed, track_id, detection) in select_seeded(&seen, &mut picks, config.max_missing) {
+                if detection.height() < config.min_box_height * frame.height as f32 {
+                    continue;
+                }
+                let slot = seed_slot(&mut slots, &mut people, seed, track_id, index);
+                jobs.push((slot, detection));
+            }
+        } else {
+            let mut candidates: Vec<(usize, Detection)> = seen
+                .iter()
+                .filter(|track| track.missing <= config.max_missing)
+                .filter_map(|track| track.detection.map(|d| (track.id, d)))
+                .collect();
+            candidates.sort_by(|a, b| {
+                b.1.area()
+                    .partial_cmp(&a.1.area())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            candidates.retain(|(_, detection)| {
+                detection.height() >= config.min_box_height * frame.height as f32
+            });
+            candidates.truncate(config.max_people);
+            for (track_id, detection) in candidates {
+                let slot = match people.iter().position(|person| person.id == track_id) {
+                    Some(slot) => slot,
+                    None => {
+                        people.push(PersonTrack {
+                            id: track_id,
+                            name: format!("Person {}", people.len() + 1),
+                            frames: Vec::new(),
+                            first_frame: index,
+                            last_frame: index,
+                            hits: 0,
+                        });
+                        people.len() - 1
+                    }
+                };
+                jobs.push((slot, detection));
             }
         }
 
-        for (track_id, detection) in candidates {
+        for (slot, detection) in jobs {
             (hooks.progress)(decoded, total, "reconstructing");
-            let slot = match people.iter().position(|person| person.id == track_id) {
-                Some(slot) => slot,
-                None => {
-                    people.push(PersonTrack {
-                        id: track_id,
-                        name: format!("Person {}", people.len() + 1),
-                        frames: Vec::new(),
-                        first_frame: index,
-                        last_frame: index,
-                        hits: 0,
-                    });
-                    people.len() - 1
-                }
-            };
             let track = &mut people[slot];
             while track.frames.len() <= index {
                 track.frames.push(None);
@@ -939,9 +1025,9 @@ mod selection_tests {
             (9, [120.0, 110.0, 210.0, 400.0]),
         ];
         let seeds = [[105.0, 100.0, 205.0, 400.0]];
-        let ids = seed_track_ids(&detections, &seeds);
+        let ids = seed_assignments(&detections, &seeds);
         assert_eq!(ids.len(), 1, "one seed, one track: {ids:?}");
-        assert_eq!(ids[0], 7, "the better overlap wins");
+        assert_eq!(ids[0], Some(7), "the better overlap wins");
     }
 
     #[test]
@@ -954,9 +1040,7 @@ mod selection_tests {
             [100.0, 100.0, 200.0, 400.0],
             [400.0, 100.0, 500.0, 400.0],
         ];
-        let mut ids = seed_track_ids(&detections, &seeds);
-        ids.sort();
-        assert_eq!(ids, vec![7, 9]);
+        assert_eq!(seed_assignments(&detections, &seeds), vec![Some(7), Some(9)]);
     }
 
     /// A seed whose body has not been detected yet seeds nothing, rather than
@@ -965,7 +1049,7 @@ mod selection_tests {
     fn a_seed_with_no_overlap_seeds_nothing() {
         let detections = [(7, [0.0, 0.0, 10.0, 10.0])];
         let seeds = [[500.0, 500.0, 600.0, 700.0]];
-        assert!(seed_track_ids(&detections, &seeds).is_empty());
+        assert_eq!(seed_assignments(&detections, &seeds), vec![None]);
     }
 
     /// The continuation follows the body, so a box that is clearly a different
@@ -975,5 +1059,147 @@ mod selection_tests {
         let picked = [100.0, 100.0, 200.0, 400.0];
         assert!(continues(picked, detection([102.0, 102.0, 202.0, 402.0])));
         assert!(!continues(picked, detection([300.0, 100.0, 400.0, 400.0])));
+    }
+
+    /// One frame of a scripted run: `(track id, missing, box)` per track.
+    type Step = Vec<(usize, usize, Option<[f32; 4]>)>;
+
+    fn seen_of(step: &Step) -> Vec<Seen> {
+        step.iter()
+            .map(|(id, missing, box_)| Seen {
+                id: *id,
+                missing: *missing,
+                detection: box_.map(detection),
+            })
+            .collect()
+    }
+
+    /// Drive the seeded selection over a scripted run the way the capture loop
+    /// does — identity resolution, then one person slot per seed — and report the
+    /// cast and the frames each person got.
+    fn run_seeded(frames: &[Step], seeds: &[[f32; 4]]) -> (Vec<PersonTrack>, Vec<Vec<usize>>) {
+        let mut picks: Vec<Pick> = Vec::new();
+        let mut slots: Vec<Option<usize>> = Vec::new();
+        let mut people: Vec<PersonTrack> = Vec::new();
+        let mut got: Vec<Vec<usize>> = Vec::new();
+        for (index, step) in frames.iter().enumerate() {
+            let seen = seen_of(step);
+            if index == 0 {
+                let boxes: Vec<(usize, [f32; 4])> = seen
+                    .iter()
+                    .filter_map(|track| {
+                        track
+                            .detection
+                            .map(|d| (track.id, [d.x0, d.y0, d.x1, d.y1]))
+                    })
+                    .collect();
+                picks = seed_assignments(&boxes, seeds)
+                    .iter()
+                    .enumerate()
+                    .map(|(seed, id)| Pick {
+                        track: *id,
+                        last_box: id
+                            .and_then(|id| {
+                                boxes
+                                    .iter()
+                                    .find(|(track, _)| *track == id)
+                                    .map(|(_, box_)| *box_)
+                            })
+                            .unwrap_or(seeds[seed]),
+                    })
+                    .collect();
+            }
+            for (seed, track_id, _) in select_seeded(&seen, &mut picks, 60) {
+                let slot = seed_slot(&mut slots, &mut people, seed, track_id, index);
+                while got.len() < people.len() {
+                    got.push(Vec::new());
+                }
+                got[slot].push(index);
+                people[slot].hits += 1;
+            }
+        }
+        (people, got)
+    }
+
+    /// The take grows only at the start: a picked person whose track id changes
+    /// half-way through stays the same person, in the same slots.
+    #[test]
+    fn one_seed_stays_one_person_when_the_track_id_changes() {
+        let picked = [100.0, 100.0, 200.0, 400.0];
+        let moved = [104.0, 100.0, 204.0, 400.0];
+        let mut frames: Vec<Step> = (0..10).map(|_| vec![(0, 0, Some(picked))]).collect();
+        // Frame 10: the tracker retires id 0 and re-detects the same body as id 1.
+        frames.push(vec![(0, 61, None), (1, 0, Some(moved))]);
+        frames.push(vec![(1, 0, Some(moved))]);
+
+        let (people, got) = run_seeded(&frames, &[picked]);
+        assert_eq!(people.len(), 1, "one pick, one person");
+        assert_eq!(people[0].hits, 12, "every frame landed in that person");
+        assert_eq!(got[0], (0..12).collect::<Vec<_>>());
+    }
+
+    /// A bystander detected while the picked track merely coasts must not become a
+    /// person of their own: that is how one selected body became three mid-take.
+    #[test]
+    fn a_bystander_does_not_become_a_person_while_the_picked_track_coasts() {
+        let picked = [100.0, 100.0, 200.0, 400.0];
+        let mut frames: Vec<Step> = (0..9).map(|_| vec![(0, 0, Some(picked))]).collect();
+        // One missed detection for the picked body, and somebody standing on top
+        // of them (a box that would pass the "same body?" test).
+        frames.push(vec![
+            (0, 1, None),
+            (5, 0, Some([104.0, 102.0, 204.0, 402.0])),
+        ]);
+        frames.push(vec![(0, 0, Some(picked))]);
+
+        let (people, got) = run_seeded(&frames, &[picked]);
+        assert_eq!(people.len(), 1, "one pick, one person: {:?}", people);
+        assert_eq!(people[0].hits, 10, "the coasting frame is not a comeback");
+        assert!(!got[0].contains(&9), "frame 9 belongs to the other body");
+    }
+
+    /// Three bodies in the room, one ticked: the cast is still one.
+    #[test]
+    fn a_crowd_around_the_picked_person_adds_nobody() {
+        let picked = [100.0, 100.0, 200.0, 400.0];
+        let mut frames: Vec<Step> = (0..6).map(|_| vec![(0, 0, Some(picked))]).collect();
+        // The picked body drops out (as when somebody walks in front of it) and
+        // three tracks are now in shot, all overlapping or adjacent to it.
+        frames.push(vec![
+            (0, 2, None),
+            (1, 0, Some([104.0, 100.0, 204.0, 400.0])),
+            (2, 0, Some([140.0, 100.0, 240.0, 400.0])),
+            (3, 0, Some([90.0, 100.0, 190.0, 400.0])),
+        ]);
+        frames.push(vec![(0, 0, Some(picked))]);
+
+        let (people, got) = run_seeded(&frames, &[picked]);
+        assert_eq!(people.len(), 1, "one pick, one person");
+        assert_eq!(got[0].len(), 7, "no bystander frame was taken for the pick");
+    }
+
+    /// Two ticked people stay two people, even when both are re-numbered.
+    #[test]
+    fn two_seeds_stay_two_people_when_both_change_ids() {
+        let left = [100.0, 100.0, 200.0, 400.0];
+        let right = [500.0, 100.0, 600.0, 400.0];
+        let mut frames: Vec<Step> = (0..5)
+            .map(|_| vec![(0, 0, Some(left)), (1, 0, Some(right))])
+            .collect();
+        frames.push(vec![
+            (0, 61, None),
+            (1, 61, None),
+            (2, 0, Some([102.0, 100.0, 202.0, 400.0])),
+            (3, 0, Some([502.0, 100.0, 602.0, 400.0])),
+        ]);
+        frames.push(vec![
+            (2, 0, Some([102.0, 100.0, 202.0, 400.0])),
+            (3, 0, Some([502.0, 100.0, 602.0, 400.0])),
+        ]);
+
+        let (people, got) = run_seeded(&frames, &[left, right]);
+        assert_eq!(people.len(), 2, "two picks, two people");
+        assert_eq!(got[0].len(), 7, "the left body kept its person");
+        assert_eq!(got[1].len(), 7, "the right body kept its person");
     }
 }
