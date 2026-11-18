@@ -92,4 +92,7 @@ Conversion fidelity is checked in-process against the PyTorch reference:
 * SMPL-H - Romero et al. 2017, Loper et al. 2015; SMPL-X - Pavlakos et al. 2019.
 
 See `UPLOAD.md` for what may be published on Hugging Face / ModelScope, with
-which licence file, and how to stage it.
+which licence file, and how to stage it. `CONVERSION-NOTICES.md` holds the
+ready-to-publish `NOTICE.md` of each repository: the three upstream licences are
+reproduced verbatim (a converted weight cannot be relicensed), and the notice is
+what tells a reader which files are ours and what the licence requires.

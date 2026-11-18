@@ -8,10 +8,16 @@ Three repositories, one per upstream licence. Do not mix them: FlowHMR and
 VGGT-Omega are non-commercial, SAM 3D Body is not, and a reader has to be able
 to tell which terms apply to what they download.
 
+Each repository carries two documents, and the difference matters: the `LICENSE`
+is the **upstream text, verbatim** - a converted weight is a derivative work and
+cannot be relicensed - and `NOTICE.md` is our conversion notice: what the
+repository is, which files we made, how they were verified. Ready-to-publish
+notices for all three are in [CONVERSION-NOTICES.md](CONVERSION-NOTICES.md).
+
 | Repository (suggested name) | Contents | Licence | Size |
 | --- | --- | --- | --- |
 | `velomocap-sam3d-onnx` | SAM 3D Body ONNX chain + MHR geometry + parameter tables (optionally the traced `sam3d_full_ts.pt`) | SAM License | ~4.2 GB (+3.3 GB optional) |
-| `velomocap-flowhmr-onnx` | FlowHMR MMDiT graph + sidecar weights + config + motion statistics | FlowHMR Model Weights License (non-commercial) | ~1.85 GB |
+| `velomocap-flowhmr-onnx` | FlowHMR MMDiT graph + sidecar weights, plus `config.yml` and `motion_stats.json` from the Apache-2.0 code repository | FlowHMR Model Weights License + Apache-2.0 | ~1.85 GB |
 | `velomocap-vggt-omega-onnx` | VGGT-Omega 1B graph + sidecar weights | FAIR Noncommercial Research License | ~4.45 GB |
 
 Use the same names under your ModelScope namespace so the two hubs stay
@@ -59,6 +65,7 @@ download with `Get-FileHash <file> -Algorithm SHA256`.
 | `sam3d_keypoints.bin` | 6,540 | `532B75DDB6E1650BE033B80F79545EEB54EAF05298CEF0BD63B9BC36E72FC4E6` |
 | `sam3d_split.json` | 3,199 | `1DC112D182CA718ADC1ECD038D3FC73EC0ED5DD0CAF769C902F839B2F8EB1715` |
 | `LICENSE` | - | the SAM License, from `licenses/SAM-LICENSE.txt` |
+| `NOTICE.md` | - | the SAM section of `licenses/CONVERSION-NOTICES.md` |
 | optional `sam3d_full_ts.pt` | 3,533,327,692 | recompute before publishing: it is traced per build by `tools/torch/sam3d_full_jit.py`, and only the LibTorch path loads it |
 
 ### velomocap-flowhmr-onnx (FlowHMR Model Weights License, non-commercial)
@@ -69,7 +76,9 @@ download with `Get-FileHash <file> -Algorithm SHA256`.
 | `flowhmr_mmdit.weights.bin` | 1,841,575,852 | `4E08A4F175E431005E6723EE3340E7C01AA016827FE97395140F31D863D34EDD` |
 | `config.yml` | 3,067 | `5DEAE01800C031975558BF9675819E8D1E24803414F692B8B5C2196B266C64D7` |
 | `motion_stats.json` | 169,611 | `6E0F2C4F5B24FE5805C93ED8B25728E466269941070A545640E51B180C315908` |
-| `LICENSE` | - | `licenses/FlowHMR-Model-Weights-LICENSE.txt` |
+| `LICENSE-flowhmr-weights` | - | `licenses/FlowHMR-Model-Weights-LICENSE.txt` (the converted weights) |
+| `LICENSE-Apache-2.0` | - | the FlowHMR code repository's licence, for `config.yml` and `motion_stats.json` |
+| `NOTICE.md` | - | the FlowHMR section of `licenses/CONVERSION-NOTICES.md`, which maps file to licence |
 
 ### velomocap-vggt-omega-onnx (FAIR Noncommercial Research License)
 
@@ -78,6 +87,7 @@ download with `Get-FileHash <file> -Algorithm SHA256`.
 | `vggt_omega_1b_512.onnx` | 1,559,489 | `44626B04C89AF9EC127AF7DDB8B5624ECB0AAAA4D7D0AF6613ECD36FE941AD99` |
 | `vggt_omega_1b_512.weights.bin` | 4,445,007,872 | `4F3BFEC468589866BE5829F302F3A11D890C28C92D649F5B5CA399C3ABCF9840` |
 | `LICENSE.txt` | - | `licenses/VGGT-Omega-LICENSE.txt` |
+| `NOTICE.md` | - | the VGGT-Omega section of `licenses/CONVERSION-NOTICES.md` |
 
 The VGGT graph is traced at a fixed 512x288 portrait canvas; a re-export from
 the checkpoint with `tools/onnx/vggt_omega_export.py` gives a dynamic size and a
@@ -113,7 +123,10 @@ Copy-Item "$root\licenses\SAM-LICENSE.txt" "$stage\velomocap-sam3d-onnx\LICENSE"
 foreach ($f in 'flowhmr_mmdit.onnx','flowhmr_mmdit.weights.bin','config.yml','motion_stats.json') {
   New-Item -ItemType HardLink -Path "$stage\velomocap-flowhmr-onnx\$f" -Target "$root\models\flowhmr\$f"
 }
-Copy-Item "$root\licenses\FlowHMR-Model-Weights-LICENSE.txt" "$stage\velomocap-flowhmr-onnx\LICENSE"
+# Two licences in this one: the converted weights are non-commercial, the two
+# files taken from the FlowHMR code repository are Apache-2.0.
+Copy-Item "$root\licenses\FlowHMR-Model-Weights-LICENSE.txt" "$stage\velomocap-flowhmr-onnx\LICENSE-flowhmr-weights"
+Copy-Item "$root\LICENSE" "$stage\velomocap-flowhmr-onnx\LICENSE-Apache-2.0"
 
 foreach ($f in 'vggt_omega_1b_512.onnx','vggt_omega_1b_512.weights.bin') {
   New-Item -ItemType HardLink -Path "$stage\velomocap-vggt-omega-onnx\$f" -Target "$root\models\flowhmr\$f"
@@ -121,7 +134,10 @@ foreach ($f in 'vggt_omega_1b_512.onnx','vggt_omega_1b_512.weights.bin') {
 Copy-Item "$root\licenses\VGGT-Omega-LICENSE.txt" "$stage\velomocap-vggt-omega-onnx\LICENSE.txt"
 ```
 
-Write a `README.md` into each folder first (template below), then upload.
+Then add the two documents each repository needs: the `README.md` model card
+(template below) and a `NOTICE.md` copied from
+[CONVERSION-NOTICES.md](CONVERSION-NOTICES.md) - one section per repository, so
+`velomocap-sam3d-onnx` gets the SAM notice, and so on.
 
 ## Hugging Face
 

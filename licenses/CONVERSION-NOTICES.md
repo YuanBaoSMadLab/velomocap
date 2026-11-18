@@ -1,0 +1,189 @@
+# Conversion notices (the "new licence" is upstream's licence, plus a notice)
+
+The weights we publish are **conversions**: ONNX exports, a traced TorchScript
+module, packed sidecars, extracted parameter tables. They exist in no upstream
+repository, so they have to be published here - but they are derivative works of
+the weights they came from, and a derivative work cannot be relicensed.
+
+So each model repository gets exactly two documents:
+
+| File in the repository | What it is | Who wrote it |
+| --- | --- | --- |
+| `LICENSE` (or `LICENSE.txt`) | the upstream licence, **verbatim and unmodified** | upstream |
+| `NOTICE.md` | our conversion notice: what this repository is, which files we made, how they were verified, and what the upstream licence requires | VeloMocap |
+
+The notice is **not** a licence. It adds no permission and takes none away; it
+exists so a reader can tell a converted file from an upstream one and knows
+which text governs. What must not be added:
+
+* a restriction upstream does not have (e.g. "no commercial use" on the SAM
+  conversion - the SAM License permits commercial use, and a derivative may only
+  be distributed *under that agreement*);
+* a share-alike or attribution **condition** on top of FlowHMR or VGGT-Omega -
+  asking for credit is fine, making it a condition would conflict;
+* a warranty or indemnity of our own on top of theirs.
+
+`LICENSE` for the FlowHMR repository is the exception: that repository also
+carries two small files from the FlowHMR **code** repository, which is
+Apache-2.0, so it ships `LICENSE-flowhmr-weights` and `LICENSE-Apache-2.0` and
+the notice says which file is under which.
+
+## Which files exist upstream, and which are ours
+
+| Upstream repository | Files it contains | Files we add (must be published by us) |
+| --- | --- | --- |
+| `facebook/sam-3d-body-dinov3` | `LICENSE`, `README.md`, `model.ckpt`, `model_config.yaml`, `assets/mhr_model.pt` | all 11 ONNX graphs + `sam3d_backbone.weights.bin`, `mhr_model.onnx`, `sam3d_params.{json,bin}`, `sam3d_mesh.json`, `sam3d_faces.bin`, `sam3d_skeleton.bin`, `sam3d_keypoints.bin`, `sam3d_split.json`, and the traced `sam3d_full_ts.pt` |
+| `fafsaf1/flowhmr-0.46B` | `LICENSE`, `README.md`, `config.json`, `flowhmr_base/*`, `flowhmr_latest/*` | `flowhmr_mmdit.onnx` + `flowhmr_mmdit.weights.bin` (both are ours) |
+| `flowhmr/flowhmr` (code, Apache-2.0) | the pipeline, `assets/motion_stats.json`, `config.yml` | nothing - we redistribute these two unchanged |
+| `facebook/VGGT-Omega` | `LICENSE.txt`, `README.md`, three `.pt` checkpoints | `vggt_omega_1b_512.onnx` + `vggt_omega_1b_512.weights.bin` |
+| `ultralytics/assets` | `yolov8x.pt` (AGPL-3.0) | `yolov8x.onnx` - **not published**, see `ULTRALYTICS-YOLOV8-NOTICE.md` |
+
+---
+
+## NOTICE.md for `velomocap-sam3d-onnx`
+
+```markdown
+# SAM 3D Body - ONNX and TorchScript conversion for VeloMocap
+
+This repository is a **conversion** of SAM 3D Body by Meta, published so that
+[VeloMocap](https://github.com/YuanBaoSMadLab/velomocap) can run the model
+without PyTorch. It is a derivative work of the upstream weights and is
+distributed under the **SAM License**, reproduced verbatim in `LICENSE`.
+Commercial use is permitted by that licence; redistribution of this repository
+or of any file in it must keep `LICENSE` with it.
+
+## Upstream
+
+* Model: <https://huggingface.co/facebook/sam-3d-body-dinov3>
+* Files converted: `model.ckpt` (body, hands, fusion) and `assets/mhr_model.pt`
+  (MHR geometry)
+* Copyright: Meta Platforms, Inc. See `LICENSE`.
+
+## Files we made
+
+| File | What it is |
+| --- | --- |
+| `sam3d_backbone.onnx`, `sam3d_backbone.weights.bin` | DINOv3 backbone, weights in a sidecar |
+| `sam3d_init.onnx`, `sam3d_pose.onnx`, `sam3d_post.onnx` | encoder, pose head, decoder |
+| `sam3d_step0.onnx` .. `sam3d_step5.onnx` | the six sampling steps, weights inline |
+| `mhr_model.onnx` | MHR geometry module |
+| `sam3d_params.json`, `sam3d_params.bin` | parameter tables the Rust decoder reads |
+| `sam3d_mesh.json`, `sam3d_faces.bin`, `sam3d_keypoints.bin`, `sam3d_skeleton.bin` | MHR topology: 18439 vertices, 36874 faces, 127 joints, 70 keypoints |
+| `sam3d_split.json` | which file holds which subgraph |
+| `sam3d_full_ts.pt` (optional) | the whole pipeline traced as one TorchScript module, for LibTorch |
+
+## How it was made
+
+Exported on CPU in fp32 by `tools/onnx/sam3d_export.py`, `sam3d_split.py` and
+`pack_onnx.py`, and traced by `tools/torch/sam3d_full_jit.py`, from this
+repository's `tools/` directory. Nothing was retrained, fine-tuned or pruned.
+
+## Verification
+
+The ONNX chain and the TorchScript module were compared against the original
+PyTorch model on the same inputs: largest vertex difference **1.5e-5 m**
+(fp32), keypoint and camera outputs within 1e-3. Reproduce with the scripts in
+`tools/onnx` and `velomocap-cli` parity commands.
+
+## Citation
+
+If you publish work that uses these files, acknowledge SAM 3D Body (Meta) as the
+licence requires, and please also mention this conversion (VeloMocap) - as a
+courtesy, not as a condition.
+```
+
+---
+
+## NOTICE.md for `velomocap-flowhmr-onnx`
+
+```markdown
+# FlowHMR - ONNX conversion for VeloMocap
+
+**Non-commercial use only.** This repository is a **conversion** of the FlowHMR
+model weights, published so that
+[VeloMocap](https://github.com/YuanBaoSMadLab/velomocap) can run the motion model
+without PyTorch. It is a derivative work of those weights and is distributed
+under the **FlowHMR Model Weights License**, reproduced verbatim in
+`LICENSE-flowhmr-weights`: non-commercial educational, research and non-profit
+use only, attribution and this licence retained, cite FlowHMR.
+
+## Upstream
+
+* Weights: <https://huggingface.co/fafsaf1/flowhmr-0.46B>, file
+  `flowhmr_latest/flowhmr_latest.ckpt`
+* Code: <https://github.com/flowhmr/flowhmr> (Apache-2.0, see `LICENSE-Apache-2.0`)
+* Paper: *FlowHMR: Physically Plausible Motion Capture from Video*,
+  arXiv:2610.03691
+
+## Files and which licence covers them
+
+| File | Origin | Licence |
+| --- | --- | --- |
+| `flowhmr_mmdit.onnx` | our ONNX export of the MMDiT | FlowHMR weights licence |
+| `flowhmr_mmdit.weights.bin` | its packed weights | FlowHMR weights licence |
+| `config.yml` | FlowHMR code repository, unchanged | Apache-2.0 |
+| `motion_stats.json` | FlowHMR code repository, unchanged | Apache-2.0 |
+
+## How it was made
+
+`tools/onnx/flowhmr_export.py` exports one flow-matching step to ONNX in fp32
+and `pack_onnx.py` folds the per-tensor files into the `.weights.bin` sidecar.
+The RoPE table and the narrowband attention masks are graph **inputs**, not
+constants, so the 20-step Euler loop and the decode stay in Rust. Nothing was
+retrained.
+
+## Verification
+
+Largest absolute difference against the PyTorch reference: **9.7e-3** on a
+feature row, mean 2.1e-4, no value above 1e-2. Reproduce with
+`tools/onnx/dump_flowhmr_reference.py` and `velomocap-cli flowhmr-parity`.
+
+## Citation
+
+Cite FlowHMR (arXiv:2610.03691) as the licence requires. Mentioning this
+conversion (VeloMocap) is a courtesy, not a condition.
+```
+
+---
+
+## NOTICE.md for `velomocap-vggt-omega-onnx`
+
+```markdown
+# VGGT-Omega - ONNX conversion for VeloMocap
+
+**Non-commercial research use only.** This repository is a **conversion** of the
+VGGT-Omega 1B checkpoint, published so that
+[VeloMocap](https://github.com/YuanBaoSMadLab/velomocap) can estimate the camera
+without PyTorch. It is a derivative work of the upstream weights and is
+distributed under the **FAIR Noncommercial Research License**, reproduced
+verbatim in `LICENSE.txt`; that licence requires this text to accompany any
+copy, and restricts use to non-commercial research.
+
+## Upstream
+
+* Model: <https://huggingface.co/facebook/VGGT-Omega>, file
+  `vggt_omega_1b_512.pt`
+* Copyright: Meta Platforms, Inc. See `LICENSE.txt`.
+
+## Files we made
+
+* `vggt_omega_1b_512.onnx` - the graph, traced at a fixed **512x288** portrait
+  canvas. The positional table (RoPE) is a graph input and the prefix tokens get
+  a prepended identity row, which removes the dynamic slicing that tracing
+  cannot express. A landscape clip is rotated a quarter turn before scaling.
+* `vggt_omega_1b_512.weights.bin` - the packed weights sidecar.
+
+Nothing was retrained. Exported in fp32 by `tools/onnx/vggt_omega_export.py` and
+`pack_onnx.py`.
+
+## Verification
+
+Largest absolute difference against the PyTorch reference: **2.6e-4**.
+Reproduce with `tools/onnx/dump_vggt_reference.py` and
+`velomocap-cli vggt-parity`.
+
+## Citation
+
+Cite VGGT (*Visual Geometry Grounded Transformer*, CVPR 2025, Meta) as the
+licence requires.
+```
