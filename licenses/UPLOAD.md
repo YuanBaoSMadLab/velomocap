@@ -8,13 +8,20 @@ Result: **three repositories, nine files, 9.8 GB.**
 
 | Repository | Files | Size | Licence |
 | --- | --- | --- | --- |
-| `velomocap-sam3d-onnx` | 5 | 3.53 GB | SAM License |
+| `velomocap-sam3d-torchscript` | 5 | 3.53 GB | SAM License |
 | `velomocap-flowhmr-onnx` | 2 | 1.85 GB | FlowHMR Model Weights License (non-commercial) |
 | `velomocap-vggt-omega-onnx` | 2 | 4.45 GB | FAIR Noncommercial Research License |
 
+The name states the **artifact format**, because that is what tells a reader
+which engine loads it: SAM 3D Body is a TorchScript module that LibTorch loads
+(`.pt`), FlowHMR and VGGT-Omega are ONNX graphs that ONNX Runtime loads (`.onnx`
++ `.weights.bin`). An earlier draft called the SAM repository `-onnx`; it holds
+no ONNX file and the application never runs it through ONNX Runtime, so the name
+was wrong.
+
 ---
 
-## 1. `velomocap-sam3d-onnx` - SAM License
+## 1. `velomocap-sam3d-torchscript` - SAM License
 
 The packaged application runs SAM 3D Body through LibTorch and loads
 `models/sam3d/sam3d_full_ts.pt`; it is the only SAM weight the release needs.
@@ -109,17 +116,17 @@ Hard links, so the staging folder costs no disk:
 $root  = "E:\RGBMocap\velomocap"
 $stage = "E:\model-upload"
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force "$stage\velomocap-sam3d-onnx"      | Out-Null
+New-Item -ItemType Directory -Force "$stage\velomocap-sam3d-torchscript"      | Out-Null
 New-Item -ItemType Directory -Force "$stage\velomocap-flowhmr-onnx"    | Out-Null
 New-Item -ItemType Directory -Force "$stage\velomocap-vggt-omega-onnx" | Out-Null
 
 # 1. SAM: the traced module lives in export\, the tables in models\sam3d
 foreach ($f in 'sam3d_faces.bin','sam3d_keypoints.bin','sam3d_skeleton.bin','sam3d_mesh.json') {
-  New-Item -ItemType HardLink -Path "$stage\velomocap-sam3d-onnx\$f" -Target "$root\models\sam3d\$f"
+  New-Item -ItemType HardLink -Path "$stage\velomocap-sam3d-torchscript\$f" -Target "$root\models\sam3d\$f"
 }
-New-Item -ItemType HardLink -Path "$stage\velomocap-sam3d-onnx\sam3d_full_ts.pt" `
+New-Item -ItemType HardLink -Path "$stage\velomocap-sam3d-torchscript\sam3d_full_ts.pt" `
   -Target "$root\..\export\sam3d\sam3d_full_ts.pt"
-Copy-Item "$root\licenses\SAM-LICENSE.txt" "$stage\velomocap-sam3d-onnx\LICENSE"
+Copy-Item "$root\licenses\SAM-LICENSE.txt" "$stage\velomocap-sam3d-torchscript\LICENSE"
 
 # 2. FlowHMR
 foreach ($f in 'flowhmr_mmdit.onnx','flowhmr_mmdit.weights.bin') {
@@ -140,7 +147,7 @@ upload:
 ```powershell
 pip install -U huggingface_hub
 hf auth login
-hf upload YuanBaoSMadLab/velomocap-sam3d-onnx      E:\model-upload\velomocap-sam3d-onnx      --repo-type model
+hf upload YuanBaoSMadLab/velomocap-sam3d-torchscript      E:\model-upload\velomocap-sam3d-torchscript      --repo-type model
 hf upload YuanBaoSMadLab/velomocap-flowhmr-onnx    E:\model-upload\velomocap-flowhmr-onnx    --repo-type model
 hf upload YuanBaoSMadLab/velomocap-vggt-omega-onnx E:\model-upload\velomocap-vggt-omega-onnx --repo-type model
 ```

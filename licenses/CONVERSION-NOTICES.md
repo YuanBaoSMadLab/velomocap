@@ -51,7 +51,7 @@ and the parameter tables they read exist only in the development tree. Same for
 
 ---
 
-## NOTICE.md for `velomocap-sam3d-onnx`
+## NOTICE.md for `velomocap-sam3d-torchscript`
 
 ```markdown
 # SAM 3D Body - TorchScript conversion for VeloMocap
