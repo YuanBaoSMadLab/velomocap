@@ -67,6 +67,7 @@ extern "C" {
     fn vm_sam3d_forward_full(
         handle: *mut std::ffi::c_void,
         frame: *const f32,
+        batch: c_int,
         height: c_int,
         width: c_int,
         bbox_center: *const f32,
@@ -79,8 +80,11 @@ extern "C" {
         keypoints_2d: *mut f32,
         kps2d_count: c_int,
         pred_cam: *mut f32,
+        cam_count: c_int,
         pred_cam_t: *mut f32,
+        cam_t_count: c_int,
         focal_length: *mut f32,
+        focal_count: c_int,
         model_params: *mut f32,
         params_count: c_int,
         joint_rots: *mut f32,
@@ -143,6 +147,8 @@ pub struct Sam3dInput<'a> {
 /// A loaded module. Dropping it frees the C++ side.
 pub struct Sam3dTorch {
     handle: *mut std::ffi::c_void,
+    /// Items per `forward`, fixed by the trace.
+    batch: usize,
 }
 
 // The handle is only touched through the C++ module, which keeps its own state;
@@ -168,6 +174,18 @@ impl Sam3dTorch {
     }
 
     pub fn load(path: impl AsRef<Path>, gpu: bool) -> Result<Self, TorchError> {
+        Self::load_batch(path, gpu, 1)
+    }
+
+    /// Load a module traced at `batch` items per call.
+    ///
+    /// A traced graph bakes its batch dimension, so the caller has to say which
+    /// one the file was traced at; [`Self::batch`] reports it back.
+    pub fn load_batch(
+        path: impl AsRef<Path>,
+        gpu: bool,
+        batch: usize,
+    ) -> Result<Self, TorchError> {
         let path = path.as_ref();
         let text = CString::new(path.display().to_string())
             .map_err(|_| TorchError("path contains a NUL byte".into()))?;
@@ -183,7 +201,10 @@ impl Sam3dTorch {
         if handle.is_null() {
             return Err(TorchError(take_error(&buffer)));
         }
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            batch: batch.max(1),
+        })
     }
 
     pub fn run(&self, input: &Sam3dInput<'_>) -> Result<Sam3dFrame, TorchError> {
@@ -340,36 +361,87 @@ pub struct Sam3dFullInput<'a> {
 }
 
 impl Sam3dTorch {
+    /// How many items one `forward` of this module carries.
+    ///
+    /// A traced graph bakes the batch dimension, so a module traced at eight
+    /// items must always be handed eight. [`Self::run_full_batch`] pads for the
+    /// caller, so this only matters when sizing the caller's own buffers.
+    pub fn batch(&self) -> usize {
+        self.batch
+    }
+
     /// `run_inference(inference_type="full")`: body, both hands, fusion.
     pub fn run_full(&self, input: &Sam3dFullInput<'_>) -> Result<Sam3dFullFrame, TorchError> {
-        assert!(
-            input.frame.len() >= 3 * input.height * input.width,
-            "frame buffer must hold 3×H×W values"
-        );
-        let mut verts = vec![0.0f32; VERTS * 3];
-        let mut keypoints_3d = vec![0.0f32; 70 * 3];
-        let mut keypoints_2d = vec![0.0f32; 70 * 2];
-        let mut pred_cam = [0.0f32; CAM];
-        let mut pred_cam_t = [0.0f32; CAM];
-        let mut focal_length = [0.0f32; 1];
-        let mut model_params = vec![0.0f32; PARAMS];
-        let mut joint_rots = vec![0.0f32; JOINTS * 9];
-        let mut hand_valid = [0.0f32; 2];
-        let mut body_token = vec![0.0f32; TOKEN];
-        let mut left_token = vec![0.0f32; TOKEN];
-        let mut right_token = vec![0.0f32; TOKEN];
-        let mut skel_state = vec![0.0f32; JOINTS * SKEL_STATE];
-        let mut pred_vec = vec![0.0f32; PRED];
+        let mut frames = self.run_full_batch(std::slice::from_ref(input))?;
+        frames
+            .pop()
+            .ok_or_else(|| TorchError("the module returned no frames".to_string()))
+    }
+
+    /// The same pass for several items at once.
+    ///
+    /// One item is one person in one frame. The module's batch is fixed by the
+    /// trace, so a short slice is padded by repeating its last item and the
+    /// extra results are dropped; the returned frames line up with `inputs`.
+    /// Every item must be the same size, which holds for one video.
+    pub fn run_full_batch(
+        &self,
+        inputs: &[Sam3dFullInput<'_>],
+    ) -> Result<Vec<Sam3dFullFrame>, TorchError> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let height = inputs[0].height;
+        let width = inputs[0].width;
+        let plane = 3 * height * width;
+        for input in inputs {
+            assert!(
+                input.frame.len() >= plane,
+                "frame buffer must hold 3×H×W values"
+            );
+            assert!(
+                input.height == height && input.width == width,
+                "every item in a batch must be the same frame size"
+            );
+        }
+        let batch = self.batch.max(inputs.len());
+        let mut packed = Vec::with_capacity(batch * plane);
+        let mut centers = Vec::with_capacity(batch * 2);
+        let mut scales = Vec::with_capacity(batch * 2);
+        let mut cameras = Vec::with_capacity(batch * 9);
+        for index in 0..batch {
+            let input = &inputs[index.min(inputs.len() - 1)];
+            packed.extend_from_slice(&input.frame[..plane]);
+            centers.extend_from_slice(&input.bbox_center);
+            scales.extend_from_slice(&input.bbox_scale);
+            cameras.extend_from_slice(&input.cam_int);
+        }
+
+        let mut verts = vec![0.0f32; batch * VERTS * 3];
+        let mut keypoints_3d = vec![0.0f32; batch * 70 * 3];
+        let mut keypoints_2d = vec![0.0f32; batch * 70 * 2];
+        let mut pred_cam = vec![0.0f32; batch * CAM];
+        let mut pred_cam_t = vec![0.0f32; batch * CAM];
+        let mut focal_length = vec![0.0f32; batch];
+        let mut model_params = vec![0.0f32; batch * PARAMS];
+        let mut joint_rots = vec![0.0f32; batch * JOINTS * 9];
+        let mut hand_valid = vec![0.0f32; batch * 2];
+        let mut body_token = vec![0.0f32; batch * TOKEN];
+        let mut left_token = vec![0.0f32; batch * TOKEN];
+        let mut right_token = vec![0.0f32; batch * TOKEN];
+        let mut skel_state = vec![0.0f32; batch * JOINTS * SKEL_STATE];
+        let mut pred_vec = vec![0.0f32; batch * PRED];
         let mut buffer = vec![0i8 as c_char; ERROR_LEN];
         let code = unsafe {
             vm_sam3d_forward_full(
                 self.handle,
-                input.frame.as_ptr(),
-                input.height as c_int,
-                input.width as c_int,
-                input.bbox_center.as_ptr(),
-                input.bbox_scale.as_ptr(),
-                input.cam_int.as_ptr(),
+                packed.as_ptr(),
+                batch as c_int,
+                height as c_int,
+                width as c_int,
+                centers.as_ptr(),
+                scales.as_ptr(),
+                cameras.as_ptr(),
                 verts.as_mut_ptr(),
                 verts.len() as c_int,
                 keypoints_3d.as_mut_ptr(),
@@ -377,8 +449,11 @@ impl Sam3dTorch {
                 keypoints_2d.as_mut_ptr(),
                 keypoints_2d.len() as c_int,
                 pred_cam.as_mut_ptr(),
+                pred_cam.len() as c_int,
                 pred_cam_t.as_mut_ptr(),
+                pred_cam_t.len() as c_int,
                 focal_length.as_mut_ptr(),
+                focal_length.len() as c_int,
                 model_params.as_mut_ptr(),
                 model_params.len() as c_int,
                 joint_rots.as_mut_ptr(),
@@ -388,7 +463,7 @@ impl Sam3dTorch {
                 body_token.as_mut_ptr(),
                 left_token.as_mut_ptr(),
                 right_token.as_mut_ptr(),
-                body_token.len() as c_int,
+                (batch * TOKEN) as c_int,
                 skel_state.as_mut_ptr(),
                 skel_state.len() as c_int,
                 pred_vec.as_mut_ptr(),
@@ -400,22 +475,38 @@ impl Sam3dTorch {
         if code != 0 {
             return Err(TorchError(take_error(&buffer)));
         }
-        Ok(Sam3dFullFrame {
-            verts,
-            keypoints_3d,
-            keypoints_2d,
-            pred_cam,
-            pred_cam_t,
-            focal_length: focal_length[0],
-            model_params,
-            joint_rots,
-            hand_valid,
-            body_token,
-            left_token,
-            right_token,
-            skel_state,
-            pred: pred_vec,
-        })
+
+        let mut frames = Vec::with_capacity(inputs.len());
+        for index in 0..inputs.len() {
+            let take = |data: &[f32], width: usize| {
+                data[index * width..(index + 1) * width].to_vec()
+            };
+            frames.push(Sam3dFullFrame {
+                verts: take(&verts, VERTS * 3),
+                keypoints_3d: take(&keypoints_3d, 70 * 3),
+                keypoints_2d: take(&keypoints_2d, 70 * 2),
+                pred_cam: [
+                    pred_cam[index * CAM],
+                    pred_cam[index * CAM + 1],
+                    pred_cam[index * CAM + 2],
+                ],
+                pred_cam_t: [
+                    pred_cam_t[index * CAM],
+                    pred_cam_t[index * CAM + 1],
+                    pred_cam_t[index * CAM + 2],
+                ],
+                focal_length: focal_length[index],
+                model_params: take(&model_params, PARAMS),
+                joint_rots: take(&joint_rots, JOINTS * 9),
+                hand_valid: [hand_valid[index * 2], hand_valid[index * 2 + 1]],
+                body_token: take(&body_token, TOKEN),
+                left_token: take(&left_token, TOKEN),
+                right_token: take(&right_token, TOKEN),
+                skel_state: take(&skel_state, JOINTS * SKEL_STATE),
+                pred: take(&pred_vec, PRED),
+            });
+        }
+        Ok(frames)
     }
 }
 

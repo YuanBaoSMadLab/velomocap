@@ -231,6 +231,64 @@ pub struct SamHooks<'a> {
 }
 
 
+/// How many items a module file was traced at.
+///
+/// `sam3d_full_b8_ts.pt` carries eight people/frames per call; the plain
+/// `sam3d_full_ts.pt` carries one.
+fn module_batch(path: &Path) -> usize {
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    if let Some(rest) = name.strip_prefix("sam3d_full_b") {
+        if let Some(digits) = rest.strip_suffix("_ts.pt") {
+            if let Ok(value) = digits.parse::<usize>() {
+                return value.max(1);
+            }
+        }
+    }
+    1
+}
+
+/// The TorchScript module a capture should run.
+///
+/// A batched module costs one call per several people, so it is preferred; the
+/// widest batch wins. `VELOMOCAP_SAM_BATCH=<n>` pins a specific one (0 and 1
+/// both mean the single-item module), which is how the two are A/B'd.
+fn find_torch_module(config: &SamConfig) -> Option<PathBuf> {
+    let mut roots = vec![config.sam3d_dir.clone()];
+    // Dev tree: `tools/torch/sam3d_full_jit.py` writes into `export/sam3d/`,
+    // next to the workspace rather than inside `models/`, so the 3.5 GB file
+    // does not have to be copied.
+    roots.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../export/sam3d"));
+    let forced = std::env::var("VELOMOCAP_SAM_BATCH")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    let mut best: Option<(usize, PathBuf)> = None;
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("pt") {
+                continue;
+            }
+            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            if !name.starts_with("sam3d_full") || name.contains("bf16") {
+                continue;
+            }
+            let batch = module_batch(&path);
+            if let Some(forced) = forced {
+                if batch != forced.max(1) {
+                    continue;
+                }
+            }
+            if best.as_ref().map_or(true, |(top, _)| batch > *top) {
+                best = Some((batch, path));
+            }
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
 /// Capture every person in `video`.
 pub fn capture_people(video: impl AsRef<Path>, config: &SamConfig) -> Result<PeopleCapture> {
     let mut progress = |_: usize, _: usize, _: &str| {};
@@ -257,8 +315,22 @@ enum SamRunner {
     /// The eleven ONNX graphs driven from Rust.
     Onnx(std::cell::RefCell<Box<Sam3dBody>>),
     /// One TorchScript module: `run_inference(inference_type="full")`, hands and
-    /// fusion included. See `docs/SAM3D.md`.
+    /// fusion included. See `docs/SAM3D.md`. The module may be traced at a
+    /// batch of several items; [`SamRunner::batch`] reports how many.
     Torch(Box<velomocap_cpp::sam3d::Sam3dTorch>),
+}
+
+/// One person in one frame, waiting for the module.
+///
+/// The frame is shared between the people in it, so a four-person frame costs
+/// one copy rather than four.
+struct PendingJob {
+    slot: usize,
+    index: usize,
+    detection: Detection,
+    rgb: Arc<Vec<u8>>,
+    width: usize,
+    height: usize,
 }
 
 impl SamRunner {
@@ -269,64 +341,196 @@ impl SamRunner {
         }
     }
 
-    fn run(
+    /// How many items one call carries.
+    fn batch(&self) -> usize {
+        match self {
+            Self::Onnx(_) => 1,
+            Self::Torch(module) => module.batch(),
+        }
+    }
+
+    /// Run a full batch and return one frame per job, in order.
+    fn run_batch(
         &self,
-        frame: &Frame,
-        bbox: [f32; 4],
+        jobs: &[&PendingJob],
         intrinsics: [[f32; 3]; 3],
-    ) -> Result<velomocap_infer::Sam3dFrame> {
+    ) -> Result<Vec<velomocap_infer::Sam3dFrame>> {
         match self {
             Self::Onnx(body) => {
-                let input =
-                    Sam3dInput::from_box(&frame.rgb, frame.width, frame.height, bbox, intrinsics)
-                        .context("building the SAM crop")?;
-                body.borrow_mut().run(&input).context("SAM 3D Body")
+                let mut out = Vec::with_capacity(jobs.len());
+                for job in jobs {
+                    let bbox = [
+                        job.detection.x0,
+                        job.detection.y0,
+                        job.detection.x1,
+                        job.detection.y1,
+                    ];
+                    let input =
+                        Sam3dInput::from_box(&job.rgb, job.width, job.height, bbox, intrinsics)
+                            .context("building the SAM crop")?;
+                    let frame = body.borrow_mut().run(&input).context("SAM 3D Body")?;
+                    out.push(frame);
+                }
+                Ok(out)
             }
             Self::Torch(module) => {
-                let (width, height) = (frame.width, frame.height);
-                let mut nchw = vec![0.0f32; 3 * width * height];
-                let plane = width * height;
-                for (index, pixel) in frame.rgb.chunks_exact(3).enumerate() {
-                    nchw[index] = pixel[0] as f32 / 255.0;
-                    nchw[plane + index] = pixel[1] as f32 / 255.0;
-                    nchw[2 * plane + index] = pixel[2] as f32 / 255.0;
+                let (height, width) = (jobs[0].height, jobs[0].width);
+                let area = width * height;
+                let plane = 3 * area;
+                // `frames` is shared between every item in this call, so it is
+                // filled once and then sliced per item.
+                let mut packed = vec![0.0f32; jobs.len() * plane];
+                let mut centers = Vec::with_capacity(jobs.len() * 2);
+                let mut scales = Vec::with_capacity(jobs.len() * 2);
+                for (item, job) in jobs.iter().enumerate() {
+                    let base = item * plane;
+                    for (index, pixel) in job.rgb.chunks_exact(3).enumerate() {
+                        packed[base + index] = pixel[0] as f32 / 255.0;
+                        packed[base + area + index] = pixel[1] as f32 / 255.0;
+                        packed[base + 2 * area + index] = pixel[2] as f32 / 255.0;
+                    }
+                    let (center, scale) = person_box([
+                        job.detection.x0,
+                        job.detection.y0,
+                        job.detection.x1,
+                        job.detection.y1,
+                    ]);
+                    centers.extend_from_slice(&center);
+                    scales.extend_from_slice(&scale);
                 }
-                let (center, scale) = person_box(bbox);
                 let mut cam_int = [0.0f32; 9];
                 for row in 0..3 {
                     for column in 0..3 {
                         cam_int[row * 3 + column] = intrinsics[row][column];
                     }
                 }
-                let out = module
-                    .run_full(&velomocap_cpp::sam3d::Sam3dFullInput {
-                        frame: &nchw,
+                let inputs: Vec<velomocap_cpp::sam3d::Sam3dFullInput<'_>> = (0..jobs.len())
+                    .map(|item| velomocap_cpp::sam3d::Sam3dFullInput {
+                        frame: &packed[item * plane..(item + 1) * plane],
                         height,
                         width,
-                        bbox_center: center,
-                        bbox_scale: scale,
+                        bbox_center: [centers[item * 2], centers[item * 2 + 1]],
+                        bbox_scale: [scales[item * 2], scales[item * 2 + 1]],
                         cam_int,
                     })
+                    .collect();
+                let outputs = module
+                    .run_full_batch(&inputs)
                     .map_err(|error| anyhow::anyhow!("SAM 3D Body (TorchScript): {error}"))?;
-                let verts = out.body_space_verts();
-                Ok(velomocap_infer::Sam3dFrame {
-                    body_token: out.body_token,
-                    left_token: out.left_token,
-                    right_token: out.right_token,
-                    // `Sam3dFrame::world_vertices` expects centimetres with `y`
-                    // down and `z` forward, and subtracts `cam_t.y`. The module
-                    // hands back metres in camera axes with `y` up, so the
-                    // translation's `y` is mirrored alongside the mesh.
-                    verts,
-                    skel_state: out.skel_state,
-                    model_params: out.model_params,
-                    pred_cam: out.pred_cam,
-                    cam_t: [out.pred_cam_t[0], -out.pred_cam_t[1], out.pred_cam_t[2]],
-                    pred: out.pred,
-                })
+                Ok(outputs
+                    .into_iter()
+                    .map(|out| {
+                        // `Sam3dFrame::world_vertices` expects centimetres with
+                        // `y` down and `z` forward, and subtracts `cam_t.y`. The
+                        // module hands back metres in camera axes with `y` up,
+                        // so the translation's `y` is mirrored alongside the mesh.
+                        let verts = out.body_space_verts();
+                        velomocap_infer::Sam3dFrame {
+                            body_token: out.body_token,
+                            left_token: out.left_token,
+                            right_token: out.right_token,
+                            verts,
+                            skel_state: out.skel_state,
+                            model_params: out.model_params,
+                            pred_cam: out.pred_cam,
+                            cam_t: [out.pred_cam_t[0], -out.pred_cam_t[1], out.pred_cam_t[2]],
+                            pred: out.pred,
+                        }
+                    })
+                    .collect())
             }
         }
     }
+}
+
+/// Turn one module output into the frame the rest of the pipeline stores.
+fn person_from_output(
+    mesh: &MeshTopology,
+    output: &velomocap_infer::Sam3dFrame,
+    detection: Detection,
+) -> PersonFrame {
+    let verts = output.world_vertices();
+    let joints = output.world_joints();
+    let mut keypoints = Vec::new();
+    mesh.regressor.apply(&verts, &joints, &mut keypoints);
+
+    // The reference places FlowHMR's world by matching the MHR hips in
+    // *camera* coordinates: `pred_keypoints_3d[[9, 10]] + pred_cam_t`.
+    // `verts` above is already translated and y-up, so the camera-space
+    // keypoints are regressed separately from the raw chain output
+    // (centimetres, y down, z forward).
+    let mut camera_joints = Vec::with_capacity(output.skel_state.len() / 8 * 3);
+    for joint in output.skel_state.chunks_exact(8) {
+        camera_joints.extend_from_slice(&joint[..3]);
+    }
+    let mut camera_keypoints = Vec::new();
+    mesh.regressor
+        .apply(&output.verts, &camera_joints, &mut camera_keypoints);
+    let mut anchor_cam = [0.0f32; 3];
+    if camera_keypoints.len() >= 11 * 3 {
+        for axis in 0..3 {
+            anchor_cam[axis] = 0.5
+                * (camera_keypoints[9 * 3 + axis] + camera_keypoints[10 * 3 + axis])
+                * 0.01
+                + output.cam_t[axis];
+        }
+    }
+
+    PersonFrame {
+        bbox: [detection.x0, detection.y0, detection.x1, detection.y1],
+        score: detection.score,
+        verts,
+        joints,
+        keypoints,
+        body_token: output.body_token.clone(),
+        left_token: output.left_token.clone(),
+        right_token: output.right_token.clone(),
+        cam_t: output.cam_t,
+        anchor_cam,
+        skel_state: output.skel_state.clone(),
+    }
+}
+
+/// Run one batch of people and store what comes back.
+///
+/// A batch that spans frames lands its results a few frames late; the track
+/// lists are kept long enough for that, and `flush` only ever touches the
+/// frames whose people it carried.
+#[allow(clippy::too_many_arguments)]
+fn flush_batch(
+    people: &mut [PersonTrack],
+    mesh: &MeshTopology,
+    config: &SamConfig,
+    runner: &SamRunner,
+    jobs: &[PendingJob],
+    intrinsics: [[f32; 3]; 3],
+    timings: &mut Timings,
+    meshes_stored: &mut usize,
+    dropped_meshes: &mut usize,
+) -> Result<()> {
+    let references: Vec<&PendingJob> = jobs.iter().collect();
+    let started = Instant::now();
+    let outputs = runner
+        .run_batch(&references, intrinsics)
+        .context("SAM 3D Body")?;
+    timings.reconstruct += started.elapsed().as_secs_f64();
+
+    for (job, output) in jobs.iter().zip(outputs) {
+        let track = &mut people[job.slot];
+        while track.frames.len() <= job.index {
+            track.frames.push(None);
+        }
+        let person_frame = person_from_output(mesh, &output, job.detection);
+        if *meshes_stored + person_frame.mesh_bytes() <= config.mesh_budget {
+            *meshes_stored += person_frame.mesh_bytes();
+            track.frames[job.index] = Some(Arc::new(person_frame));
+        } else {
+            *dropped_meshes += 1;
+        }
+        track.last_frame = job.index;
+        track.hits += 1;
+    }
+    Ok(())
 }
 
 /// Intersection over union of two `[x0, y0, x1, y1]` boxes.
@@ -601,24 +805,21 @@ pub fn capture_people_with(
                     .map(PathBuf::from)
                     .filter(|path| path.is_file())
             })
-            .or_else(|| {
-                let candidate = config.sam3d_dir.join("sam3d_full_ts.pt");
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                // Dev tree: `tools/torch/sam3d_full_jit.py` writes into
-                // `export/sam3d/`, next to the workspace rather than inside
-                // `models/`, so the 3.5 GB file does not have to be copied.
-                let exported = Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../../export/sam3d/sam3d_full_ts.pt");
-                exported.is_file().then_some(exported)
-            })
+            .or_else(|| find_torch_module(config))
     };
+    let torch_batch = torch_weights
+        .as_deref()
+        .map(module_batch)
+        .unwrap_or(1);
     let body = match torch_weights.as_deref() {
         Some(path) if velomocap_cpp::sam3d::Sam3dTorch::built() => {
-            match velomocap_cpp::sam3d::Sam3dTorch::load(path, config.gpu) {
+            match velomocap_cpp::sam3d::Sam3dTorch::load_batch(path, config.gpu, torch_batch) {
                 Ok(module) => {
-                    eprintln!("[SAM] using {} through LibTorch", path.display());
+                    eprintln!(
+                        "[SAM] using {} through LibTorch ({} item(s) per call)",
+                        path.display(),
+                        module.batch()
+                    );
                     SamRunner::Torch(Box::new(module))
                 }
                 Err(error) => {
@@ -675,6 +876,8 @@ pub fn capture_people_with(
     // slot, so the cast cannot grow past the number of seeds.
     let mut picks: Vec<Pick> = Vec::new();
     let mut slots: Vec<Option<usize>> = Vec::new();
+    // People waiting for a batch of `body.batch()` items.
+    let mut pending: Vec<PendingJob> = Vec::new();
 
     while let Some(frame) = decoder.next_frame()? {
         if (hooks.cancelled)() {
@@ -785,68 +988,39 @@ pub fn capture_people_with(
             }
         }
 
+        // Queue this frame's people. A module traced at several items per call
+        // takes them in batches; the ONNX chain takes them one at a time, which
+        // is the same code with a batch of one.
+        let frame_rgb = Arc::new(frame.rgb.clone());
         for (slot, detection) in jobs {
             (hooks.progress)(decoded, total, "reconstructing");
-            let track = &mut people[slot];
-            while track.frames.len() <= index {
-                track.frames.push(None);
+            while people[slot].frames.len() <= index {
+                people[slot].frames.push(None);
             }
-
-            let reconstruct_start = Instant::now();
-            let output = body
-                .run(&frame, [detection.x0, detection.y0, detection.x1, detection.y1], intrinsics)
-                .context("SAM 3D Body")?;
-            timings.reconstruct += reconstruct_start.elapsed().as_secs_f64();
-
-            let verts = output.world_vertices();
-            let joints = output.world_joints();
-            let mut keypoints = Vec::new();
-            mesh.regressor.apply(&verts, &joints, &mut keypoints);
-
-            // The reference places FlowHMR's world by matching the MHR hips in
-            // *camera* coordinates: `pred_keypoints_3d[[9, 10]] + pred_cam_t`.
-            // `verts` above is already translated and y-up, so the camera-space
-            // keypoints are regressed separately from the raw chain output
-            // (centimetres, y down, z forward).
-            let mut camera_joints = Vec::with_capacity(output.skel_state.len() / 8 * 3);
-            for joint in output.skel_state.chunks_exact(8) {
-                camera_joints.extend_from_slice(&joint[..3]);
-            }
-            let mut camera_keypoints = Vec::new();
-            mesh.regressor
-                .apply(&output.verts, &camera_joints, &mut camera_keypoints);
-            let mut anchor_cam = [0.0f32; 3];
-            if camera_keypoints.len() >= 11 * 3 {
-                for axis in 0..3 {
-                    anchor_cam[axis] = 0.5
-                        * (camera_keypoints[9 * 3 + axis] + camera_keypoints[10 * 3 + axis])
-                        * 0.01
-                        + output.cam_t[axis];
-                }
-            }
-
-            let person_frame = PersonFrame {
-                bbox: [detection.x0, detection.y0, detection.x1, detection.y1],
-                score: detection.score,
-                verts,
-                joints,
-                keypoints,
-                body_token: output.body_token,
-                left_token: output.left_token,
-                right_token: output.right_token,
-                cam_t: output.cam_t,
-                anchor_cam,
-                skel_state: output.skel_state,
-            };
-
-            if meshes_stored + person_frame.mesh_bytes() <= config.mesh_budget {
-                meshes_stored += person_frame.mesh_bytes();
-                track.frames[index] = Some(Arc::new(person_frame));
-            } else {
-                dropped_meshes += 1;
-            }
-            track.last_frame = index;
-            track.hits += 1;
+            pending.push(PendingJob {
+                slot,
+                index,
+                detection,
+                rgb: Arc::clone(&frame_rgb),
+                width: frame.width,
+                height: frame.height,
+            });
+        }
+        let batch = body.batch().max(1);
+        while pending.len() >= batch {
+            let count = batch.min(pending.len());
+            let group: Vec<PendingJob> = pending.drain(..count).collect();
+            flush_batch(
+                &mut people,
+                &mesh,
+                config,
+                &body,
+                &group,
+                intrinsics,
+                &mut timings,
+                &mut meshes_stored,
+                &mut dropped_meshes,
+            )?;
         }
 
         // Keep every other track's frame list aligned with the clip.
@@ -860,6 +1034,24 @@ pub fn capture_people_with(
         if config.max_frames > 0 && decoded >= config.max_frames {
             break;
         }
+    }
+
+    // Whatever is left of the last batch still has to be reconstructed: the
+    // module pads it up to its own batch and the extra results are dropped.
+    if !pending.is_empty() && !(hooks.cancelled)() {
+        let group: Vec<PendingJob> = pending.drain(..).collect();
+        flush_batch(
+            &mut people,
+            &mesh,
+            config,
+            &body,
+            &group,
+            intrinsics,
+            &mut timings,
+            &mut meshes_stored,
+            &mut dropped_meshes,
+        )?;
+        (hooks.people)(decoded.saturating_sub(1), &people);
     }
 
     // Planted feet stay planted, and the body stops jittering frame to frame.

@@ -56,21 +56,29 @@ int vm_sam3d_forward(void* handle, const float* image, const float* bbox_center,
 // traces, i.e. `run_inference(inference_type="full")` — body pass, both hand
 // crops, the fusion criteria, the keypoint-prompt pass and the final mesh.
 //
-//   frame        3 * height * width float32, NCHW, RGB in [0, 1], the *original*
-//                frame (crops happen inside the graph)
-//   bbox_center  2 values, pixels
-//   bbox_scale   2 values, pixels (already padded)
-//   cam_int      9 values, row major
+//   frame        batch * 3 * height * width float32, NCHW, RGB in [0, 1], the
+//                *original* frames (crops happen inside the graph)
+//   batch        items in this call: one item is one person in one frame. A
+//                traced module bakes this, so it must match the trace and the
+//                caller pads by repeating its last item.
+//   bbox_center  batch * 2 values, pixels
+//   bbox_scale   batch * 2 values, pixels (already padded)
+//   cam_int      batch * 9 values, row major
 //
 // Every output buffer is sized by the caller; `count` is the number of floats
 // it holds and the call fails rather than overflowing if the module disagrees.
-int vm_sam3d_forward_full(void* handle, const float* frame, int height, int width,
+// Outputs are batch-major, so a caller holding `batch` of them gets one row per
+// item in order.
+int vm_sam3d_forward_full(void* handle, const float* frame, int batch, int height,
+                          int width,
                           const float* bbox_center, const float* bbox_scale,
                           const float* cam_int,
                           float* verts, int verts_count,
                           float* keypoints_3d, int kps3d_count,
                           float* keypoints_2d, int kps2d_count,
-                          float* pred_cam, float* pred_cam_t, float* focal_length,
+                          float* pred_cam, int cam_count,
+                          float* pred_cam_t, int cam_t_count,
+                          float* focal_length, int focal_count,
                           float* model_params, int params_count,
                           float* joint_rots, int rots_count,
                           float* hand_valid, int hand_count,

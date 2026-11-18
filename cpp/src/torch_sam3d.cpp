@@ -190,13 +190,15 @@ bool copy_checked(const torch::jit::IValue& value, float* out, int count,
 
 }  // namespace
 
-int vm_sam3d_forward_full(void* opaque, const float* frame, int height, int width,
+int vm_sam3d_forward_full(void* opaque, const float* frame, int batch, int height, int width,
                           const float* bbox_center, const float* bbox_scale,
                           const float* cam_int,
                           float* verts, int verts_count,
                           float* keypoints_3d, int kps3d_count,
                           float* keypoints_2d, int kps2d_count,
-                          float* pred_cam, float* pred_cam_t, float* focal_length,
+                          float* pred_cam, int cam_count,
+                          float* pred_cam_t, int cam_t_count,
+                          float* focal_length, int focal_count,
                           float* model_params, int params_count,
                           float* joint_rots, int rots_count,
                           float* hand_valid, int hand_count,
@@ -213,18 +215,26 @@ int vm_sam3d_forward_full(void* opaque, const float* frame, int height, int widt
     fail(error, error_len, "empty frame");
     return 1;
   }
+  if (batch <= 0) {
+    fail(error, error_len, "empty batch");
+    return 1;
+  }
   auto* handle = static_cast<Handle*>(opaque);
   try {
     torch::NoGradGuard guard;
     auto device = [&](torch::Tensor tensor) { return tensor.to(handle->device); };
 
-    auto frame_t = device(from(frame, {1, 3, height, width}));
-    auto center_t = device(from(bbox_center, {1, 2}));
-    auto scale_t = device(from(bbox_scale, {1, 2}));
-    auto cam_t = device(from(cam_int, {1, 3, 3}));
-    auto size_t = device(torch::zeros({1, 2}, torch::kFloat32));
-    size_t[0][0] = static_cast<float>(width);
-    size_t[0][1] = static_cast<float>(height);
+    // One item is one person in one frame. A module traced at batch N expects
+    // exactly N of them, so the caller pads: `batch` here is that N.
+    auto frame_t = device(from(frame, {batch, 3, height, width}));
+    auto center_t = device(from(bbox_center, {batch, 2}));
+    auto scale_t = device(from(bbox_scale, {batch, 2}));
+    auto cam_t = device(from(cam_int, {batch, 3, 3}));
+    auto size_t = device(torch::zeros({batch, 2}, torch::kFloat32));
+    for (int item = 0; item < batch; ++item) {
+      size_t[item][0] = static_cast<float>(width);
+      size_t[item][1] = static_cast<float>(height);
+    }
     size_t = size_t.to(handle->device);
 
     std::vector<torch::jit::IValue> inputs{frame_t, center_t, scale_t, cam_t, size_t};
@@ -244,9 +254,9 @@ int vm_sam3d_forward_full(void* opaque, const float* frame, int height, int widt
         {0, verts, verts_count, "verts"},
         {1, keypoints_3d, kps3d_count, "keypoints_3d"},
         {2, keypoints_2d, kps2d_count, "keypoints_2d"},
-        {3, pred_cam, 3, "pred_cam"},
-        {4, pred_cam_t, 3, "pred_cam_t"},
-        {5, focal_length, 1, "focal_length"},
+        {3, pred_cam, cam_count, "pred_cam"},
+        {4, pred_cam_t, cam_t_count, "pred_cam_t"},
+        {5, focal_length, focal_count, "focal_length"},
         {6, model_params, params_count, "model_params"},
         {7, joint_rots, rots_count, "joint_rots"},
         {8, hand_valid, hand_count, "hand_valid"},

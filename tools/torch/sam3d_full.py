@@ -189,13 +189,16 @@ class Sam3dFull(nn.Module):
         8 bits before it reaches the backbone; the rounding below reproduces
         that (cv2's fixed-point weights differ by well under one level).
         """
-        u = self.base[..., 0]
-        v = self.base[..., 1]
-        sx = (u - affine[0, 0, 2]) / affine[0, 0, 0]
-        sy = (v - affine[0, 1, 2]) / affine[0, 1, 1]
-        gx = (2.0 * (sx + 0.5)) / size[0, 0] - 1.0
-        gy = (2.0 * (sy + 0.5)) / size[0, 1] - 1.0
-        grid = torch.stack([gx, gy], dim=-1).unsqueeze(0)
+        # One grid per item in the batch: `affine` is [B, 3, 3] and `size` [B, 2],
+        # so a batch of frames is cropped against its own boxes in one
+        # `grid_sample`, exactly as `B` separate warpAffines would.
+        u = self.base[..., 0].unsqueeze(0)
+        v = self.base[..., 1].unsqueeze(0)
+        sx = (u - affine[:, 0, 2 : 3, None]) / affine[:, 0, 0 : 1, None]
+        sy = (v - affine[:, 1, 2 : 3, None]) / affine[:, 1, 1 : 2, None]
+        gx = (2.0 * (sx + 0.5)) / size[:, 0:1, None] - 1.0
+        gy = (2.0 * (sy + 0.5)) / size[:, 1:2, None] - 1.0
+        grid = torch.stack([gx, gy], dim=-1)
         crop = F.grid_sample(
             frame, grid, mode="bilinear", padding_mode="zeros", align_corners=False
         )
@@ -249,7 +252,8 @@ class Sam3dFull(nn.Module):
 
     # -- forward ----------------------------------------------------------
     def forward(self, frame, bbox_center, bbox_scale, cam_int, frame_size):
-        dummy = torch.zeros(1, 1, 3, dtype=frame.dtype, device=frame.device)
+        count = frame.shape[0]
+        dummy = torch.zeros(count, 1, 3, dtype=frame.dtype, device=frame.device)
         dummy[:, :, -1] = -2
         affine = self.body.affine(bbox_center, bbox_scale)
         crop = self._crop(frame, affine, frame_size)
@@ -273,14 +277,15 @@ class Sam3dFull(nn.Module):
         hand_logits = self.hand_cls_embed(box_tokens)
         boxes = hand_box * IMAGE_SIZE
         box_scale = boxes[..., 2:].amax(dim=-1, keepdim=True).expand(-1, -1, 2)
-        offset = torch.stack([affine[0, 0, 2], affine[0, 1, 2]])
-        box_centre = (boxes[..., :2] - offset) / affine[0, 0, 0]
-        box_scale = box_scale / affine[0, 0, 0]
+        # `affine` is per item, the boxes are two per item: keep the leading dim.
+        offset = torch.stack([affine[:, 0, 2], affine[:, 1, 2]], dim=1).unsqueeze(1)
+        box_centre = (boxes[..., :2] - offset) / affine[:, 0, 0:1, None]
+        box_scale = box_scale / affine[:, 0, 0:1, None]
         xyxy = torch.cat(
             [box_centre - box_scale * 0.5, box_centre + box_scale * 0.5], dim=-1
         )
 
-        width = frame_size[0, 0]
+        width = frame_size[:, 0].unsqueeze(-1).unsqueeze(-1)
         left_xyxy = torch.cat(
             [
                 width - xyxy[:, 0:1, 2:3] - 1.0,
@@ -299,11 +304,11 @@ class Sam3dFull(nn.Module):
         right_centre = (right_xyxy[..., 0:2] + right_xyxy[..., 2:4]) * 0.5
         right_size = (right_xyxy[..., 2:4] - right_xyxy[..., 0:2]) * HAND_PADDING
 
-        left_affine = self._hand_affine(left_centre[0], left_size[0])
-        right_affine = self._hand_affine(right_centre[0], right_size[0])
-        # Both hands go through one batch-2 forward. The two crops are
-        # independent, so this is the same arithmetic as two batch-1 calls with
-        # a single ViT pass instead of two — worth ~a third of the runtime.
+        left_affine = self._hand_affine(left_centre[:, 0], left_size[:, 0])
+        right_affine = self._hand_affine(right_centre[:, 0], right_size[:, 0])
+        # Both hands of every item go through one 2B forward. The crops are
+        # independent, so this is the same arithmetic as 2B batch-1 calls with a
+        # single ViT pass instead of 2B — worth ~a third of the runtime.
         hand_crop = torch.cat(
             [
                 self._crop(flipped, left_affine, frame_size),
@@ -311,20 +316,20 @@ class Sam3dFull(nn.Module):
             ],
             dim=0,
         )
-        hand_center = torch.cat([left_centre[0], right_centre[0]], dim=0)
-        hand_size = torch.cat([left_size[0], right_size[0]], dim=0)
-        hand_prompt = dummy.expand(2, 1, 3).clone()
-        hand_frame = frame_size.expand(2, 2)
-        cam_batch = cam_int.expand(2, 3, 3)
+        hand_center = torch.cat([left_centre[:, 0], right_centre[:, 0]], dim=0)
+        hand_size = torch.cat([left_size[:, 0], right_size[:, 0]], dim=0)
+        hand_prompt = dummy.repeat(2, 1, 1)
+        hand_frame = frame_size.repeat(2, 1)
+        cam_batch = cam_int.repeat(2, 1, 1)
         hand_out = self.hand(
             hand_crop, hand_center, hand_size, cam_batch, hand_prompt, hand_frame
         )
         (
             lnormed, lpred, lcam_t, lverts, lj3d, lj2d, ldepth, lmp, lrots
-        ) = [value[:1] for value in hand_out]
+        ) = [value[:count] for value in hand_out]
         (
             rnormed, rpred, rcam_t, rverts, rj3d, rj2d, rdepth, rmp, rrots
-        ) = [value[1:] for value in hand_out]
+        ) = [value[count:] for value in hand_out]
 
         # -- unflip the left hand ----------------------------------------
         sm = self.scale_mean
@@ -391,11 +396,11 @@ class Sam3dFull(nn.Module):
         prompt = torch.cat(
             [right_crop_kps, left_crop_kps, right_elbow, left_elbow], dim=1
         )
-        labels = torch.zeros(1, 4, 1, dtype=prompt.dtype, device=prompt.device)
-        labels[0, 0, 0] = 41
-        labels[0, 1, 0] = 62
-        labels[0, 2, 0] = 8
-        labels[0, 3, 0] = 7
+        labels = torch.zeros(count, 4, 1, dtype=prompt.dtype, device=prompt.device)
+        labels[:, 0, 0] = 41
+        labels[:, 1, 0] = 62
+        labels[:, 2, 0] = 8
+        labels[:, 3, 0] = 7
         valid_key = (
             (prompt > -0.5) & (prompt < 0.5)
         ).all(dim=2) & hand_valid[:, [1, 0, 1, 0]].bool()
@@ -424,7 +429,9 @@ class Sam3dFull(nn.Module):
         # `run_inference` only runs the prompt pass when at least one keypoint
         # survived the criteria; otherwise the first pass stands. Both are
         # computed, so the choice is one elementwise `where`.
-        use_prompt = valid_key.any().reshape(1, 1)
+        # Per item, not over the whole batch: one person's surviving prompt must
+        # not switch another person's second pass on.
+        use_prompt = valid_key.any(dim=1, keepdim=True)
         pred2 = torch.where(use_prompt, pred2, pred)
         pred_cam2 = torch.where(use_prompt, pred_cam2, pred_cam)
         global_rot2, body_pose2, shape2, scale2, hand2, face2 = pred_parts(
@@ -529,8 +536,10 @@ class Sam3dFull(nn.Module):
         j3d = _j3
         # Final projection: `run_inference` uses the *image centre*, not cam_int.
         proj = j3d + cam_t2[:, None, :]
-        x = proj[..., 0] * focal2[:, None] + frame_size[0, 0] * 0.5 * proj[..., 2]
-        y = proj[..., 1] * focal2[:, None] + frame_size[0, 1] * 0.5 * proj[..., 2]
+        size_x = frame_size[:, 0:1]
+        size_y = frame_size[:, 1:2]
+        x = proj[..., 0] * focal2[:, None] + size_x * 0.5 * proj[..., 2]
+        y = proj[..., 1] * focal2[:, None] + size_y * 0.5 * proj[..., 2]
         j2d = torch.stack([x / proj[..., 2], y / proj[..., 2]], dim=-1)
         return (
             verts,

@@ -43,15 +43,30 @@ NAMES = (
 )
 
 
-def sample_inputs(seed=0, height=720, width=1280):
+def sample_inputs(seed=0, height=720, width=1280, batch=1):
     torch.manual_seed(seed)
-    frame = torch.rand(1, 3, height, width)
-    bbox_center = torch.tensor([[640.0, 395.0]])
-    bbox_scale = torch.tensor([[762.5, 762.5]])
-    cam_int = torch.tensor(
-        [[[1400.0, 0.0, 640.0], [0.0, 1400.0, 360.0], [0.0, 0.0, 1.0]]]
-    )
-    frame_size = torch.tensor([[float(width), float(height)]])
+    # Each item is one person in one frame: its own frame, box and intrinsics,
+    # so a batch exercises the per-item paths instead of repeating one crop.
+    frames = [torch.rand(1, 3, height, width) for _ in range(batch)]
+    frame = torch.cat(frames, dim=0)
+    centers = []
+    scales = []
+    cameras = []
+    for index in range(batch):
+        shift = 40.0 * index
+        centers.append([600.0 - shift, 395.0 + 6.0 * index])
+        scales.append([700.0 + 11.0 * index, 700.0 + 11.0 * index])
+        cameras.append(
+            [
+                [1400.0 + index, 0.0, 640.0 - shift],
+                [0.0, 1400.0 + index, 360.0 + index],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+    bbox_center = torch.tensor(centers)
+    bbox_scale = torch.tensor(scales)
+    cam_int = torch.tensor(cameras)
+    frame_size = torch.tensor([[float(width), float(height)]] * batch)
     return frame, bbox_center, bbox_scale, cam_int, frame_size
 
 
@@ -70,6 +85,10 @@ def main() -> int:
         "and twice the file but less sensitive to crop-sampling differences)",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--batch", type=int, default=1,
+                        help="Items in the traced batch (one person in one frame "
+                             "per item). The tracer bakes it, so a batch-8 module "
+                             "expects exactly 8 items per call.")
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--width", type=int, default=1280)
     args = parser.parse_args()
@@ -90,7 +109,7 @@ def main() -> int:
 
     print("[2/4] building the module ...", flush=True)
     module = Sam3dFull(model, backbone_dtype=backbone_dtype).eval().to(device)
-    inputs = tuple(t.to(device) for t in sample_inputs(args.seed, args.height, args.width))
+    inputs = tuple(t.to(device) for t in sample_inputs(args.seed, args.height, args.width, args.batch))
 
     print("[3/4] reference forward (eager) ...", flush=True)
     started = time.time()
