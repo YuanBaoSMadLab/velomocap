@@ -19,6 +19,31 @@ which engine loads it: SAM 3D Body is a TorchScript module that LibTorch loads
 no ONNX file and the application never runs it through ONNX Runtime, so the name
 was wrong.
 
+## Which licence to pick in the hub form
+
+The form only offers a fixed list, and none of these three can be expressed by a
+standard entry - `CC-BY-NC-4.0` is not FlowHMR's licence, and `Apache-2.0` on a
+converted weight would be a relicensing, which the upstream licences forbid.
+Pick **Other** and let the card carry the details.
+
+| Repository | Licence text to upload | Name in the repo | Form field | Card front matter |
+| --- | --- | --- | --- | --- |
+| `velomocap-sam3d-torchscript` | `licenses/SAM-LICENSE.txt` | `LICENSE` | Other | `license: other`, `license_name: sam-license`, `license_link: https://huggingface.co/facebook/sam-3d-body-dinov3` |
+| `velomocap-flowhmr-onnx` | `licenses/FlowHMR-Model-Weights-LICENSE.txt` | `LICENSE-flowhmr-weights` | Other | `license_name: flowhmr-model-weights-license`, `license_link: https://huggingface.co/fafsaf1/flowhmr-0.46B` |
+| `velomocap-vggt-omega-onnx` | `licenses/VGGT-Omega-LICENSE.txt` | `LICENSE.txt` | Other | `license_name: fair-noncommercial-research-license`, `license_link: https://huggingface.co/facebook/VGGT-Omega` |
+
+If the UI has no "Other", set nothing in the form and put the same three lines at
+the top of `README.md` by hand - the card is what the Hub actually reads. On
+ModelScope, choose Other and repeat the licence name and link in the
+description; the `README.md` front matter works there too.
+
+Everything is already staged by `tools/stage_model_upload.py`, which fills in
+the card, copies the licence under the right name and hard-links the weights:
+
+```powershell
+python tools\stage_model_upload.py --out E:\model-upload
+```
+
 ---
 
 ## 1. `velomocap-sam3d-torchscript` - SAM License
