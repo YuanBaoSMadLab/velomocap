@@ -299,6 +299,29 @@ pub struct VeloMocap {
     /// `--save-project`: write the workspace once the capture finishes, then
     /// leave. Used to verify the round trip without a GUI.
     pub save_after_capture: Option<PathBuf>,
+    /// Fingerprint of the workspace the last time it was written to a `.vp` (or
+    /// opened from one). The UI calls it "dirty" when the current state differs,
+    /// which needs no hook at every widget that can change the scene.
+    saved_signature: u64,
+    /// The close button was pressed with unsaved work: the confirmation is up.
+    pub ask_quit: bool,
+    /// The confirmed close is going through, so the interception stands down.
+    closing: bool,
+    /// Restored from the TEMP autosave: real work that no `.vp` holds yet, so it
+    /// counts as unsaved until it is written somewhere the user chooses.
+    pub recovered: bool,
+    /// An autosave a previous session left behind because it did not exit cleanly.
+    pub recovery: Option<crate::project::Recovery>,
+    /// Run for one command-line job and leave (a capture, an export, a probe):
+    /// no session marker and no autosave, so a verification run cannot leave a
+    /// "crashed session" behind for the next interactive launch to offer.
+    pub headless: bool,
+    /// When the workspace was last copied to TEMP.
+    autosaved_at: Instant,
+    /// A write to TEMP is in flight.
+    autosave_running: Arc<std::sync::atomic::AtomicBool>,
+    /// The autosave path has been logged once, so the console says where it goes.
+    autosave_logged: bool,
     /// How the next project save writes geometry and compresses it.
     pub storage_precision: crate::project::Precision,
     pub storage_compression: crate::project::Compression,
@@ -533,6 +556,26 @@ impl VeloMocap {
         if std::env::var("VELOMOCAP_FORCE_CPU").is_ok() {
             memory_mode = capture::MemoryMode::Cpu;
         }
+        // A headless run (`--capture`, `--save-project`, an export) leaves on its
+        // own, which would look exactly like a crash to the next launch: no
+        // session marker of its own, but an autosave in TEMP. Only an interactive
+        // window takes part in the session and recovery bookkeeping.
+        let headless = capture_start
+            || detect_only
+            || play_check.is_some()
+            || save_project.is_some()
+            || open_project.is_some()
+            || render_probe.is_some()
+            || render_character.is_some()
+            || export_asset.is_some()
+            || export_animated.is_some()
+            || render_pose.is_some()
+            || measure_soles.is_some();
+        let session_recovery = if headless {
+            None
+        } else {
+            crate::project::begin_session()
+        };
         let mut app = Self {
             video,
             detector,
@@ -563,6 +606,15 @@ impl VeloMocap {
             first_frame: None,
             project_path: None,
             save_after_capture: save_project.clone(),
+            saved_signature: 0,
+            ask_quit: false,
+            closing: false,
+            recovered: false,
+            recovery: session_recovery,
+            headless,
+            autosaved_at: Instant::now(),
+            autosave_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            autosave_logged: false,
             storage_precision: crate::project::Precision::default(),
             storage_compression: crate::project::Compression::default(),
             stream: crate::stream::VideoStream::spawn(),
@@ -752,8 +804,7 @@ impl VeloMocap {
             // Re-saving a workspace that was just opened is the cheapest proof
             // that a project round-trips without running anything again.
             if let Some(out) = save_project.clone() {
-                app.save_project(out.clone());
-                let saved = app.error.is_none();
+                let saved = app.save_project(out.clone());
                 eprintln!(
                     "project: {} {}",
                     if saved { "saved" } else { "failed" },
@@ -809,6 +860,23 @@ impl VeloMocap {
         }
         if capture_start && app.video.is_some() {
             app.start_capture();
+        }
+        // Whatever the launch already put on screen counts as the baseline: a
+        // window opened on a video is not "unsaved changes" yet.
+        app.mark_saved();
+        if let Some(recovery) = app.recovery.clone() {
+            app.log(i18n::zh_en(
+                &format!(
+                    "发现上次未正常退出留下的临时工程（{}），可以选择恢复：{}",
+                    recovery.describe(),
+                    recovery.path.display()
+                ),
+                &format!(
+                    "A previous session did not exit cleanly; its temporary workspace ({}) can be recovered: {}",
+                    recovery.describe(),
+                    recovery.path.display()
+                ),
+            ));
         }
         app
     }
@@ -1673,7 +1741,7 @@ impl VeloMocap {
 
     /// Save the whole workspace — video, tracked bodies, baked clips, avatars,
     /// locks and settings — to one `.vp` file.
-    pub fn save_project(&mut self, path: PathBuf) {
+    pub fn save_project(&mut self, path: PathBuf) -> bool {
         let path = if path.extension().is_none() {
             path.with_extension(crate::project::EXTENSION)
         } else {
@@ -1700,6 +1768,11 @@ impl VeloMocap {
                 self.log(note.clone());
                 self.status = note;
                 self.project_path = Some(path);
+                // The file on disk is now what the scene holds: no "unsaved"
+                // question on the way out, and no TEMP copy worth keeping.
+                self.mark_saved();
+                crate::project::discard_autosave();
+                true
             }
             Err(error) => {
                 let note = format!("{error:#}");
@@ -1708,11 +1781,15 @@ impl VeloMocap {
                     &format!("Could not save the project: {note}"),
                 ));
                 self.error = Some(note);
+                false
             }
         }
     }
 
-    pub fn save_project_dialog(&mut self) {        let mut dialog = rfd::FileDialog::new()
+    /// Ask where to put the workspace, then write it. `false` when the dialog was
+    /// dismissed or the write failed.
+    pub fn save_project_dialog(&mut self) -> bool {
+        let mut dialog = rfd::FileDialog::new()
             .add_filter(i18n::t("VeloMocap project"), &[crate::project::EXTENSION])
             .set_title(i18n::t("Save project"));
         let stem = self
@@ -1728,17 +1805,198 @@ impl VeloMocap {
             .set_file_name(format!("{stem}.{}", crate::project::EXTENSION))
             .save_file()
         else {
-            return;
+            return false;
         };
-        self.save_project(path);
+        self.save_project(path)
     }
 
     /// Ctrl+S: write over the file this workspace came from, or ask once.
-    pub fn save_project_here(&mut self) {
+    ///
+    /// `false` means nothing was written — the dialog was dismissed or the write
+    /// failed — which is what keeps "save and close" from closing when the take
+    /// did not make it to disk.
+    pub fn save_project_here(&mut self) -> bool {
         match self.project_path.clone() {
             Some(path) => self.save_project(path),
             None => self.save_project_dialog(),
         }
+    }
+
+    /// Fingerprint of everything a `.vp` stores apart from the bulk numbers:
+    /// which video, who is in the scene, what they wear, which takes exist, and
+    /// how the next save writes them.
+    ///
+    /// Comparing this with the fingerprint at the last save is what "there is
+    /// unsaved work here" means. Hooking every widget that can change the scene
+    /// would be a list to keep in sync forever; this cannot miss one.
+    pub fn workspace_signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.video
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .hash(&mut hasher);
+        self.people.len().hash(&mut hasher);
+        for person in &self.people {
+            person.id.hash(&mut hasher);
+            person.name.hash(&mut hasher);
+            person.visible.hash(&mut hasher);
+            person.colour.to_array().hash(&mut hasher);
+            person
+                .character
+                .as_ref()
+                .map(|assigned| assigned.path.to_string_lossy().into_owned())
+                .hash(&mut hasher);
+            person.frames.len().hash(&mut hasher);
+            person
+                .frames
+                .iter()
+                .map(|frame| frame.is_some())
+                .collect::<Vec<_>>()
+                .hash(&mut hasher);
+        }
+        self.flow.len().hash(&mut hasher);
+        for clip in &self.flow {
+            clip.name.hash(&mut hasher);
+            clip.first_frame.hash(&mut hasher);
+            clip.frames.len().hash(&mut hasher);
+            clip.first_frame.hash(&mut hasher);
+        }
+        self.characters.len().hash(&mut hasher);
+        self.floor.to_bits().hash(&mut hasher);
+        self.capture_fps.to_bits().hash(&mut hasher);
+        self.confidence.to_bits().hash(&mut hasher);
+        self.max_frames.hash(&mut hasher);
+        self.scale_width.hash(&mut hasher);
+        self.estimate_camera.hash(&mut hasher);
+        self.refine_camera.hash(&mut hasher);
+        format!(
+            "{:?}/{:?}/{:?}",
+            self.storage_precision, self.storage_compression, self.correction
+        )
+        .hash(&mut hasher);
+        for track in &self.locks.tracks {
+            track.as_ref().map(Vec::len).hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Is there work that no `.vp` on disk holds?
+    ///
+    /// A window that only has a video open is not unsaved work — the file is
+    /// right there. A scene with people or baked takes is.
+    pub fn dirty(&self) -> bool {
+        if self.recovered {
+            return true;
+        }
+        self.has_scene() && self.workspace_signature() != self.saved_signature
+    }
+
+    /// The workspace as it is now is what the file on disk holds.
+    pub fn mark_saved(&mut self) {
+        self.saved_signature = self.workspace_signature();
+        self.recovered = false;
+    }
+
+    /// Copy the workspace into TEMP so a crash cannot take the take with it.
+    ///
+    /// The copy of the bulk numbers happens here, on the UI thread, and the write
+    /// on a worker. That is why this runs after a capture and then slowly instead
+    /// of every second: minutes of GPU work are worth a short pause, a moved
+    /// camera is not.
+    pub fn autosave_now(&mut self) {
+        use std::sync::atomic::Ordering;
+        if self.headless || self.autosave_running.load(Ordering::SeqCst) {
+            return;
+        }
+        let project = crate::project::Project::capture(self);
+        let running = Arc::clone(&self.autosave_running);
+        running.store(true, Ordering::SeqCst);
+        self.autosaved_at = Instant::now();
+        if !self.autosave_logged {
+            self.autosave_logged = true;
+            self.log(format!(
+                "autosave: {}",
+                crate::project::autosave_path().display()
+            ));
+        }
+        std::thread::spawn(move || {
+            match crate::project::write_autosave(&project) {
+                Ok(bytes) => eprintln!(
+                    "[autosave] {:.1} MB -> {}",
+                    bytes as f64 / 1.0e6,
+                    crate::project::autosave_path().display()
+                ),
+                Err(error) => eprintln!("[autosave] failed: {error:#}"),
+            }
+            running.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Autosave cadence: every three minutes while there is unsaved work, and
+    /// never while a capture, a correction or an export owns the machine.
+    fn autosave_step(&mut self) {
+        use std::sync::atomic::Ordering;
+        if !self.dirty() || self.autosave_running.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.capture.is_some() || self.recorrect.is_some() || self.asset_job.is_some() {
+            return;
+        }
+        if self.autosaved_at.elapsed() < std::time::Duration::from_secs(180) {
+            return;
+        }
+        self.autosave_now();
+    }
+
+    /// Intercept the window's close button: when the take is not in a file yet —
+    /// or a reconstruction is still running — ask before it is gone.
+    pub fn check_close(&mut self, ctx: &egui::Context) {
+        if self.closing || !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        if !self.dirty() && self.capture.is_none() {
+            return;
+        }
+        // Stop the close this frame and ask; `CancelClose` has to be sent again on
+        // every request, or a second click on X would close the window behind the
+        // question.
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if !self.ask_quit {
+            self.ask_quit = true;
+            ctx.request_repaint();
+        }
+    }
+
+    /// The question was answered (or there was nothing to lose): finish the
+    /// session and let the window go. Windows closed any other way — Alt+F4 with
+    /// nothing unsaved, a kill from the task manager — are handled by the marker
+    /// in TEMP instead, which is what makes a kill look like a crash.
+    pub fn finish_close(&mut self, ctx: &egui::Context) {
+        self.closing = true;
+        self.ask_quit = false;
+        // A run in flight is why the window was being closed too: stop it so its
+        // worker cannot keep the process alive past the window.
+        if let Some(job) = self.capture.take() {
+            job.cancel();
+        }
+        crate::project::end_session();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// Take the autosave a dead session left behind.
+    pub fn recover_from_temp(&mut self, path: PathBuf) {
+        self.open_project(path);
+        // It lives in TEMP, which is not where the user wants the take to stay:
+        // no path here means Ctrl+S asks, and closing asks again.
+        self.project_path = None;
+        self.recovered = true;
+        let note = i18n::zh_en(
+            "已从临时目录恢复。请另存为工程文件，否则关闭时仍会提示未保存。",
+            "Recovered from the temporary folder. Save it as a project file - closing still asks while it is unsaved.",
+        );
+        self.log(note.clone());
+        self.status = note;
     }
 
     pub fn open_project_dialog(&mut self) {
@@ -1767,6 +2025,9 @@ impl VeloMocap {
                 self.log(note.clone());
                 self.status = note;
                 self.project_path = Some(path);
+                // Opening a project sets the baseline as well: what is on screen
+                // is exactly what the file holds.
+                self.mark_saved();
             }
             Err(error) => {
                 let note = format!("{error:#}");
@@ -2570,6 +2831,9 @@ impl VeloMocap {
                 self.locks_dirty = false;
                 self.correction_dirty = false;
             }
+            // Minutes of GPU work that only exists in memory: put a copy in TEMP
+            // at the moment it becomes worth something, not three minutes later.
+            self.autosave_now();
         }
         if let Some(faces) = smplh_faces {
             self.smplh_faces = Some(faces);
@@ -2605,8 +2869,7 @@ impl VeloMocap {
                         self.sync_people(&snapshot);
         if finished && self.save_after_capture.is_some() {
             let path = self.save_after_capture.take().unwrap();
-            self.save_project(path.clone());
-            let saved = self.error.is_none();
+            let saved = self.save_project(path.clone());
             eprintln!(
                 "project: {} {}",
                 if saved { "saved" } else { "failed" },
@@ -2919,7 +3182,7 @@ impl VeloMocap {
             )
         });
         if save {
-            self.save_project_here();
+            let _ = self.save_project_here();
             return;
         }
         if open {
@@ -3325,7 +3588,11 @@ impl eframe::App for VeloMocap {
         self.poll_asset_export(ctx);
         self.shortcuts(ctx);
         self.tick(ctx);
+        // Before drawing: a close request has to be answered on the frame it
+        // arrives, or the window is already gone.
+        self.check_close(ctx);
         ui::draw(self, ctx);
+        self.autosave_step();
     }}
 #[cfg(test)]
 mod tests {

@@ -156,7 +156,151 @@ pub fn draw(app: &mut VeloMocap, ctx: &egui::Context) {
     export_window(app, ctx);
     person_window(app, ctx);
     clear_scene_prompt(app, ctx);
+    quit_confirm(app, ctx);
+    recovery_prompt(app, ctx);
     drop_overlay(ctx);
+}
+
+/// Closing the window with work that no `.vp` holds: ask before it is gone.
+///
+/// The window itself was stopped with `CancelClose` (see `VeloMocap::check_close`),
+/// so the answer here is what decides whether it goes.
+fn quit_confirm(app: &mut VeloMocap, ctx: &egui::Context) {
+    if !app.ask_quit {
+        return;
+    }
+    let people = app.people.len();
+    let clips = app.flow.len();
+    let capturing = app.capture.is_some();
+    let project = app
+        .project_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    // 1 save, 2 discard, 3 cancel.
+    let mut answer = 0u8;
+    egui::Window::new(i18n::zh_en("未保存的修改", "Unsaved changes"))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.label(
+                egui::RichText::new(i18n::zh_en(
+                    &format!("当前有 {people} 人、{clips} 段动作还没有保存。关闭前保存吗？"),
+                    &format!(
+                        "The scene has {people} people and {clips} motion clips that are not saved. Save before closing?"
+                    ),
+                ))
+                .size(12.0),
+            );
+            if capturing {
+                ui.label(
+                    egui::RichText::new(i18n::zh_en(
+                        "正在重建中：关闭会中断这次重建。",
+                        "A reconstruction is still running; closing stops it.",
+                    ))
+                    .size(11.0)
+                    .color(ERR),
+                );
+            }
+            if let Some(path) = &project {
+                ui.label(
+                    egui::RichText::new(i18n::zh_en(
+                        &format!("将保存到 {path}"),
+                        &format!("Will be written to {path}"),
+                    ))
+                    .size(11.0)
+                    .color(MUTED),
+                );
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button(i18n::zh_en("保存并关闭", "Save and close"))
+                    .clicked()
+                {
+                    answer = 1;
+                }
+                if ui
+                    .button(i18n::zh_en("不保存关闭", "Close without saving"))
+                    .clicked()
+                {
+                    answer = 2;
+                }
+                if ui.button(i18n::t("Cancel")).clicked() {
+                    answer = 3;
+                }
+            });
+        });
+    match answer {
+        // Only leave once the file is on disk: a dismissed dialog or a failed
+        // write keeps the window open with the reason in the status bar, instead
+        // of dropping the take the user just asked to keep.
+        1 => {
+            if app.save_project_here() {
+                app.finish_close(ctx);
+            }
+        }
+        2 => app.finish_close(ctx),
+        3 => app.ask_quit = false,
+        _ => {}
+    }
+}
+
+/// A previous session died: offer the workspace it left in TEMP.
+fn recovery_prompt(app: &mut VeloMocap, ctx: &egui::Context) {
+    let Some(recovery) = app.recovery.clone() else {
+        return;
+    };
+    // 1 recover, 2 discard.
+    let mut answer = 0u8;
+    egui::Window::new(i18n::zh_en("恢复上次的工作", "Recover the last session"))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.label(
+                egui::RichText::new(i18n::zh_en(
+                    &format!(
+                        "上次运行没有正常退出。临时目录里还有一份自动保存的工程（{}）。要恢复吗？",
+                        recovery.describe()
+                    ),
+                    &format!(
+                        "The last session did not exit cleanly. Its autosaved workspace is still in the temporary folder ({}). Recover it?",
+                        recovery.describe()
+                    ),
+                ))
+                .size(12.0),
+            );
+            ui.label(
+                egui::RichText::new(recovery.path.display().to_string())
+                    .size(11.0)
+                    .color(MUTED),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button(i18n::zh_en("恢复", "Recover")).clicked() {
+                    answer = 1;
+                }
+                if ui.button(i18n::zh_en("丢弃", "Discard")).clicked() {
+                    answer = 2;
+                }
+            });
+        });
+    match answer {
+        1 => {
+            app.recovery = None;
+            app.recover_from_temp(recovery.path);
+        }
+        2 => {
+            app.recovery = None;
+            crate::project::discard_autosave();
+            app.log(i18n::zh_en(
+                "已丢弃上次的临时工程。",
+                "Discarded the temporary workspace from the last session.",
+            ));
+        }
+        _ => {}
+    }
 }
 
 /// While files hover over the window, say what releasing them would do. Without

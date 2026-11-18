@@ -30,9 +30,27 @@ fn main() -> eframe::Result<()> {
             .with_title(ui::window_title()),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         &ui::window_title(),
         options,
         Box::new(|cc| Ok(Box::new(app::VeloMocap::new(cc)))),
-    )
+    );
+    // Closing the window used to leave the process behind. The capture, camera
+    // and export workers own CUDA and ONNX Runtime contexts, and tearing one of
+    // those down can block a thread until the driver gives up; `run_native` then
+    // returned while the process stayed alive - invisible, holding the GPU and
+    // the executable's file lock, and looking like a crash to the next launch.
+    // Nothing is written after the window closes, so leave here instead of
+    // waiting for destructors that may never finish.
+    //
+    // The session marker goes first: it is what tells the next launch that this
+    // one exited properly, so there is nothing to recover.
+    project::end_session();
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(error) => {
+            eprintln!("VeloMocap: {error}");
+            std::process::exit(1);
+        }
+    }
 }

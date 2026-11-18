@@ -749,6 +749,167 @@ pub fn candidate(state: &CandidateState) -> Candidate {
     }
 }
 
+// --- Crash recovery -------------------------------------------------------
+//
+// A take is minutes of GPU work that lives only in memory until it is saved to a
+// `.vp`. If the window is closed by a crash, a kill from Task Manager, or the
+// machine losing power, that work is gone. So the workspace is also written to
+// `%TEMP%\VeloMocap\autosave.vp`, and a `session.lock` marker says whether a
+// session ended properly:
+//
+//   * no marker at startup        -> clean last exit, nothing to do
+//   * marker, pid still alive     -> a second window is open, leave it alone
+//   * marker, pid gone            -> the last session died; offer the autosave
+//
+// A clean exit removes both files, so the prompt only appears when it should.
+
+/// Where a session's scratch state lives: `%TEMP%\VeloMocap`.
+///
+/// `VELOMOCAP_RECOVERY_DIR` overrides it so a test (or a headless verification
+/// run) can drive the whole state machine without touching the real one.
+pub fn recovery_dir() -> PathBuf {
+    std::env::var_os("VELOMOCAP_RECOVERY_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("VeloMocap"))
+}
+
+/// The autosaved workspace of a session.
+pub fn autosave_path() -> PathBuf {
+    recovery_dir().join("autosave.vp")
+}
+
+/// Marks a session as open. Removed on a clean exit.
+pub fn session_lock_path() -> PathBuf {
+    recovery_dir().join("session.lock")
+}
+
+/// An autosave left behind by a session that did not finish.
+#[derive(Clone, Debug)]
+pub struct Recovery {
+    pub path: PathBuf,
+    pub bytes: u64,
+    /// When the autosave was written, for the prompt and the log.
+    pub taken: Option<std::time::SystemTime>,
+}
+
+impl Recovery {
+    /// Look for an autosave that a dead session left behind.
+    pub fn detect() -> Option<Recovery> {
+        let lock = session_lock_path();
+        let text = std::fs::read_to_string(&lock).ok()?;
+        // `pid` on the first line, start time (unix seconds) on the second.
+        let pid: u32 = text.lines().next()?.trim().parse().ok()?;
+        if process_alive(pid) {
+            return None;
+        }
+        let path = autosave_path();
+        let meta = std::fs::metadata(&path).ok()?;
+        if meta.len() == 0 {
+            return None;
+        }
+        Some(Recovery {
+            path,
+            bytes: meta.len(),
+            taken: meta.modified().ok(),
+        })
+    }
+
+    /// `5.2 MB, 14:03`, for the prompt.
+    pub fn describe(&self) -> String {
+        let clock = self
+            .taken
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|since| {
+                let secs = since.as_secs() as i64 + 8 * 3600;
+                format!(
+                    "{:02}:{:02}",
+                    (secs / 3600) % 24,
+                    (secs % 3600) / 60
+                )
+            })
+            .unwrap_or_else(|| "?".to_string());
+        format!("{:.1} MB, {clock}", self.bytes as f64 / 1.0e6)
+    }
+}
+
+/// Open a session: drop a marker that survives a crash, and say whether the last
+/// run left something to recover.
+pub fn begin_session() -> Option<Recovery> {
+    let recovery = Recovery::detect();
+    let _ = std::fs::create_dir_all(recovery_dir());
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    let text = format!("{}\n{}\n", std::process::id(), started);
+    if let Err(error) = std::fs::write(session_lock_path(), text) {
+        eprintln!("[recovery] could not write the session marker: {error}");
+    }
+    recovery
+}
+
+/// Close a session: no marker means the next launch has nothing to recover, and
+/// no autosave means the workspace is in the `.vp` the user saved.
+pub fn end_session() {
+    let _ = std::fs::remove_file(session_lock_path());
+    discard_autosave();
+}
+
+/// Drop the TEMP copy: the workspace is in a `.vp` the user chose, which is
+/// better than the autosave and would otherwise be offered back after a crash.
+pub fn discard_autosave() {
+    let _ = std::fs::remove_file(autosave_path());
+    let _ = std::fs::remove_file(autosave_path().with_extension("vp.part"));
+}
+
+/// Write `project` to the autosave path atomically: a crash mid-write must not
+/// replace a good autosave with half a file.
+pub fn write_autosave(project: &Project) -> Result<u64> {
+    let path = autosave_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let partial = path.with_extension("vp.part");
+    let bytes = project.save(&partial)?;
+    std::fs::rename(&partial, &path)
+        .with_context(|| format!("moving the autosave into {}", path.display()))?;
+    Ok(bytes)
+}
+
+/// Is this process id alive? A terminated process that still has an open handle
+/// counts as gone, which is what makes the crash test work.
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        fn WaitForSingleObject(handle: *mut c_void, millis: u32) -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
+    unsafe {
+        let handle = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let wait = WaitForSingleObject(handle, 0);
+        CloseHandle(handle);
+        wait == WAIT_TIMEOUT
+    }
+}
+
+#[cfg(not(windows))]
+fn process_alive(_pid: u32) -> bool {
+    // No cheap liveness test without a dependency; assume the previous session is
+    // gone, so the worst case is one recovery prompt too many.
+    false
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -943,5 +1104,46 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         assert!(Project::load(&path).is_err());
         std::fs::remove_file(&path).ok();
+    }
+
+    /// The session marker is what separates "the window was closed" from "the
+    /// process died": a live pid must not look like a crash, a dead one must, and
+    /// a clean exit must leave nothing behind to offer.
+    #[test]
+    fn only_a_dead_session_offers_its_autosave() {
+        let dir = std::env::temp_dir().join(format!("velomocap-recovery-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("VELOMOCAP_RECOVERY_DIR", &dir);
+        let _ = std::fs::remove_file(session_lock_path());
+        let _ = std::fs::remove_file(autosave_path());
+
+        // No session marker: nothing to recover.
+        assert!(Recovery::detect().is_none());
+
+        // An autosave with no marker behind it is not a crash either.
+        std::fs::write(autosave_path(), b"pretend project").unwrap();
+        assert!(Recovery::detect().is_none());
+
+        // A marker from this very process: another window is open, leave it.
+        std::fs::write(
+            session_lock_path(),
+            format!("{}\n0\n", std::process::id()),
+        )
+        .unwrap();
+        assert!(Recovery::detect().is_none());
+
+        // A marker from a process that is gone: offer the autosave.
+        std::fs::write(session_lock_path(), "4294967294\n0\n").unwrap();
+        let recovery = Recovery::detect().expect("a dead session leaves a recovery");
+        assert_eq!(recovery.bytes, 15);
+        assert!(recovery.describe().contains("MB"));
+
+        // A clean exit clears both, so the next launch asks nothing.
+        end_session();
+        assert!(Recovery::detect().is_none());
+        assert!(!autosave_path().exists());
+        assert!(!session_lock_path().exists());
+        std::env::remove_var("VELOMOCAP_RECOVERY_DIR");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
