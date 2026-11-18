@@ -48,6 +48,7 @@ REPOS = [
                    "must travel with the files.",
         "files": [
             ("sam3d/sam3d_full_b8_ts.pt", "sam3d_full_b8_ts.pt"),
+            ("sam3d/sam3d_body_b8_ts.pt", "sam3d_body_b8_ts.pt"),
             ("sam3d/sam3d_full_ts.pt", "sam3d_full_ts.pt"),
             ("sam3d/sam3d_faces.bin", "sam3d_faces.bin"),
             ("sam3d/sam3d_keypoints.bin", "sam3d_keypoints.bin"),
@@ -56,6 +57,7 @@ REPOS = [
         ],
         "extra_sources": {
             "sam3d_full_b8_ts.pt": "../export/sam3d/sam3d_full_b8_ts.pt",
+            "sam3d_body_b8_ts.pt": "../export/sam3d/sam3d_body_b8_ts.pt",
             "sam3d_full_ts.pt": "../export/sam3d/sam3d_full_ts.pt",
         },
         "changed": [
@@ -68,6 +70,11 @@ REPOS = [
             "`flow_fast_sam.py` batches up to sixteen frames). VeloMocap prefers "
             "it on a card with 10 GB or more and falls back to `sam3d_full_ts.pt` "
             "below that.",
+            "`sam3d_body_b8_ts.pt` is `--hands body --batch 8`: one body pass, no "
+            "hand crops. VeloMocap runs it on the frames whose hand features are "
+            "interpolated from a neighbour, which is the reference's video "
+            "default (`mocap/flow_hand_sampling.py`: hands every fourth frame, "
+            "body every frame).",
             "The MHR tables were dumped by `tools/onnx/dump_mesh.py`.",
             "Nothing was retrained, fine-tuned or pruned.",
         ],

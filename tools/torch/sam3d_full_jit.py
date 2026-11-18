@@ -1,9 +1,9 @@
-"""Trace `sam3d_full.Sam3dFull` into one TorchScript module.
+﻿"""Trace `sam3d_full.Sam3dFull` into one TorchScript module.
 
     python tools/torch/sam3d_full_jit.py --ckpt ... --mhr ... --config ... --out ...
 
 The graph takes the original frame plus the person box and produces the fused
-mesh, the keypoints, the camera and the model parameters — the whole
+mesh, the keypoints, the camera and the model parameters 鈥?the whole
 `run_inference("full")` path, with the hand crops, the four fusion criteria and
 the keypoint prompt inside the graph. `tools/torch/sam3d_full_check.py` is what
 pins it to the reference before this ever runs.
@@ -84,6 +84,9 @@ def main() -> int:
         help="precision the ViT runs at (the app uses bf16; fp32 is 2x slower "
         "and twice the file but less sensitive to crop-sampling differences)",
     )
+    parser.add_argument("--hands", choices=("full", "body"), default="full",
+                        help="`body` traces run_inference(inference_type='body'): "
+                             "one body pass, no hand crops, empty hand tokens")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch", type=int, default=1,
                         help="Items in the traced batch (one person in one frame "
@@ -108,7 +111,7 @@ def main() -> int:
     print(f"      device {device}, backbone {backbone_dtype}", flush=True)
 
     print("[2/4] building the module ...", flush=True)
-    module = Sam3dFull(model, backbone_dtype=backbone_dtype).eval().to(device)
+    module = Sam3dFull(model, backbone_dtype=backbone_dtype, hands=args.hands == "full").eval().to(device)
     inputs = tuple(t.to(device) for t in sample_inputs(args.seed, args.height, args.width, args.batch))
 
     print("[3/4] reference forward (eager) ...", flush=True)

@@ -48,8 +48,8 @@ pub struct SamConfig {
     /// The reference's ByteTrack runs `track_buffer=60` (`person_tracking.py`) and
     /// `with_reid`, i.e. two seconds at 30 fps, and that is what keeps a body
     /// across a doorway/occlusion. Ours coasted 8 frames (0.27 s), so any longer
-    /// dropout ended the track: the 24 fps source — resampled to 30 fps, where a
-    /// blurred source frame becomes one and a quarter output frames — lost the
+    /// dropout ended the track: the 24 fps source 鈥?resampled to 30 fps, where a
+    /// blurred source frame becomes one and a quarter output frames 鈥?lost the
     /// person near the end, the take stopped there, and the viewport went empty.
     pub max_missing: usize,
     /// Prefer the CUDA execution provider.
@@ -65,9 +65,19 @@ pub struct SamConfig {
     pub mesh_budget: usize,
     /// Optional TorchScript module for the whole SAM pipeline
     /// (`tools/torch/sam3d_full_jit.py`). When it is set, exists, and the build
-    /// has LibTorch, the person pass runs through it instead of the ONNX chain —
+    /// has LibTorch, the person pass runs through it instead of the ONNX chain 鈥?
     /// hands and fusion included, at ~1.1 s/frame on a 5060 Ti.
     pub torch_weights: Option<PathBuf>,
+    /// Every how many frames the hand branch runs (`0` and `1` = every frame).
+    ///
+    /// The reference's default for video is four: `mocap/flow_hand_sampling.py`
+    /// samples `[0, 4, 8, 鈥` plus the last frame, runs the hand pass only there
+    /// and interpolates the hand features for the frames in between, while the
+    /// body pass still runs everywhere. The hand branch is ~two thirds of the
+    /// per-person cost (two 512脳512 crops), so this is the single biggest lever
+    /// the original itself uses. `VELOMOCAP_SAM_HAND_STRIDE=1` restores
+    /// per-frame hands.
+    pub hand_stride: usize,
     /// Boxes the user picked after the detection pass. When non-empty, the cast is
     /// exactly these people: one seed answers to one track on the first frame,
     /// follows that body if the tracker re-numbers it, and its frames always land
@@ -92,6 +102,7 @@ impl Default for SamConfig {
             min_box_height: 0.12,
             mesh_budget: 900 * 1024 * 1024,
             torch_weights: None,
+            hand_stride: 4,
             seed_boxes: Vec::new(),
         }
     }
@@ -103,11 +114,11 @@ pub struct PersonFrame {
     /// Detection box in work-resolution pixels.
     pub bbox: [f32; 4],
     pub score: f32,
-    /// `18439 × 3` vertices, metres, y-up (`x` right, `y` up, `z` forward).
+    /// `18439 脳 3` vertices, metres, y-up (`x` right, `y` up, `z` forward).
     pub verts: Vec<f32>,
-    /// `127 × 3` joint centres, same frame.
+    /// `127 脳 3` joint centres, same frame.
     pub joints: Vec<f32>,
-    /// `70 × 3` named keypoints, same frame.
+    /// `70 脳 3` named keypoints, same frame.
     pub keypoints: Vec<f32>,
     /// Body token for the motion stage (`1024`).
     pub body_token: Vec<f32>,
@@ -117,9 +128,9 @@ pub struct PersonFrame {
     pub right_token: Vec<f32>,
     /// Camera-space translation used for placement.
     pub cam_t: [f32; 3],
-    /// MHR hips in camera coordinates, metres — FlowHMR's placement anchor.
+    /// MHR hips in camera coordinates, metres 鈥?FlowHMR's placement anchor.
     pub anchor_cam: [f32; 3],
-    /// `127 × 8` joint translations plus global quaternions, straight from MHR.
+    /// `127 脳 8` joint translations plus global quaternions, straight from MHR.
     pub skel_state: Vec<f32>,
 }
 
@@ -135,7 +146,7 @@ impl PersonFrame {
 pub struct PersonTrack {
     /// Tracker id, stable across the run.
     pub id: usize,
-    /// `Person 1`, `Person 2`, … in order of first appearance.
+    /// `Person 1`, `Person 2`, 鈥?in order of first appearance.
     pub name: String,
     /// One slot per decoded frame; `None` while the person was not observed.
     pub frames: Vec<Option<Arc<PersonFrame>>>,
@@ -167,7 +178,7 @@ pub struct Timings {
 impl Timings {
     pub fn line(&self) -> String {
         format!(
-            "detect {:.2}s · reconstruct {:.2}s · total {:.2}s",
+            "detect {:.2}s 路 reconstruct {:.2}s 路 total {:.2}s",
             self.detect, self.reconstruct, self.total
         )
     }
@@ -196,7 +207,7 @@ impl PeopleCapture {
         let feet = if feet.is_empty() {
             String::new()
         } else {
-            format!(" · {feet}")
+            format!(" 路 {feet}")
         };
         let meshes: usize = self
             .people
@@ -204,13 +215,13 @@ impl PeopleCapture {
             .map(|p| p.frames.iter().flatten().count())
             .sum();
         format!(
-            "{} people · {} person-frames · {} meshes @ {:.2} fps{}",
+            "{} people 路 {} person-frames 路 {} meshes @ {:.2} fps{}",
             self.people.len(),
             hits,
             meshes,
             self.fps,
             if self.dropped_meshes > 0 {
-                format!(" · {} dropped (mesh budget)", self.dropped_meshes)
+                format!(" 路 {} dropped (mesh budget)", self.dropped_meshes)
             } else {
                 String::new()
             },
@@ -247,6 +258,58 @@ fn module_batch(path: &Path) -> usize {
     1
 }
 
+/// Whether the device has room for the widest batch and both graphs.
+///
+/// A batch of eight peaks around 4 GiB at the app's work resolution, and the
+/// batching plus the two graphs together want about ten; below that the capture
+/// keeps the single-item module and per-frame hands, which still fits.
+fn device_is_roomy() -> bool {
+    velomocap_cpp::sam3d::cuda_memory()
+        .map(|(_, total)| total >= 10 * 1024 * 1024 * 1024)
+        .unwrap_or(false)
+}
+
+/// Whether the device has room for the widest batch *and* both graphs.
+///
+/// The full and the body-only module together hold ~7 GB of weights, and a
+/// batch of eight peaks around 4 GiB on top at the app's work resolution. Below
+/// twelve gigabytes the capture keeps one graph and per-frame hands, which
+/// still fits.
+fn device_has_room_for_two() -> bool {
+    velomocap_cpp::sam3d::cuda_memory()
+        .map(|(_, total)| total >= 12 * 1024 * 1024 * 1024)
+        .unwrap_or(false)
+}
+
+/// The body-only graph (`sam3d_body_b<N>_ts.pt`) traced at the same batch.
+fn find_body_module(config: &SamConfig, batch: usize) -> Option<PathBuf> {
+    let mut roots = vec![config.sam3d_dir.clone()];
+    roots.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../export/sam3d"));
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        let mut found: Option<PathBuf> = None;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            let Some(digits) = name
+                .strip_prefix("sam3d_body_b")
+                .and_then(|rest| rest.strip_suffix("_ts.pt"))
+            else {
+                continue;
+            };
+            if digits.parse::<usize>().ok() == Some(batch) {
+                found = Some(path);
+            }
+        }
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
 /// The TorchScript module a capture should run.
 ///
 /// A batched module costs one call per several people, so it is preferred; the
@@ -265,12 +328,9 @@ fn find_torch_module(config: &SamConfig) -> Option<PathBuf> {
     let forced = std::env::var("VELOMOCAP_SAM_BATCH")
         .ok()
         .and_then(|value| value.parse::<usize>().ok());
-    // A batch of eight peaks around 4 GiB of device memory at the app's work
-    // resolution, so ten gigabytes of card leaves room for everything else.
-    // Below that the single-item module is the safe choice.
-    let roomy = velomocap_cpp::sam3d::cuda_memory()
-        .map(|(_, total)| total >= 10 * 1024 * 1024 * 1024)
-        .unwrap_or(false);
+    // A batch of eight needs a roomy card; below that the single-item module is
+    // the safe choice.
+    let roomy = device_is_roomy();
     let mut best: Option<(usize, PathBuf)> = None;
     for root in roots {
         let Ok(entries) = std::fs::read_dir(&root) else {
@@ -329,7 +389,14 @@ enum SamRunner {
     /// One TorchScript module: `run_inference(inference_type="full")`, hands and
     /// fusion included. See `docs/SAM3D.md`. The module may be traced at a
     /// batch of several items; [`SamRunner::batch`] reports how many.
-    Torch(Box<velomocap_cpp::sam3d::Sam3dTorch>),
+    ///
+    /// `body` is the same graph traced with `inference_type="body"`: one body
+    /// pass and no hand crops. It carries the frames whose hand features are
+    /// interpolated from a neighbour, which is the reference's video default.
+    Torch {
+        full: Box<velomocap_cpp::sam3d::Sam3dTorch>,
+        body: Option<Box<velomocap_cpp::sam3d::Sam3dTorch>>,
+    },
 }
 
 /// One person in one frame, waiting for the module.
@@ -343,13 +410,15 @@ struct PendingJob {
     rgb: Arc<Vec<u8>>,
     width: usize,
     height: usize,
+    /// Whether this item goes through the full graph (hand crops included).
+    hands: bool,
 }
 
 impl SamRunner {
     fn backend(&self) -> String {
         match self {
             Self::Onnx(body) => body.borrow().backend().as_str().to_string(),
-            Self::Torch(_) => "torchscript".to_string(),
+            Self::Torch { .. } => "torchscript".to_string(),
         }
     }
 
@@ -357,8 +426,13 @@ impl SamRunner {
     fn batch(&self) -> usize {
         match self {
             Self::Onnx(_) => 1,
-            Self::Torch(module) => module.batch(),
+            Self::Torch { full, .. } => full.batch(),
         }
+    }
+
+    /// Whether this backend can leave the hand branch out of some frames.
+    fn can_stride_hands(&self) -> bool {
+        matches!(self, Self::Torch { body: Some(_), .. })
     }
 
     /// Run a full batch and return one frame per job, in order.
@@ -385,7 +459,7 @@ impl SamRunner {
                 }
                 Ok(out)
             }
-            Self::Torch(module) => {
+            Self::Torch { full, body } => {
                 let (height, width) = (jobs[0].height, jobs[0].width);
                 let area = width * height;
                 let plane = 3 * area;
@@ -426,6 +500,15 @@ impl SamRunner {
                         cam_int,
                     })
                     .collect();
+                // One queue per graph: the caller never mixes sampled and
+                // unsampled items in a single call.
+                let module = if jobs[0].hands {
+                    full
+                } else {
+                    body.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("this backend has no body-only module")
+                    })?
+                };
                 let outputs = module
                     .run_full_batch(&inputs)
                     .map_err(|error| anyhow::anyhow!("SAM 3D Body (TorchScript): {error}"))?;
@@ -545,6 +628,76 @@ fn flush_batch(
     Ok(())
 }
 
+/// The frames that run the hand branch: `[0, stride, 2路stride, 鈥` plus the
+/// last one 鈥?`mocap/flow_hand_sampling.py::sample_indices` exactly.
+///
+/// A stride of one (or zero) keeps every frame, which is what the module did
+/// before the fast path existed. The last frame is always an anchor so the
+/// interpolation never extrapolates past the end of the clip.
+pub fn hand_sample_indices(frames: usize, stride: usize) -> Vec<usize> {
+    if frames == 0 {
+        return Vec::new();
+    }
+    if stride <= 1 {
+        return (0..frames).collect();
+    }
+    let mut indices: Vec<usize> = (0..frames).step_by(stride).collect();
+    if indices.last() != Some(&(frames - 1)) {
+        indices.push(frames - 1);
+    }
+    indices
+}
+
+/// Fill the hand features of the frames that were not sampled, in place.
+///
+/// `mocap/flow_hand_sampling.py::interpolate_hands`: the anchors are the frames
+/// the hand branch ran on, and every other frame gets the linear blend of its
+/// two neighbouring anchors. The body features are untouched. A track with a
+/// single anchor copies it everywhere, and non-anchor frames that have no
+/// tokens at all (a track that had not started yet) are left alone.
+pub fn interpolate_hand_tokens(frames: &mut [Option<Arc<PersonFrame>>], anchors: &[usize]) {
+    if anchors.len() < 2 {
+        return;
+    }
+    let length = frames.len();
+    let mut left_anchor = 0usize;
+    for index in 0..length {
+        // Anchors are sorted; advance while the next one is still to the right.
+        while left_anchor + 2 < anchors.len() && anchors[left_anchor + 1] <= index {
+            left_anchor += 1;
+        }
+        let left = anchors[left_anchor];
+        let right = anchors[(left_anchor + 1).min(anchors.len() - 1)];
+        if index == left || index == right {
+            continue;
+        }
+        let Some(left_tokens) = frames.get(left).and_then(|frame| frame.as_ref()) else {
+            continue;
+        };
+        let Some(right_tokens) = frames.get(right).and_then(|frame| frame.as_ref()) else {
+            continue;
+        };
+        let (left_tokens, right_tokens) = (left_tokens.clone(), right_tokens.clone());
+        let span = (right - left).max(1) as f32;
+        let weight = (index.saturating_sub(left)) as f32 / span;
+        let blend = |first: &[f32], second: &[f32]| -> Vec<f32> {
+            first
+                .iter()
+                .zip(second.iter())
+                .map(|(a, b)| a * (1.0 - weight) + b * weight)
+                .collect()
+        };
+        let left_token = blend(&left_tokens.left_token, &right_tokens.left_token);
+        let right_token = blend(&left_tokens.right_token, &right_tokens.right_token);
+        if let Some(Some(frame)) = frames.get_mut(index) {
+            let mut copy = (**frame).clone();
+            copy.left_token = left_token;
+            copy.right_token = right_token;
+            *frame = Arc::new(copy);
+        }
+    }
+}
+
 /// Intersection over union of two `[x0, y0, x1, y1]` boxes.
 fn box_iou(first: [f32; 4], second: [f32; 4]) -> f32 {
     let x0 = first[0].max(second[0]);
@@ -562,7 +715,7 @@ fn box_iou(first: [f32; 4], second: [f32; 4]) -> f32 {
 }
 
 /// The `(center, scale)` a person box becomes after `GetBBoxCenterScale(1.25)`
-/// and the two `fix_aspect_ratio` calls in `TopdownAffine` — i.e. what the
+/// and the two `fix_aspect_ratio` calls in `TopdownAffine` 鈥?i.e. what the
 /// reference feeds `prepare_batch`, which the TorchScript module reproduces.
 fn person_box(bbox: [f32; 4]) -> ([f32; 2], [f32; 2]) {
     let center = [(bbox[0] + bbox[2]) * 0.5, (bbox[1] + bbox[3]) * 0.5];
@@ -587,7 +740,7 @@ fn person_box(bbox: [f32; 4]) -> ([f32; 2], [f32; 2]) {
 ///
 /// The seed boxes are the people the user ticked, so each one answers to exactly
 /// one track: a box that overlaps two people (or two tracks for one body) must
-/// not double the cast. A seed with no detection is simply absent for now — the
+/// not double the cast. A seed with no detection is simply absent for now 鈥?the
 /// continuation clause looks for it again on later frames.
 fn seed_assignments(detections: &[(usize, [f32; 4])], seeds: &[[f32; 4]]) -> Vec<Option<usize>> {
     seeds
@@ -636,7 +789,7 @@ struct Pick {
 ///   be accepted as "the same body", which is how one selected person grew into
 ///   two and three people half-way through a take.
 /// * Only once the tracker has retired that track (`missing > max_missing`, so it
-///   can never come back) is the body looked for again under a new id — and then
+///   can never come back) is the body looked for again under a new id 鈥?and then
 ///   with `continues`, i.e. the box the person was last seen in.
 /// * A track already answering to another pick cannot be taken over.
 ///
@@ -823,6 +976,22 @@ pub fn capture_people_with(
         .as_deref()
         .map(module_batch)
         .unwrap_or(1);
+    // The reference's video default samples the hands every fourth frame and
+    // interpolates the features in between (`mocap/flow_hand_sampling.py`).
+    // That needs the body-only graph next to the full one; without it every
+    // frame runs the full pass, which is what the ONNX chain does anyway.
+    // `VELOMOCAP_SAM_HAND_STRIDE=1` restores per-frame hands; the config default
+    // is the reference's four.
+    let hand_stride = std::env::var("VELOMOCAP_SAM_HAND_STRIDE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(config.hand_stride);
+    let body_weights = if torch_weights.is_some() && hand_stride > 1 && device_has_room_for_two()
+    {
+        find_body_module(config, torch_batch)
+    } else {
+        None
+    };
     let body = match torch_weights.as_deref() {
         Some(path) if velomocap_cpp::sam3d::Sam3dTorch::built() => {
             match velomocap_cpp::sam3d::Sam3dTorch::load_batch(path, config.gpu, torch_batch) {
@@ -832,7 +1001,30 @@ pub fn capture_people_with(
                         path.display(),
                         module.batch()
                     );
-                    SamRunner::Torch(Box::new(module))
+                    let body_only = body_weights.as_deref().and_then(|body_path| {
+                        match velomocap_cpp::sam3d::Sam3dTorch::load_batch(
+                            body_path, config.gpu, torch_batch,
+                        ) {
+                            Ok(body_module) => {
+                                eprintln!(
+                                    "[SAM] hands every {} frame(s), body {} elsewhere",
+                                    hand_stride.max(1),
+                                    body_path.display()
+                                );
+                                Some(Box::new(body_module))
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "[SAM] body-only load failed ({error}); hands every frame"
+                                );
+                                None
+                            }
+                        }
+                    });
+                    SamRunner::Torch {
+                        full: Box::new(module),
+                        body: body_only,
+                    }
                 }
                 Err(error) => {
                     eprintln!("[SAM] TorchScript load failed ({error}); falling back to ONNX");
@@ -888,8 +1080,29 @@ pub fn capture_people_with(
     // slot, so the cast cannot grow past the number of seeds.
     let mut picks: Vec<Pick> = Vec::new();
     let mut slots: Vec<Option<usize>> = Vec::new();
-    // People waiting for a batch of `body.batch()` items.
-    let mut pending: Vec<PendingJob> = Vec::new();
+    // People waiting for a batch of `body.batch()` items. Hand frames and body
+    // frames go to different graphs, so each gets its own queue.
+    let mut pending_hands: Vec<PendingJob> = Vec::new();
+    let mut pending_body: Vec<PendingJob> = Vec::new();
+    // The frames the hand branch runs on; the rest are interpolated at the end.
+    // A backend without a body-only graph runs the hands everywhere.
+    let hand_stride = if body.can_stride_hands() {
+        hand_stride.max(1)
+    } else {
+        1
+    };
+    let anchors = hand_sample_indices(total, hand_stride);
+    let mut hands_on_frame = vec![false; total.max(1)];
+    for index in &anchors {
+        hands_on_frame[*index] = true;
+    }
+    if hand_stride > 1 {
+        eprintln!(
+            "[SAM] hands on {} of {} frames (stride {hand_stride}, the reference default)",
+            anchors.len(),
+            total
+        );
+    }
 
     while let Some(frame) = decoder.next_frame()? {
         if (hooks.cancelled)() {
@@ -1002,37 +1215,47 @@ pub fn capture_people_with(
 
         // Queue this frame's people. A module traced at several items per call
         // takes them in batches; the ONNX chain takes them one at a time, which
-        // is the same code with a batch of one.
+        // is the same code with a batch of one. Frames whose hand features are
+        // interpolated go to the body-only graph instead.
         let frame_rgb = Arc::new(frame.rgb.clone());
+        let hands_here = hands_on_frame[index.min(hands_on_frame.len().saturating_sub(1))];
+        let queue = if hands_here {
+            &mut pending_hands
+        } else {
+            &mut pending_body
+        };
         for (slot, detection) in jobs {
             (hooks.progress)(decoded, total, "reconstructing");
             while people[slot].frames.len() <= index {
                 people[slot].frames.push(None);
             }
-            pending.push(PendingJob {
+            queue.push(PendingJob {
                 slot,
                 index,
                 detection,
                 rgb: Arc::clone(&frame_rgb),
                 width: frame.width,
                 height: frame.height,
+                hands: hands_here,
             });
         }
         let batch = body.batch().max(1);
-        while pending.len() >= batch {
-            let count = batch.min(pending.len());
-            let group: Vec<PendingJob> = pending.drain(..count).collect();
-            flush_batch(
-                &mut people,
-                &mesh,
-                config,
-                &body,
-                &group,
-                intrinsics,
-                &mut timings,
-                &mut meshes_stored,
-                &mut dropped_meshes,
-            )?;
+        for queue in [&mut pending_hands, &mut pending_body] {
+            while queue.len() >= batch {
+                let count = batch.min(queue.len());
+                let group: Vec<PendingJob> = queue.drain(..count).collect();
+                flush_batch(
+                    &mut people,
+                    &mesh,
+                    config,
+                    &body,
+                    &group,
+                    intrinsics,
+                    &mut timings,
+                    &mut meshes_stored,
+                    &mut dropped_meshes,
+                )?;
+            }
         }
 
         // Keep every other track's frame list aligned with the clip.
@@ -1050,19 +1273,32 @@ pub fn capture_people_with(
 
     // Whatever is left of the last batch still has to be reconstructed: the
     // module pads it up to its own batch and the extra results are dropped.
-    if !pending.is_empty() && !(hooks.cancelled)() {
-        let group: Vec<PendingJob> = pending.drain(..).collect();
-        flush_batch(
-            &mut people,
-            &mesh,
-            config,
-            &body,
-            &group,
-            intrinsics,
-            &mut timings,
-            &mut meshes_stored,
-            &mut dropped_meshes,
-        )?;
+    if !(hooks.cancelled)() && !(pending_hands.is_empty() && pending_body.is_empty()) {
+        for queue in [&mut pending_hands, &mut pending_body] {
+            if queue.is_empty() {
+                continue;
+            }
+            let group: Vec<PendingJob> = queue.drain(..).collect();
+            flush_batch(
+                &mut people,
+                &mesh,
+                config,
+                &body,
+                &group,
+                intrinsics,
+                &mut timings,
+                &mut meshes_stored,
+                &mut dropped_meshes,
+            )?;
+        }
+        // Fill the hand features of the frames the hand branch skipped, from
+        // their neighbouring anchors (`flow_hand_sampling.py::interpolate_hands`).
+        if hand_stride > 1 {
+            (hooks.progress)(decoded, total, "interpolating hands");
+            for track in people.iter_mut() {
+                interpolate_hand_tokens(&mut track.frames, &anchors);
+            }
+        }
         (hooks.people)(decoded.saturating_sub(1), &people);
     }
 
@@ -1279,7 +1515,7 @@ mod selection_tests {
     }
 
     /// Drive the seeded selection over a scripted run the way the capture loop
-    /// does — identity resolution, then one person slot per seed — and report the
+    /// does 鈥?identity resolution, then one person slot per seed 鈥?and report the
     /// cast and the frames each person got.
     fn run_seeded(frames: &[Step], seeds: &[[f32; 4]]) -> (Vec<PersonTrack>, Vec<Vec<usize>>) {
         let mut picks: Vec<Pick> = Vec::new();

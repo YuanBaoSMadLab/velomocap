@@ -136,15 +136,23 @@ def fix_wrist_euler(wrist_xzy, limits_x=(-2.2, 1.0), limits_z=(-2.2, 1.5),
 
 
 class Sam3dFull(nn.Module):
-    def __init__(self, model, mask_bias=None, backbone_dtype=None):
+    def __init__(self, model, mask_bias=None, backbone_dtype=None, hands=True):
         super().__init__()
         # The shipped config converts the ViT to bfloat16 and leaves everything
         # else float32, so `backbone_dtype=torch.bfloat16` is the precision the
         # app runs at. It is also ~2x faster and roughly halves the traced file.
         if backbone_dtype is not None:
             model.backbone_dtype = backbone_dtype
+        # `hands=False` is `run_inference(inference_type="body")`: one body pass,
+        # no hand crops and no fusion. VeloMocap uses it for the frames whose
+        # hand features come from a neighbour and are interpolated in
+        # (`mocap/flow_hand_sampling.py`), which is the reference's default for
+        # video: hands every fourth frame, body every frame.
+        self.hands = hands
         self.body = BodyPass(model, mask_bias, backbone_dtype)
-        self.hand = HandBranch(model, mask_bias=mask_bias, dtype=backbone_dtype)
+        # A body-only graph never touches the hand branch, so keeping it out of
+        # the module keeps its 1.6 GB of weights out of the traced file too.
+        self.hand = HandBranch(model, mask_bias=mask_bias, dtype=backbone_dtype) if hands else None
         self.bbox_embed = model.bbox_embed
         self.hand_cls_embed = model.hand_cls_embed
         self.head = model.head_pose
@@ -270,6 +278,34 @@ class Sam3dFull(nn.Module):
         )
         joint_rots0 = roma.unitquat_to_rotmat(skel0[:, :, 3:7])
         j2d_crop0 = self._full_to_crop(j2d0, affine)
+
+        if not self.hands:
+            # `run_inference(inference_type="body")`: the first body pass is the
+            # answer, and the hand slots stay empty. The caller fills them from
+            # the nearest sampled frame, exactly like `interpolate_hands`.
+            sign = torch.tensor(
+                [1.0, -1.0, -1.0], dtype=verts0.dtype, device=verts0.device
+            )
+            empty_token = torch.zeros(
+                count, 1024, dtype=normed.dtype, device=normed.device
+            )
+            hand_valid = torch.zeros(count, 2, dtype=pred.dtype, device=pred.device)
+            return (
+                verts0 / 100 * sign,
+                j3d0,
+                j2d0,
+                pred_cam,
+                cam_t0,
+                focal0,
+                model_params,
+                joint_rots0,
+                hand_valid,
+                normed[:, 0],
+                empty_token,
+                empty_token,
+                skel0,
+                pred,
+            )
 
         # -- hand boxes ---------------------------------------------------
         box_tokens = normed[:, 3:5]

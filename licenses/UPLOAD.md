@@ -1,14 +1,14 @@
-﻿# Publishing the converted models - the final list
+# Publishing the converted models - the final list
 
 Rule: a file is ours to publish only when **the release package contains it**
 and **the upstream repository does not**. Everything we tried and dropped stays
 in the development tree and is not published.
 
-Result: **three repositories, ten files, 13.3 GB.**
+Result: **three repositories, eleven files, 16.8 GB.**
 
 | Repository | Files | Size | Licence |
 | --- | --- | --- | --- |
-| `velomocap-sam3d-torchscript` | 6 | 7.06 GB | SAM License |
+| `velomocap-sam3d-torchscript` | 7 | 10.4 GB | SAM License |
 | `velomocap-flowhmr-onnx` | 2 | 1.85 GB | FlowHMR Model Weights License (non-commercial) |
 | `velomocap-vggt-omega-onnx` | 2 | 4.45 GB | FAIR Noncommercial Research License |
 
@@ -50,14 +50,18 @@ python tools\stage_model_upload.py --out E:\model-upload
 
 The packaged application runs SAM 3D Body through LibTorch and loads
 `models/sam3d/sam3d_full_b8_ts.pt` (one call reconstructs up to eight people,
-the batching the reference itself uses); `models/sam3d/sam3d_full_ts.pt` is the
-same graph at one person per call, which the application keeps for a card under
-10 GB. The ONNX export of the same model is not in the package and is not
+the batching the reference itself uses); `models/sam3d/sam3d_body_b8_ts.pt` is
+the same graph with the hand crops left out, which runs the frames whose hand
+features are interpolated from a neighbour (the reference's video default:
+hands every fourth frame, body every frame); `models/sam3d/sam3d_full_ts.pt` is
+the same graph at one person per call, which the application keeps for a card
+under 10 GB. The ONNX export of the same model is not in the package and is not
 published.
 
 | File | Bytes | SHA-256 |
 | --- | --- | --- |
 | `sam3d_full_b8_ts.pt` | 3,533,437,384 | `88ca5d6e2daaf132d1e9cc26b152f0e0aa2941ed58738f5cf3c290086c8c79d4` |
+| `sam3d_body_b8_ts.pt` | 3,341,596,466 | `07db1c511c80ad5861f60c232f6bb1b4a4f039071e3625a01c59de8a6ae14622` |
 | `sam3d_full_ts.pt` | 3,533,327,692 | `476d31ee0a26f1140ffc5fd44b3e64fc7ace8da4d112a3164bff8c5f5d16d9f6` |
 | `sam3d_faces.bin` | 442,488 | `f6748e290ef37fbb6877c4cc5bd7287105db9e98252b0ba170ae9ac3c45eacd6` |
 | `sam3d_keypoints.bin` | 6,540 | `532b75ddb6e1650be033b80f79545eeb54eaf05298cef0bd63b9bc36e72fc4e6` |
@@ -67,12 +71,12 @@ published.
 Add: `LICENSE` (the SAM License, verbatim from `licenses/SAM-LICENSE.txt`) and
 `NOTICE.md` (the SAM section of `licenses/CONVERSION-NOTICES.md`).
 
-Both `.pt` files are traced per build, so a re-trace changes the hash. If you
-would rather not host 7 GB, keep the batch-8 module only and say in the README
-that a card under 10 GB runs it one item at a time; or drop the repository
-entirely and say the user traces it themselves with
-`tools/torch/sam3d_full_jit.py` from Meta's gated `model.ckpt` - the package
-then stops being drop-in.
+All three `.pt` files are traced per build, so a re-trace changes the hash. If
+you would rather not host 10 GB, keep the batch-8 pair and drop
+`sam3d_full_ts.pt`, saying in the README that a card under 10 GB falls back to
+the ONNX chain; or drop the repository entirely and say the user traces it
+themselves with `tools/torch/sam3d_full_jit.py` from Meta's gated `model.ckpt` -
+the package then stops being drop-in.
 
 ---
 
@@ -159,6 +163,8 @@ New-Item -ItemType HardLink -Path "$stage\velomocap-sam3d-torchscript\sam3d_full
   -Target "$root\..\export\sam3d\sam3d_full_ts.pt"
 New-Item -ItemType HardLink -Path "$stage\velomocap-sam3d-torchscript\sam3d_full_b8_ts.pt" `
   -Target "$root\..\export\sam3d\sam3d_full_b8_ts.pt"
+New-Item -ItemType HardLink -Path "$stage\velomocap-sam3d-torchscript\sam3d_body_b8_ts.pt" `
+  -Target "$root\..\export\sam3d\sam3d_body_b8_ts.pt"
 Copy-Item "$root\licenses\SAM-LICENSE.txt" "$stage\velomocap-sam3d-torchscript\LICENSE"
 
 # 2. FlowHMR
@@ -190,7 +196,7 @@ ModelScope: same three names, `ms-hub upload <namespace>/<repo> <folder>
 
 ## Before you publish
 
-- [ ] Only the ten files above are in the staging folders.
+- [ ] Only the eleven files above are in the staging folders.
 - [ ] Each repository has the upstream licence text, verbatim, under the file
       name its own convention uses (`LICENSE`, `LICENSE-flowhmr-weights`,
       `LICENSE.txt`).
