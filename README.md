@@ -114,6 +114,14 @@ weight comes from. SMPL-H must be downloaded from
 [smpl.is.tue.mpg.de](https://smpl.is.tue.mpg.de/) after registration and placed at
 `models/body_models/smplh/neutral/model.npz`.
 
+Most of the model files are ONNX conversions made here, and a conversion is a derivative
+work: it keeps the licence of the weights it came from. [licenses/README.md](licenses/README.md)
+lists every file with its upstream, its licence and whether it was converted;
+[licenses/](licenses/) holds the verbatim texts that must travel with the converted
+weights, says which upstreams may not be redistributed (SMPL-H, YOLOv8), and
+[licenses/UPLOAD.md](licenses/UPLOAD.md) describes how to publish the allowed ones on
+Hugging Face or ModelScope.
+
 ## Releases
 
 Tags mark the source that produced a working build. No binaries, archives or installers are

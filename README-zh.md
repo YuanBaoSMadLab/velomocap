@@ -106,6 +106,12 @@ ONNX Runtime / LibTorch / ffmpeg 二进制各有自己的许可，需要单独�
 SMPL-H 需要在 [smpl.is.tue.mpg.de](https://smpl.is.tue.mpg.de/) 注册后下载，放到
 `models/body_models/smplh/neutral/model.npz`。
 
+`models/` 里多数文件是这里**转换**出来的（ONNX 导出、TorchScript 追踪）。转换件是衍生
+作品，不会获得新许可，仍受原权重条款约束：[licenses/README-zh.md](licenses/README-zh.md)
+逐文件列出上游、许可证、是否转换、能否再分发，[licenses/](licenses/) 里是必须随转换件
+一起分发的许可证全文，并写明哪些上游**不能**再分发（SMPL-H、YOLOv8）；
+[licenses/UPLOAD.md](licenses/UPLOAD.md) 是发布到 Hugging Face / 魔搭的操作清单。
+
 ## 发布说明
 
 Tag 只标注对应的源码。**不发布任何二进制、压缩包或安装程序**，请按上面的步骤自行构建。
