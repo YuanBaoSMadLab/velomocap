@@ -220,6 +220,40 @@ Reproduced verbatim in LICENSE. This conversion is a derivative work of
 <upstream>, published under the same terms. <Attribution/citation requirement>.
 ```
 
+## 中文卡片模板（魔搭 / ModelScope 用）
+
+```markdown
+# <名称> — VeloMocap 的 ONNX 转换版
+
+<上游模型> 的 ONNX Runtime 版本，由官方 checkpoint 转换而来，让
+[VeloMocap](https://github.com/YuanBaoSMadLab/velomocap) 不需要 PyTorch 就能运行。
+**<仅限非商业研究使用 / 遵守 SAM 许可证，见 LICENSE>。**
+
+## 上游
+
+* 模型：<链接>，版本 <commit>
+* 权重：<checkpoint 文件>，<字节数>，sha256 <...>
+* 论文：<引用>
+
+## 我们改了什么
+
+* 用 `tools/onnx/<脚本>.py` 导出为 fp32 ONNX，没有重新训练。
+* <权重打包进 `.weights.bin` 旁文件 | 固定 512x288 输入 | RoPE 与注意力掩码改为图输入>
+* 与 PyTorch 参考实现对齐：最大绝对误差 <数值>。
+
+## 文件
+
+见仓库文件列表（含每个文件的大小与 sha256）。
+
+## 使用方式
+
+放进 VeloMocap 的 `models/sam3d/` 或 `models/flowhmr/`；权重不在源码仓库里。
+
+## 许可证
+
+全文见 LICENSE。本转换件是 <上游> 的衍生作品，按同样的条款发布。<署名/引用要求>。
+```
+
 ## Checklist before you publish
 
 - [ ] The staging folder holds only files from the tables above.
