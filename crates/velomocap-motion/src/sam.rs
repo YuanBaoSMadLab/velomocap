@@ -252,6 +252,10 @@ fn module_batch(path: &Path) -> usize {
 /// A batched module costs one call per several people, so it is preferred; the
 /// widest batch wins. `VELOMOCAP_SAM_BATCH=<n>` pins a specific one (0 and 1
 /// both mean the single-item module), which is how the two are A/B'd.
+///
+/// A wide batch holds several frames and their hand crops at once, so on a
+/// small device the capture keeps the single-item module: the point of the
+/// batch is speed, and an out-of-memory failure has none.
 fn find_torch_module(config: &SamConfig) -> Option<PathBuf> {
     let mut roots = vec![config.sam3d_dir.clone()];
     // Dev tree: `tools/torch/sam3d_full_jit.py` writes into `export/sam3d/`,
@@ -261,6 +265,12 @@ fn find_torch_module(config: &SamConfig) -> Option<PathBuf> {
     let forced = std::env::var("VELOMOCAP_SAM_BATCH")
         .ok()
         .and_then(|value| value.parse::<usize>().ok());
+    // A batch of eight peaks around 4 GiB of device memory at the app's work
+    // resolution, so ten gigabytes of card leaves room for everything else.
+    // Below that the single-item module is the safe choice.
+    let roomy = velomocap_cpp::sam3d::cuda_memory()
+        .map(|(_, total)| total >= 10 * 1024 * 1024 * 1024)
+        .unwrap_or(false);
     let mut best: Option<(usize, PathBuf)> = None;
     for root in roots {
         let Ok(entries) = std::fs::read_dir(&root) else {
@@ -280,6 +290,8 @@ fn find_torch_module(config: &SamConfig) -> Option<PathBuf> {
                 if batch != forced.max(1) {
                     continue;
                 }
+            } else if batch > 1 && !roomy {
+                continue;
             }
             if best.as_ref().map_or(true, |(top, _)| batch > *top) {
                 best = Some((batch, path));

@@ -47,22 +47,33 @@ REPOS = [
                    "Commercial use is allowed by the SAM License; the licence text "
                    "must travel with the files.",
         "files": [
+            ("sam3d/sam3d_full_b8_ts.pt", "sam3d_full_b8_ts.pt"),
             ("sam3d/sam3d_full_ts.pt", "sam3d_full_ts.pt"),
             ("sam3d/sam3d_faces.bin", "sam3d_faces.bin"),
             ("sam3d/sam3d_keypoints.bin", "sam3d_keypoints.bin"),
             ("sam3d/sam3d_skeleton.bin", "sam3d_skeleton.bin"),
             ("sam3d/sam3d_mesh.json", "sam3d_mesh.json"),
         ],
-        "extra_sources": {"sam3d_full_ts.pt": "../export/sam3d/sam3d_full_ts.pt"},
+        "extra_sources": {
+            "sam3d_full_b8_ts.pt": "../export/sam3d/sam3d_full_b8_ts.pt",
+            "sam3d_full_ts.pt": "../export/sam3d/sam3d_full_ts.pt",
+        },
         "changed": [
             "Traced from `model.ckpt` and `assets/mhr_model.pt` by "
             "`tools/torch/sam3d_full_jit.py`: backbone, both hands, fusion and the "
             "MHR geometry in one graph, fp32.",
+            "`sam3d_full_b8_ts.pt` is the same graph traced at `--batch 8`: one "
+            "call reconstructs up to eight people, which is what the reference "
+            "does (its `flow_sam.py` passes every box of a frame at once and its "
+            "`flow_fast_sam.py` batches up to sixteen frames). VeloMocap prefers "
+            "it on a card with 10 GB or more and falls back to `sam3d_full_ts.pt` "
+            "below that.",
             "The MHR tables were dumped by `tools/onnx/dump_mesh.py`.",
             "Nothing was retrained, fine-tuned or pruned.",
         ],
         "verified": "Largest vertex difference **1.5e-5 m** against the PyTorch "
-                    "reference (fp32); keypoints and camera within 1e-3.",
+                    "reference (fp32); keypoints and camera within 1e-3. The "
+                    "batch-8 graph reproduces the batch-1 graph to 7.7e-7 per item.",
         "extra_note": "Loaded by LibTorch, not by ONNX Runtime. The ONNX export of "
                       "this model exists in the development tree but is not used by "
                       "the release and is not published here.",

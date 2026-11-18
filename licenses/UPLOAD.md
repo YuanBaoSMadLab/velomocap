@@ -1,14 +1,14 @@
-# Publishing the converted models - the final list
+﻿# Publishing the converted models - the final list
 
 Rule: a file is ours to publish only when **the release package contains it**
 and **the upstream repository does not**. Everything we tried and dropped stays
 in the development tree and is not published.
 
-Result: **three repositories, nine files, 9.8 GB.**
+Result: **three repositories, ten files, 13.3 GB.**
 
 | Repository | Files | Size | Licence |
 | --- | --- | --- | --- |
-| `velomocap-sam3d-torchscript` | 5 | 3.53 GB | SAM License |
+| `velomocap-sam3d-torchscript` | 6 | 7.06 GB | SAM License |
 | `velomocap-flowhmr-onnx` | 2 | 1.85 GB | FlowHMR Model Weights License (non-commercial) |
 | `velomocap-vggt-omega-onnx` | 2 | 4.45 GB | FAIR Noncommercial Research License |
 
@@ -49,11 +49,15 @@ python tools\stage_model_upload.py --out E:\model-upload
 ## 1. `velomocap-sam3d-torchscript` - SAM License
 
 The packaged application runs SAM 3D Body through LibTorch and loads
-`models/sam3d/sam3d_full_ts.pt`; it is the only SAM weight the release needs.
-The ONNX export of the same model is not in the package and is not published.
+`models/sam3d/sam3d_full_b8_ts.pt` (one call reconstructs up to eight people,
+the batching the reference itself uses); `models/sam3d/sam3d_full_ts.pt` is the
+same graph at one person per call, which the application keeps for a card under
+10 GB. The ONNX export of the same model is not in the package and is not
+published.
 
 | File | Bytes | SHA-256 |
 | --- | --- | --- |
+| `sam3d_full_b8_ts.pt` | 3,533,437,384 | `88ca5d6e2daaf132d1e9cc26b152f0e0aa2941ed58738f5cf3c290086c8c79d4` |
 | `sam3d_full_ts.pt` | 3,533,327,692 | `476d31ee0a26f1140ffc5fd44b3e64fc7ace8da4d112a3164bff8c5f5d16d9f6` |
 | `sam3d_faces.bin` | 442,488 | `f6748e290ef37fbb6877c4cc5bd7287105db9e98252b0ba170ae9ac3c45eacd6` |
 | `sam3d_keypoints.bin` | 6,540 | `532b75ddb6e1650be033b80f79545eeb54eaf05298cef0bd63b9bc36e72fc4e6` |
@@ -63,10 +67,12 @@ The ONNX export of the same model is not in the package and is not published.
 Add: `LICENSE` (the SAM License, verbatim from `licenses/SAM-LICENSE.txt`) and
 `NOTICE.md` (the SAM section of `licenses/CONVERSION-NOTICES.md`).
 
-`sam3d_full_ts.pt` is traced per build, so a re-trace changes the hash. If you
-would rather not host 3.5 GB, drop this repository and say in the README that
-the user traces it themselves with `tools/torch/sam3d_full_jit.py` from Meta's
-gated `model.ckpt` - the package then stops being drop-in.
+Both `.pt` files are traced per build, so a re-trace changes the hash. If you
+would rather not host 7 GB, keep the batch-8 module only and say in the README
+that a card under 10 GB runs it one item at a time; or drop the repository
+entirely and say the user traces it themselves with
+`tools/torch/sam3d_full_jit.py` from Meta's gated `model.ckpt` - the package
+then stops being drop-in.
 
 ---
 
@@ -151,6 +157,8 @@ foreach ($f in 'sam3d_faces.bin','sam3d_keypoints.bin','sam3d_skeleton.bin','sam
 }
 New-Item -ItemType HardLink -Path "$stage\velomocap-sam3d-torchscript\sam3d_full_ts.pt" `
   -Target "$root\..\export\sam3d\sam3d_full_ts.pt"
+New-Item -ItemType HardLink -Path "$stage\velomocap-sam3d-torchscript\sam3d_full_b8_ts.pt" `
+  -Target "$root\..\export\sam3d\sam3d_full_b8_ts.pt"
 Copy-Item "$root\licenses\SAM-LICENSE.txt" "$stage\velomocap-sam3d-torchscript\LICENSE"
 
 # 2. FlowHMR
@@ -182,7 +190,7 @@ ModelScope: same three names, `ms-hub upload <namespace>/<repo> <folder>
 
 ## Before you publish
 
-- [ ] Only the nine files above are in the staging folders.
+- [ ] Only the ten files above are in the staging folders.
 - [ ] Each repository has the upstream licence text, verbatim, under the file
       name its own convention uses (`LICENSE`, `LICENSE-flowhmr-weights`,
       `LICENSE.txt`).
