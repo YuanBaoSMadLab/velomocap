@@ -31,10 +31,9 @@ script in `tools/`; the upstream checkpoint itself is what the licence covers.
 
 | Files | Upstream | Licence | Converted here | Ship with a converted copy? |
 | --- | --- | --- | --- | --- |
-| `models/sam3d/sam3d_backbone.onnx` + `.weights.bin`, `sam3d_init/pose/post/step0..5.onnx` | SAM 3D Body `model.ckpt` | SAM License | yes - ONNX export, fp32, packed sidecar | yes, with `SAM-LICENSE.txt` |
-| `models/sam3d/mhr_model.onnx` | SAM 3D Body `assets/mhr_model.pt` | SAM License | yes - ONNX export | yes, with `SAM-LICENSE.txt` |
-| `models/sam3d/sam3d_params.{json,bin}`, `sam3d_mesh.json`, `sam3d_faces.bin`, `sam3d_skeleton.bin`, `sam3d_keypoints.bin`, `sam3d_split.json` | SAM 3D Body / MHR | SAM License | yes - tables extracted from the checkpoint | yes, with `SAM-LICENSE.txt` |
-| `export/sam3d/sam3d_full_ts.pt` (LibTorch path, not in git) | SAM 3D Body + hands | SAM License | yes - whole pipeline traced to TorchScript | yes, with `SAM-LICENSE.txt` |
+| `export/sam3d/sam3d_full_ts.pt` (packaged into `models/sam3d/`, not in git) | SAM 3D Body + hands | SAM License | yes - whole pipeline traced to TorchScript | yes, with `SAM-LICENSE.txt` |
+| `models/sam3d/sam3d_mesh.json`, `sam3d_faces.bin`, `sam3d_skeleton.bin`, `sam3d_keypoints.bin` | SAM 3D Body / MHR | SAM License | yes - topology tables extracted from the checkpoint | yes, with `SAM-LICENSE.txt` |
+| `models/sam3d/sam3d_backbone.onnx` + `.weights.bin`, `sam3d_init/pose/post/step0..5.onnx`, `mhr_model.onnx`, `sam3d_params.{json,bin}`, `sam3d_split.json` | SAM 3D Body `model.ckpt` | SAM License | yes - ONNX export, fp32, packed sidecar | **no** - abandoned route: the packaged build runs SAM through LibTorch, so these are not shipped and not published |
 | `models/flowhmr/flowhmr_mmdit.onnx` + `.weights.bin` | FlowHMR 0.46B `flowhmr_latest.ckpt` | FlowHMR Model Weights License | yes - ONNX export, fp32, ODE loop stays in Rust | yes, **non-commercial**, with its licence |
 | `models/flowhmr/config.yml`, `motion_stats.json` | FlowHMR | FlowHMR Model Weights License | unchanged (hash matches upstream) | yes |
 | `models/flowhmr/vggt_omega_1b_512.onnx` + `.weights.bin` | VGGT-Omega 1B `vggt_omega_1b_512.pt` | FAIR Noncommercial Research License | yes - ONNX export at a fixed 512x288 canvas | yes, **non-commercial**, with its licence |

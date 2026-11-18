@@ -30,20 +30,31 @@ the notice says which file is under which.
 
 ## Which files exist upstream, and which are ours
 
-| Upstream repository | Files it contains | Files we add (must be published by us) |
+Only what the **packaged application actually loads** is listed. Anything else
+in the development tree is a route we abandoned - the ONNX SAM chain is the big
+one, and it is neither in the release nor published.
+
+| Upstream repository | Files it contains | Files we publish (ours) |
 | --- | --- | --- |
-| `facebook/sam-3d-body-dinov3` | `LICENSE`, `README.md`, `model.ckpt`, `model_config.yaml`, `assets/mhr_model.pt` | all 11 ONNX graphs + `sam3d_backbone.weights.bin`, `mhr_model.onnx`, `sam3d_params.{json,bin}`, `sam3d_mesh.json`, `sam3d_faces.bin`, `sam3d_skeleton.bin`, `sam3d_keypoints.bin`, `sam3d_split.json`, and the traced `sam3d_full_ts.pt` |
-| `fafsaf1/flowhmr-0.46B` | `LICENSE`, `README.md`, `config.json`, `flowhmr_base/*`, `flowhmr_latest/*` | `flowhmr_mmdit.onnx` + `flowhmr_mmdit.weights.bin` (both are ours) |
-| `flowhmr/flowhmr` (code, Apache-2.0) | the pipeline, `assets/motion_stats.json`, `config.yml` | nothing - we redistribute these two unchanged |
+| `facebook/sam-3d-body-dinov3` | `LICENSE`, `README.md`, `model.ckpt`, `model_config.yaml`, `assets/mhr_model.pt` | the traced `sam3d_full_ts.pt` plus the four MHR tables `sam3d_mesh.json`, `sam3d_faces.bin`, `sam3d_skeleton.bin`, `sam3d_keypoints.bin` |
+| `fafsaf1/flowhmr-0.46B` | `LICENSE`, `README.md`, `config.json`, `flowhmr_base/*`, `flowhmr_latest/*` | `flowhmr_mmdit.onnx` + `flowhmr_mmdit.weights.bin` |
+| `flowhmr/flowhmr` (code, Apache-2.0) | the pipeline, `assets/motion_stats.json`, `config.yml` | nothing - these two are redistributed unchanged, with their Apache-2.0 licence |
 | `facebook/VGGT-Omega` | `LICENSE.txt`, `README.md`, three `.pt` checkpoints | `vggt_omega_1b_512.onnx` + `vggt_omega_1b_512.weights.bin` |
 | `ultralytics/assets` | `yolov8x.pt` (AGPL-3.0) | `yolov8x.onnx` - **not published**, see `ULTRALYTICS-YOLOV8-NOTICE.md` |
+
+**Not published, and not part of the release:** the ONNX SAM chain
+(`sam3d_backbone.onnx` + sidecar, `sam3d_init/pose/post/step0..5.onnx`,
+`mhr_model.onnx`, `sam3d_params.{json,bin}`, `sam3d_split.json`). The packaged
+build runs SAM through LibTorch with the single traced module; the ONNX graphs
+and the parameter tables they read exist only in the development tree. Same for
+`yolov8x-pose.onnx`, SMPL-X and the original checkpoints.
 
 ---
 
 ## NOTICE.md for `velomocap-sam3d-onnx`
 
 ```markdown
-# SAM 3D Body - ONNX and TorchScript conversion for VeloMocap
+# SAM 3D Body - TorchScript conversion for VeloMocap
 
 This repository is a **conversion** of SAM 3D Body by Meta, published so that
 [VeloMocap](https://github.com/YuanBaoSMadLab/velomocap) can run the model
@@ -61,29 +72,30 @@ or of any file in it must keep `LICENSE` with it.
 
 ## Files we made
 
-| File | What it is |
-| --- | --- |
-| `sam3d_backbone.onnx`, `sam3d_backbone.weights.bin` | DINOv3 backbone, weights in a sidecar |
-| `sam3d_init.onnx`, `sam3d_pose.onnx`, `sam3d_post.onnx` | encoder, pose head, decoder |
-| `sam3d_step0.onnx` .. `sam3d_step5.onnx` | the six sampling steps, weights inline |
-| `mhr_model.onnx` | MHR geometry module |
-| `sam3d_params.json`, `sam3d_params.bin` | parameter tables the Rust decoder reads |
-| `sam3d_mesh.json`, `sam3d_faces.bin`, `sam3d_keypoints.bin`, `sam3d_skeleton.bin` | MHR topology: 18439 vertices, 36874 faces, 127 joints, 70 keypoints |
-| `sam3d_split.json` | which file holds which subgraph |
-| `sam3d_full_ts.pt` (optional) | the whole pipeline traced as one TorchScript module, for LibTorch |
+| File | Size | What it is |
+| --- | --- | --- |
+| `sam3d_full_ts.pt` | 3,533,327,692 B | the whole pipeline - backbone, hands, fusion, MHR geometry - traced as one TorchScript module for LibTorch. This is what the application loads. |
+| `sam3d_mesh.json` | 325 B | MHR topology description: 18439 vertices, 36874 faces, 127 joints, 70 keypoints, and the file names of the three tables below |
+| `sam3d_faces.bin` | 442,488 B | triangle indices, uint32 little-endian |
+| `sam3d_skeleton.bin` | 2,032 B | the 127-joint skeleton |
+| `sam3d_keypoints.bin` | 6,540 B | the 70-keypoint regressor |
+
+The ONNX export of this model (eleven graphs plus a weights sidecar and the
+parameter tables they read) is **not** part of this repository: that route is not
+used by the application any more.
 
 ## How it was made
 
-Exported on CPU in fp32 by `tools/onnx/sam3d_export.py`, `sam3d_split.py` and
-`pack_onnx.py`, and traced by `tools/torch/sam3d_full_jit.py`, from this
-repository's `tools/` directory. Nothing was retrained, fine-tuned or pruned.
+Traced on CPU in fp32 by `tools/torch/sam3d_full_jit.py`, and the MHR tables
+dumped by `tools/onnx/dump_mesh.py`, from this repository's `tools/` directory.
+Nothing was retrained, fine-tuned or pruned.
 
 ## Verification
 
 The ONNX chain and the TorchScript module were compared against the original
 PyTorch model on the same inputs: largest vertex difference **1.5e-5 m**
-(fp32), keypoint and camera outputs within 1e-3. Reproduce with the scripts in
-`tools/onnx` and `velomocap-cli` parity commands.
+(fp32), keypoint and camera outputs within 1e-3. Reproduce with
+`tools/torch/sam3d_full_check.py` and the fixtures kept for the Rust port.
 
 ## Citation
 
