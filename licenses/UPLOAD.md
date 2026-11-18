@@ -1,279 +1,161 @@
-# Publishing the converted models (Hugging Face / ModelScope)
+# Publishing the converted models - the final list
 
-This is the checklist for putting the ONNX conversions on a model hub. It is an
-engineering note, not legal advice: the licence texts in this folder decide, and
-a lawyer should look at anything commercial.
+Rule: a file is ours to publish only when **the release package contains it**
+and **the upstream repository does not**. Everything we tried and dropped stays
+in the development tree and is not published.
 
-Three repositories, one per upstream licence. Do not mix them: FlowHMR and
-VGGT-Omega are non-commercial, SAM 3D Body is not, and a reader has to be able
-to tell which terms apply to what they download.
+Result: **three repositories, nine files, 9.8 GB.**
 
-Each repository carries two documents, and the difference matters: the `LICENSE`
-is the **upstream text, verbatim** - a converted weight is a derivative work and
-cannot be relicensed - and `NOTICE.md` is our conversion notice: what the
-repository is, which files we made, how they were verified. Ready-to-publish
-notices for all three are in [CONVERSION-NOTICES.md](CONVERSION-NOTICES.md).
-
-| Repository (suggested name) | Contents | Licence | Size |
+| Repository | Files | Size | Licence |
 | --- | --- | --- | --- |
-| `velomocap-sam3d-onnx` | the traced TorchScript pipeline (`sam3d_full_ts.pt`) + the four MHR tables | SAM License | 3.29 GB |
-| `velomocap-flowhmr-onnx` | FlowHMR MMDiT graph + sidecar weights, plus `config.yml` and `motion_stats.json` from the Apache-2.0 code repository | FlowHMR Model Weights License + Apache-2.0 | ~1.85 GB |
-| `velomocap-vggt-omega-onnx` | VGGT-Omega 1B graph + sidecar weights | FAIR Noncommercial Research License | ~4.45 GB |
+| `velomocap-sam3d-onnx` | 5 | 3.53 GB | SAM License |
+| `velomocap-flowhmr-onnx` | 2 | 1.85 GB | FlowHMR Model Weights License (non-commercial) |
+| `velomocap-vggt-omega-onnx` | 2 | 4.45 GB | FAIR Noncommercial Research License |
 
-Use the same names under your ModelScope namespace so the two hubs stay
-comparable.
+---
 
-## Do not upload
+## 1. `velomocap-sam3d-onnx` - SAM License
 
-* `models/body_models/smplh/**`, `models/body_models/smplx/**` - see
-  `SMPL-NOTICE.md`; the user must register and download these.
-* `models/detector/yolov8*.onnx` - AGPL-3.0, see `ULTRALYTICS-YOLOV8-NOTICE.md`.
-  Publish `tools/export_yolo.py` instead.
-* `models/characters/*.glb` - Epic/Adobe assets bound to their engines.
-* `runtime/**` - ONNX Runtime, LibTorch, CUDA/cuDNN, ffmpeg binaries; each has
-  its own terms and most of them do not allow passing the binaries on.
-* The abandoned ONNX SAM chain (`sam3d_backbone.onnx` + sidecar, the ten other
-  `sam3d_*.onnx` graphs, `mhr_model.onnx`, `sam3d_params.*`,
-  `sam3d_split.json`) - the packaged application does not load any of it, so
-  there is nothing to publish; it exists only in the development tree.
-* The original checkpoints (`flowhmr_latest.ckpt`, `model.ckpt`,
-  `mhr_model.pt`, `vggt_omega_1b_512.pt`) - point readers at the upstream
-  repositories instead of mirroring 10 GB of Meta/FlowHMR files.
-
-## Files and checksums
-
-Sizes and SHA-256 of exactly the bytes that are expected on the hub. Verify a
-download with `Get-FileHash <file> -Algorithm SHA256`.
-
-### velomocap-sam3d-onnx (SAM License)
+The packaged application runs SAM 3D Body through LibTorch and loads
+`models/sam3d/sam3d_full_ts.pt`; it is the only SAM weight the release needs.
+The ONNX export of the same model is not in the package and is not published.
 
 | File | Bytes | SHA-256 |
 | --- | --- | --- |
-| `sam3d_full_ts.pt` | 3,533,327,692 | `476D31EE0A26F1140FFC5FD44B3E64FC7ACE8DA4D112A3164BFF8C5F5D16D9F6` |
-| `sam3d_mesh.json` | 325 | `04430BF3908A102F3130D660A0EED32CB6DA4E53CEC10D9707F0E35FBECD4E3C` |
-| `sam3d_faces.bin` | 442,488 | `F6748E290EF37FBB6877C4CC5BD7287105DB9E98252B0BA170AE9AC3C45EACD6` |
-| `sam3d_skeleton.bin` | 2,032 | `BF8080B0D21E9B2469CD1B84C62DA475EC560EF9743341A011AAC57BC90F61E9` |
-| `sam3d_keypoints.bin` | 6,540 | `532B75DDB6E1650BE033B80F79545EEB54EAF05298CEF0BD63B9BC36E72FC4E6` |
-| `LICENSE` | - | the SAM License, from `licenses/SAM-LICENSE.txt` |
-| `NOTICE.md` | - | the SAM section of `licenses/CONVERSION-NOTICES.md` |
+| `sam3d_full_ts.pt` | 3,533,327,692 | `476d31ee0a26f1140ffc5fd44b3e64fc7ace8da4d112a3164bff8c5f5d16d9f6` |
+| `sam3d_faces.bin` | 442,488 | `f6748e290ef37fbb6877c4cc5bd7287105db9e98252b0ba170ae9ac3c45eacd6` |
+| `sam3d_keypoints.bin` | 6,540 | `532b75ddb6e1650be033b80f79545eeb54eaf05298cef0bd63b9bc36e72fc4e6` |
+| `sam3d_skeleton.bin` | 2,032 | `bf8080b0d21e9b2469cd1b84c62da475ec560ef9743341a011aac57bc90f61e9` |
+| `sam3d_mesh.json` | 325 | `04430bf3908a102f3130d660a0eed32cb6da4e53cec10d9707f0e35fbecd4e3c` |
 
-That is the whole repository: 3.29 GiB, five files. The ONNX export of SAM 3D
-Body (eleven graphs, a 3.1 GiB backbone sidecar, `mhr_model.onnx`,
-`sam3d_params.*`, `sam3d_split.json`) is an abandoned route: the packaged
-application loads the traced module instead, so those files are neither shipped
-nor published. `sam3d_full_ts.pt` is regenerated per build with
-`tools/torch/sam3d_full_jit.py` - if you re-trace it, the SHA-256 changes.
+Add: `LICENSE` (the SAM License, verbatim from `licenses/SAM-LICENSE.txt`) and
+`NOTICE.md` (the SAM section of `licenses/CONVERSION-NOTICES.md`).
 
-### velomocap-flowhmr-onnx (FlowHMR Model Weights License, non-commercial)
+`sam3d_full_ts.pt` is traced per build, so a re-trace changes the hash. If you
+would rather not host 3.5 GB, drop this repository and say in the README that
+the user traces it themselves with `tools/torch/sam3d_full_jit.py` from Meta's
+gated `model.ckpt` - the package then stops being drop-in.
 
-| File | Bytes | SHA-256 |
-| --- | --- | --- |
-| `flowhmr_mmdit.onnx` | 4,118,877 | `29D7390E58D4635A9CEFE3574297CB284BCA3AE9F6B6CA1765D8D305B7C33F0C` |
-| `flowhmr_mmdit.weights.bin` | 1,841,575,852 | `4E08A4F175E431005E6723EE3340E7C01AA016827FE97395140F31D863D34EDD` |
-| `config.yml` | 3,067 | `5DEAE01800C031975558BF9675819E8D1E24803414F692B8B5C2196B266C64D7` |
-| `motion_stats.json` | 169,611 | `6E0F2C4F5B24FE5805C93ED8B25728E466269941070A545640E51B180C315908` |
-| `LICENSE-flowhmr-weights` | - | `licenses/FlowHMR-Model-Weights-LICENSE.txt` (the converted weights) |
-| `LICENSE-Apache-2.0` | - | the FlowHMR code repository's licence, for `config.yml` and `motion_stats.json` |
-| `NOTICE.md` | - | the FlowHMR section of `licenses/CONVERSION-NOTICES.md`, which maps file to licence |
+---
 
-### velomocap-vggt-omega-onnx (FAIR Noncommercial Research License)
+## 2. `velomocap-flowhmr-onnx` - FlowHMR Model Weights License
 
 | File | Bytes | SHA-256 |
 | --- | --- | --- |
-| `vggt_omega_1b_512.onnx` | 1,559,489 | `44626B04C89AF9EC127AF7DDB8B5624ECB0AAAA4D7D0AF6613ECD36FE941AD99` |
-| `vggt_omega_1b_512.weights.bin` | 4,445,007,872 | `4F3BFEC468589866BE5829F302F3A11D890C28C92D649F5B5CA399C3ABCF9840` |
-| `LICENSE.txt` | - | `licenses/VGGT-Omega-LICENSE.txt` |
-| `NOTICE.md` | - | the VGGT-Omega section of `licenses/CONVERSION-NOTICES.md` |
+| `flowhmr_mmdit.weights.bin` | 1,841,575,852 | `4e08a4f175e431005e6723ee3340e7c01aa016827fe97395140f31d863d34edd` |
+| `flowhmr_mmdit.onnx` | 4,118,877 | `29d7390e58d4635a9cefe3574297cb284bca3ae9f6b6ca1765d8d305b7c33f0c` |
 
-The VGGT graph is traced at a fixed 512x288 portrait canvas; a re-export from
-the checkpoint with `tools/onnx/vggt_omega_export.py` gives a dynamic size and a
-different hash. Say which one a file is.
+Add: `LICENSE-flowhmr-weights` (verbatim from
+`licenses/FlowHMR-Model-Weights-LICENSE.txt`) and `NOTICE.md` (the FlowHMR
+section). Non-commercial use only; attribution and citation of
+arXiv:2610.03691 are conditions.
 
-Conversion parity, measured against the PyTorch reference (see `docs/MODELS.md`
-in the development tree): VGGT-Omega max abs difference **2.6e-4**, FlowHMR
-MMDiT max abs **9.7e-3** (mean 2.1e-4). Use those numbers in the card rather
-than "matches the original".
+Optional, from the FlowHMR **code** repository (Apache-2.0, not ours):
+`config.yml` (3,067 B, `5deae018...`) and `motion_stats.json` (169,611 B,
+`6e0f2c4f...`). If you include them, also ship `LICENSE-Apache-2.0` and say in
+the notice which file is under which licence.
 
-## Staging folder without copying 10 GB
+---
 
-Hard links share the bytes, so the staging folder costs no disk space:
+## 3. `velomocap-vggt-omega-onnx` - FAIR Noncommercial Research License
+
+| File | Bytes | SHA-256 |
+| --- | --- | --- |
+| `vggt_omega_1b_512.weights.bin` | 4,445,007,872 | `4f3bfec468589866be5829f302f3a11d890c28c92d649f5b5ca399c3abcf9840` |
+| `vggt_omega_1b_512.onnx` | 1,559,489 | `44626b04c89af9ec127af7ddb8b5624ecb0aaaa4d7d0af6613ecd36fe941ad99` |
+
+Add: `LICENSE.txt` (verbatim from `licenses/VGGT-Omega-LICENSE.txt`) and
+`NOTICE.md` (the VGGT section). Non-commercial research only; this licence
+requires the text to accompany every copy, and a citation of VGGT.
+
+Only used when camera estimation is switched on - the workspace starts with a
+static camera. Say so in the card, so nobody downloads 4.4 GB for nothing.
+
+---
+
+## What is not published, and why
+
+| File | Why not |
+| --- | --- |
+| `sam3d_backbone.onnx` + `.weights.bin`, `sam3d_init/pose/post/step0..5.onnx`, `mhr_model.onnx`, `sam3d_params.{json,bin}`, `sam3d_split.json` | Abandoned ONNX route: not in the release package, the packed build loads the traced module instead |
+| `detector/yolov8x.onnx` | AGPL-3.0: publishing it would put the whole combination under AGPL |
+| `body_models/smplh/*`, `body_models/smplx/*` | MPI registration, non-commercial, redistribution forbidden |
+| `characters/*.glb` | Epic / Adobe assets bound to their engines |
+| `runtime/**` | ONNX Runtime, LibTorch, CUDA/cuDNN, ffmpeg - own terms, mostly not redistributable |
+| `flowhmr_latest.ckpt`, `model.ckpt`, `mhr_model.pt`, `vggt_omega_1b_512.pt` | The original checkpoints; link to the upstream repositories instead of mirroring 10 GB |
+
+## Model card: the three lines that matter
+
+```yaml
+---
+license: other
+license_name: <sam-license | flowhmr-model-weights-license | fair-noncommercial-research-license>
+license_link: <https://huggingface.co/facebook/sam-3d-body-dinov3 | .../fafsaf1/flowhmr-0.46B | .../facebook/VGGT-Omega>
+---
+```
+
+Then one paragraph: what this repository is, one line per file in a table with
+size and SHA-256, `## Upstream` (repository, revision, copyright), `## What
+changed` (the conversion, fp32, nothing retrained), `## Verification` (SAM
+1.5e-5 m, FlowHMR 9.7e-3 max, VGGT 2.6e-4, with the reproduce command),
+`## Licence` (verbatim text in `LICENSE`, plus what the licence requires).
+Templates with the numbers filled in: `licenses/CONVERSION-NOTICES.md`.
+
+## Stage, then upload
+
+Hard links, so the staging folder costs no disk:
 
 ```powershell
 $root  = "E:\RGBMocap\velomocap"
 $stage = "E:\model-upload"
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
-
-New-Item -ItemType Directory -Force "$stage\velomocap-sam3d-onnx"    | Out-Null
-New-Item -ItemType Directory -Force "$stage\velomocap-flowhmr-onnx"  | Out-Null
+New-Item -ItemType Directory -Force "$stage\velomocap-sam3d-onnx"      | Out-Null
+New-Item -ItemType Directory -Force "$stage\velomocap-flowhmr-onnx"    | Out-Null
 New-Item -ItemType Directory -Force "$stage\velomocap-vggt-omega-onnx" | Out-Null
 
-# The traced module is in export/ (the development tree keeps it outside
-# models/); the four MHR tables are in models/sam3d.
-$sam = @('sam3d_mesh.json','sam3d_faces.bin','sam3d_skeleton.bin','sam3d_keypoints.bin')
-foreach ($f in $sam) {
+# 1. SAM: the traced module lives in export\, the tables in models\sam3d
+foreach ($f in 'sam3d_faces.bin','sam3d_keypoints.bin','sam3d_skeleton.bin','sam3d_mesh.json') {
   New-Item -ItemType HardLink -Path "$stage\velomocap-sam3d-onnx\$f" -Target "$root\models\sam3d\$f"
 }
-New-Item -ItemType HardLink -Path "$stage\velomocap-sam3d-onnx\sam3d_full_ts.pt" -Target "$root\..\export\sam3d\sam3d_full_ts.pt"
+New-Item -ItemType HardLink -Path "$stage\velomocap-sam3d-onnx\sam3d_full_ts.pt" `
+  -Target "$root\..\export\sam3d\sam3d_full_ts.pt"
 Copy-Item "$root\licenses\SAM-LICENSE.txt" "$stage\velomocap-sam3d-onnx\LICENSE"
 
-foreach ($f in 'flowhmr_mmdit.onnx','flowhmr_mmdit.weights.bin','config.yml','motion_stats.json') {
+# 2. FlowHMR
+foreach ($f in 'flowhmr_mmdit.onnx','flowhmr_mmdit.weights.bin') {
   New-Item -ItemType HardLink -Path "$stage\velomocap-flowhmr-onnx\$f" -Target "$root\models\flowhmr\$f"
 }
-# Two licences in this one: the converted weights are non-commercial, the two
-# files taken from the FlowHMR code repository are Apache-2.0.
 Copy-Item "$root\licenses\FlowHMR-Model-Weights-LICENSE.txt" "$stage\velomocap-flowhmr-onnx\LICENSE-flowhmr-weights"
-Copy-Item "$root\LICENSE" "$stage\velomocap-flowhmr-onnx\LICENSE-Apache-2.0"
 
+# 3. VGGT-Omega
 foreach ($f in 'vggt_omega_1b_512.onnx','vggt_omega_1b_512.weights.bin') {
   New-Item -ItemType HardLink -Path "$stage\velomocap-vggt-omega-onnx\$f" -Target "$root\models\flowhmr\$f"
 }
 Copy-Item "$root\licenses\VGGT-Omega-LICENSE.txt" "$stage\velomocap-vggt-omega-onnx\LICENSE.txt"
 ```
 
-Then add the two documents each repository needs: the `README.md` model card
-(template below) and a `NOTICE.md` copied from
-[CONVERSION-NOTICES.md](CONVERSION-NOTICES.md) - one section per repository, so
-`velomocap-sam3d-onnx` gets the SAM notice, and so on.
-
-## Hugging Face
-
-Create the three repositories first (web UI or CLI). In each one:
-
-* **Licence field:** `Other`, with the name and link of the upstream licence.
-  Hugging Face accepts these card fields:
-
-  ```yaml
-  license: other
-  license_name: sam-license
-  license_link: https://huggingface.co/facebook/sam-3d-body-dinov3
-  ```
-
-  For FlowHMR use `license_name: flowhmr-model-weights-license` and
-  `license_link: https://huggingface.co/fafsaf1/flowhmr-0.46B`; for VGGT-Omega
-  `license_name: fair-noncommercial-research-license`,
-  `license_link: https://huggingface.co/facebook/VGGT-Omega`.
-* **Tags:** `onnx`, `motion-capture`, `sam-3d-body` / `flowhmr` / `vggt`,
-  `velomocap`.
-* **Gating:** optional. The SAM licence already permits redistribution, so an
-  open repository is legal; mirroring Meta's own gate (as the two non-commercial
-  repositories do) is the conservative choice and costs nothing but friction.
+Then write the model card (`README.md`) and `NOTICE.md` into each folder and
+upload:
 
 ```powershell
 pip install -U huggingface_hub
-hf auth login          # or: huggingface-cli login
-
-hf upload YuanBaoSMadLab/velomocap-sam3d-onnx    E:\model-upload\velomocap-sam3d-onnx    --repo-type model
-hf upload YuanBaoSMadLab/velomocap-flowhmr-onnx  E:\model-upload\velomocap-flowhmr-onnx  --repo-type model
+hf auth login
+hf upload YuanBaoSMadLab/velomocap-sam3d-onnx      E:\model-upload\velomocap-sam3d-onnx      --repo-type model
+hf upload YuanBaoSMadLab/velomocap-flowhmr-onnx    E:\model-upload\velomocap-flowhmr-onnx    --repo-type model
 hf upload YuanBaoSMadLab/velomocap-vggt-omega-onnx E:\model-upload\velomocap-vggt-omega-onnx --repo-type model
 ```
 
-Old versions of the CLI are `huggingface-cli upload` with the same arguments.
-Files over 10 MB go to LFS automatically.
+ModelScope: same three names, `ms-hub upload <namespace>/<repo> <folder>
+--repo-type model`, or the web upload.
 
-## ModelScope (魔搭)
+## Before you publish
 
-Same three names under your namespace. Create the model repositories in the web
-UI, set the licence to *Other* and paste the upstream licence link into the
-description, then either drag the files in or use the CLI:
-
-```powershell
-pip install -U modelscope-hub
-ms-hub upload YuanBaoSMadLab/velomocap-sam3d-onnx E:\model-upload\velomocap-sam3d-onnx --repo-type model --commit-message "SAM 3D Body ONNX chain"
-```
-
-`ms-hub --help` is the authority for the arguments on your version; the web
-upload does the same thing without the CLI.
-
-## Model card template
-
-Copy into `README.md` in each staging folder and fill the markers.
-
-```markdown
----
-license: other
-license_name: <sam-license | flowhmr-model-weights-license | fair-noncommercial-research-license>
-license_link: <upstream licence URL>
-tags: [onnx, motion-capture, <sam-3d-body | flowhmr | vggt>, velomocap]
----
-
-# <name> - ONNX conversion for VeloMocap
-
-ONNX Runtime version of <upstream model>, converted from the official
-checkpoint so that [VeloMocap](https://github.com/YuanBaoSMadLab/velomocap) can
-run it without PyTorch. **<Non-commercial research use only / SAM License -
-see LICENSE>.**
-
-## Upstream
-
-* Model: <link>, revision <commit>
-* Weights: <checkpoint file>, <bytes>, sha256 <...>
-* Paper: <citation>
-
-## What changed
-
-* Exported to ONNX in fp32 by `tools/onnx/<script>.py`; nothing was retrained.
-* <weights packed into the `.weights.bin` sidecar | fixed 512x288 input canvas |
-  RoPE/attention masks made graph inputs>
-* Verified against the PyTorch reference: max abs difference <value>
-  (`velomocap-cli <flowhmr|vggt>-parity`).
-
-## Files
-
-Table of file, bytes, sha256 - see the repository listing.
-
-## How to use
-
-`models/sam3d/`, `models/flowhmr/` of a VeloMocap checkout. Model weights are
-not part of the source repository.
-
-## Licence
-
-Reproduced verbatim in LICENSE. This conversion is a derivative work of
-<upstream>, published under the same terms. <Attribution/citation requirement>.
-```
-
-## 中文卡片模板（魔搭 / ModelScope 用）
-
-```markdown
-# <名称> — VeloMocap 的 ONNX 转换版
-
-<上游模型> 的 ONNX Runtime 版本，由官方 checkpoint 转换而来，让
-[VeloMocap](https://github.com/YuanBaoSMadLab/velomocap) 不需要 PyTorch 就能运行。
-**<仅限非商业研究使用 / 遵守 SAM 许可证，见 LICENSE>。**
-
-## 上游
-
-* 模型：<链接>，版本 <commit>
-* 权重：<checkpoint 文件>，<字节数>，sha256 <...>
-* 论文：<引用>
-
-## 我们改了什么
-
-* 用 `tools/onnx/<脚本>.py` 导出为 fp32 ONNX，没有重新训练。
-* <权重打包进 `.weights.bin` 旁文件 | 固定 512x288 输入 | RoPE 与注意力掩码改为图输入>
-* 与 PyTorch 参考实现对齐：最大绝对误差 <数值>。
-
-## 文件
-
-见仓库文件列表（含每个文件的大小与 sha256）。
-
-## 使用方式
-
-放进 VeloMocap 的 `models/sam3d/` 或 `models/flowhmr/`；权重不在源码仓库里。
-
-## 许可证
-
-全文见 LICENSE。本转换件是 <上游> 的衍生作品，按同样的条款发布。<署名/引用要求>。
-```
-
-## Checklist before you publish
-
-- [ ] The staging folder holds only files from the tables above.
-- [ ] `LICENSE` / `LICENSE.txt` is in every repository and is the *verbatim*
-      upstream text.
-- [ ] The card's first paragraph says non-commercial where that applies, and
-      names the upstream repository and revision.
-- [ ] Sizes and hashes in the card match the uploaded files.
-- [ ] No SMPL-H/SMPL-X, no YOLO, no character assets, no runtime binaries.
-- [ ] VeloMocap's own README links to the hub repository instead of shipping
-      weights, and `licenses/README.md` is updated if anything changes.
+- [ ] Only the nine files above are in the staging folders.
+- [ ] Each repository has the upstream licence text, verbatim, under the file
+      name its own convention uses (`LICENSE`, `LICENSE-flowhmr-weights`,
+      `LICENSE.txt`).
+- [ ] Each repository has a `NOTICE.md` that says which files we made and what
+      the licence requires.
+- [ ] The two non-commercial repositories say so in the first paragraph.
+- [ ] The card lists sizes and SHA-256 that match the uploaded bytes.
+- [ ] No ONNX SAM chain, no YOLO, no SMPL-H, no characters, no runtime binaries.
