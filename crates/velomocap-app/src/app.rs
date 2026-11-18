@@ -503,8 +503,14 @@ impl VeloMocap {
             .unwrap_or_else(|| PathBuf::from("models/detector/yolov8x.onnx"));
         let sam3d_dir = resolve_model(&["models/sam3d"])
             .unwrap_or_else(|| PathBuf::from("models/sam3d"));
+        // The SAM 3D parameter tables (`sam3d_params.json` + `.bin`) sit beside
+        // the graphs in `models/flowhmr/sam` in the development tree and inside
+        // `models/sam3d` in a packed install — the same rule `sam3d::load` uses
+        // when it prefers the model directory. Asking only for the development
+        // layout made the installed build fail with "models/flowhmr/sam\
+        // sam3d_params.json: the system cannot find the path".
         let params_dir = resolve_model(&["models/flowhmr/sam"])
-            .unwrap_or_else(|| PathBuf::from("models/flowhmr/sam"));
+            .unwrap_or_else(|| sam3d_dir.clone());
         let video = initial_video;
         let status = match (&ort_path, tools_ok, &video) {
             (Some(_), true, None) => i18n::t("Ready. Open a video or a project.").to_string(),

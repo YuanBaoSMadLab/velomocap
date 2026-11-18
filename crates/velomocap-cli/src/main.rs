@@ -827,6 +827,22 @@ fn decode_rgb(bytes: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
 ///
 /// A shipped build keeps `models/` beside the `.exe`, and the CLI is often run
 /// from another directory, so a bare relative path is not enough.
+///
+/// The SAM 3D parameter tables, from `--params` or beside the graphs: a packed
+/// install keeps `sam3d_params.{json,bin}` inside `models/sam3d` and has no
+/// `models/flowhmr/sam`, so the development default alone cannot load there
+/// (`sam3d::load` already prefers the model directory for the same reason).
+fn params_dir(params: &std::path::Path, sam3d: &std::path::Path) -> PathBuf {
+    let resolved = resolve_model(params);
+    if resolved.join("sam3d_params.json").is_file() {
+        return resolved;
+    }
+    if sam3d.join("sam3d_params.json").is_file() {
+        return sam3d.to_path_buf();
+    }
+    resolved
+}
+
 fn resolve_model(path: &std::path::Path) -> PathBuf {
     if path.is_file() {
         return path.to_path_buf();
@@ -872,8 +888,8 @@ fn people_report(
     };
     let config = SamConfig {
         detector: resolve_model(detector),
+        params_dir: params_dir(params, &sam3d),
         sam3d_dir: sam3d,
-        params_dir: resolve_model(params),
         confidence,
         work_width: width,
         max_frames: limit,
@@ -1352,8 +1368,8 @@ fn flow_report(
     };
     let sam_config = SamConfig {
         detector: resolve_model(detector),
+        params_dir: params_dir(params, &sam3d),
         sam3d_dir: sam3d,
-        params_dir: resolve_model(params),
         confidence,
         work_width: width,
         max_frames: limit,
