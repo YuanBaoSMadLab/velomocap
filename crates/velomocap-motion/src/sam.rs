@@ -454,27 +454,45 @@ impl SamRunner {
                 let (height, width) = (jobs[0].height, jobs[0].width);
                 let area = width * height;
                 let plane = 3 * area;
+                let count = jobs.len();
                 // `frames` is shared between every item in this call, so it is
                 // filled once and then sliced per item.
-                let mut packed = vec![0.0f32; jobs.len() * plane];
-                let mut centers = Vec::with_capacity(jobs.len() * 2);
-                let mut scales = Vec::with_capacity(jobs.len() * 2);
-                for (item, job) in jobs.iter().enumerate() {
-                    let base = item * plane;
-                    for (index, pixel) in job.rgb.chunks_exact(3).enumerate() {
-                        packed[base + index] = pixel[0] as f32 / 255.0;
-                        packed[base + area + index] = pixel[1] as f32 / 255.0;
-                        packed[base + 2 * area + index] = pixel[2] as f32 / 255.0;
+                let mut packed = vec![0.0f32; count * plane];
+                let mut centers = vec![0.0f32; count * 2];
+                let mut scales = vec![0.0f32; count * 2];
+                // The normalisation loop is a byte-by-byte conversion of the whole
+                // frame, per item: a 1080×1912 clip packs 1.6 M pixels eight times
+                // over and the card waits for it. Each item owns its own slice, so
+                // they run at once (one thread per item, no shared state).
+                std::thread::scope(|scope| {
+                    let mut chunks = packed.chunks_mut(plane);
+                    let mut center_slots = centers.chunks_mut(2);
+                    let mut scale_slots = scales.chunks_mut(2);
+                    for job in jobs {
+                        let Some(slice) = chunks.next() else { break };
+                        let Some(center_slot) = center_slots.next() else { break };
+                        let Some(scale_slot) = scale_slots.next() else { break };
+                        scope.spawn(move || {
+                            let (planes, rest) = slice.split_at_mut(area);
+                            let (green, blue) = rest.split_at_mut(area);
+                            for (index, pixel) in job.rgb.chunks_exact(3).enumerate() {
+                                planes[index] = pixel[0] as f32 / 255.0;
+                                green[index] = pixel[1] as f32 / 255.0;
+                                blue[index] = pixel[2] as f32 / 255.0;
+                            }
+                            let (center, scale) = person_box([
+                                job.detection.x0,
+                                job.detection.y0,
+                                job.detection.x1,
+                                job.detection.y1,
+                            ]);
+                            center_slot[0] = center[0];
+                            center_slot[1] = center[1];
+                            scale_slot[0] = scale[0];
+                            scale_slot[1] = scale[1];
+                        });
                     }
-                    let (center, scale) = person_box([
-                        job.detection.x0,
-                        job.detection.y0,
-                        job.detection.x1,
-                        job.detection.y1,
-                    ]);
-                    centers.extend_from_slice(&center);
-                    scales.extend_from_slice(&scale);
-                }
+                });
                 let mut cam_int = [0.0f32; 9];
                 for row in 0..3 {
                     for column in 0..3 {
@@ -616,6 +634,47 @@ fn flush_batch(
     Ok(())
 }
 
+/// How far the reconstruction is, across both phases.
+///
+/// The phases run the hand frames and the rest separately, so a per-phase counter
+/// would restart halfway through the bar. This counts *frames*, and a frame counts
+/// once every person in it has been reconstructed by whichever phase owns it.
+struct Reconstruction {
+    /// Jobs still to run, per clip frame.
+    remaining: Vec<usize>,
+    frames_done: usize,
+    frames_total: usize,
+}
+
+impl Reconstruction {
+    fn new(plan: &[Vec<(usize, Detection)>]) -> Self {
+        let remaining: Vec<usize> = plan.iter().map(Vec::len).collect();
+        let frames_total = remaining.iter().filter(|count| **count > 0).count();
+        Self {
+            remaining,
+            frames_done: 0,
+            frames_total,
+        }
+    }
+
+    /// Account for one finished batch, and report the frame count when it moved.
+    fn account(&mut self, jobs: &[PendingJob], progress: &mut dyn FnMut(usize, usize, &str)) {
+        let before = self.frames_done;
+        for job in jobs {
+            let Some(left) = self.remaining.get_mut(job.index) else {
+                continue;
+            };
+            *left = left.saturating_sub(1);
+            if *left == 0 {
+                self.frames_done += 1;
+            }
+        }
+        if self.frames_done != before {
+            progress(self.frames_done, self.frames_total, "reconstructing");
+        }
+    }
+}
+
 /// Run one module over the frames it is responsible for.
 ///
 /// The capture is split in two passes so that only one graph is resident: this
@@ -639,6 +698,7 @@ fn run_phase(
     timings: &mut Timings,
     meshes_stored: &mut usize,
     dropped_meshes: &mut usize,
+    reconstruction: &mut Reconstruction,
     hooks: &mut SamHooks<'_>,
 ) -> Result<()> {
     let batch = runner.batch().max(1);
@@ -661,7 +721,6 @@ fn run_phase(
         let jobs = jobs.expect("checked above");
         let frame_rgb = Arc::new(frame.rgb.clone());
         for (slot, detection) in jobs {
-            (hooks.progress)(index + 1, total, "reconstructing");
             pending.push(PendingJob {
                 slot: *slot,
                 index,
@@ -684,6 +743,7 @@ fn run_phase(
                 meshes_stored,
                 dropped_meshes,
             )?;
+            reconstruction.account(&group, &mut *hooks.progress);
             (hooks.people)(index, people);
         }
         index += 1;
@@ -703,6 +763,7 @@ fn run_phase(
             meshes_stored,
             dropped_meshes,
         )?;
+        reconstruction.account(&group, &mut *hooks.progress);
     }
     Ok(())
 }
@@ -1284,7 +1345,6 @@ pub fn capture_people_with(
             plan.push(Vec::new());
         }
         for (slot, detection) in jobs {
-            (hooks.progress)(decoded, total, "reconstructing");
             while people[slot].frames.len() <= index {
                 people[slot].frames.push(None);
             }
@@ -1323,6 +1383,9 @@ pub fn capture_people_with(
         );
     }
     let mut runner = Some(body);
+    // The bar counts frames, and a frame is done when every person in it has been
+    // reconstructed — across both phases, so it never restarts halfway.
+    let mut reconstruction = Reconstruction::new(&plan);
     if let Some(active) = runner.as_ref() {
         run_phase(
             &tools,
@@ -1340,6 +1403,7 @@ pub fn capture_people_with(
             &mut timings,
             &mut meshes_stored,
             &mut dropped_meshes,
+            &mut reconstruction,
             hooks,
         )?;
     }
@@ -1371,6 +1435,7 @@ pub fn capture_people_with(
                     &mut timings,
                     &mut meshes_stored,
                     &mut dropped_meshes,
+                    &mut reconstruction,
                     hooks,
                 )?;
             }
@@ -1403,6 +1468,7 @@ pub fn capture_people_with(
                     &mut timings,
                     &mut meshes_stored,
                     &mut dropped_meshes,
+                    &mut reconstruction,
                     hooks,
                 )?;
             }
@@ -1430,6 +1496,7 @@ pub fn capture_people_with(
                         &mut timings,
                         &mut meshes_stored,
                         &mut dropped_meshes,
+                        &mut reconstruction,
                         hooks,
                     )?;
                 }

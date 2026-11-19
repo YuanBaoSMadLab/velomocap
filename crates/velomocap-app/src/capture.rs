@@ -123,15 +123,16 @@ impl CaptureStage {
 /// Every stage reports its own `(done, total)`, so the bar moves during the long
 /// ones — camera and motion used to leave the SAM counter frozen at 100 % and the
 /// run looked hung.
-pub const STAGE_COUNT: usize = 6;
+pub const STAGE_COUNT: usize = 7;
 
 pub fn stage_name(index: usize) -> &'static str {
     match index {
         0 => "loading models",
-        1 => "reconstructing people",
-        2 => "estimating camera",
-        3 => "generating motion",
-        4 => "skinning",
+        1 => "detecting people",
+        2 => "reconstructing people",
+        3 => "estimating camera",
+        4 => "generating motion",
+        5 => "skinning",
         _ => "done",
     }
 }
@@ -140,11 +141,12 @@ fn stage_index(stage: &str) -> usize {
     match stage {
         "loading mesh" | "loading detector" | "loading SAM 3D Body" | "opening video"
         | "flow body model" | "flow camera" => 0,
-        "detecting" | "reconstructing" => 1,
-        "camera" => 2,
-        "flow" => 3,
-        "skin" => 4,
-        _ => 5,
+        "detecting" => 1,
+        "reconstructing" | "interpolating hands" | "stabilising" => 2,
+        "camera" => 3,
+        "flow" => 4,
+        "skin" => 5,
+        _ => 6,
     }
 }
 
@@ -445,7 +447,11 @@ fn run(
 
     let mut progress = {
         let shared = Arc::clone(&shared);
-        let started = started;
+        // The rate in the status line is the current stage's own rate: dividing a
+        // stage's frame count by the whole run's elapsed time made every later
+        // stage look slower than it is.
+        let mut stage_started = Instant::now();
+        let mut current = String::new();
         move |frame: usize, total: usize, stage: &str| {
             let mut state = shared.lock().unwrap();
             state.progress.stage = match stage {
@@ -459,11 +465,18 @@ fn run(
                 "done" => CaptureStage::Done,
                 _ => state.progress.stage,
             };
+            if stage != current {
+                current = stage.to_string();
+                stage_started = Instant::now();
+                // The headless log is the only record of a run without a window,
+                // and the phase order is the thing that was hard to read.
+                eprintln!("[progress] {stage} ({frame}/{total})");
+            }
             state.progress.stage_index = stage_index(stage);
             state.progress.frame = frame;
             state.progress.total = total;
             state.progress.message = stage.to_string();
-            state.progress.elapsed = started.elapsed().as_secs_f64();
+            state.progress.elapsed = stage_started.elapsed().as_secs_f64();
             // Sample device memory *inside* a stage, not only at its edges: a
             // per-frame leak in the reconstruction loop is invisible otherwise, and
             // "it used to be 8 GB" has to be answerable from the log.
@@ -944,6 +957,7 @@ fn downscale(index: usize, rgb: &[u8], width: usize, height: usize, target: usiz
             names,
             vec![
                 "loading models",
+                "detecting people",
                 "reconstructing people",
                 "estimating camera",
                 "generating motion",
@@ -953,11 +967,13 @@ fn downscale(index: usize, rgb: &[u8], width: usize, height: usize, target: usiz
         );
         assert_eq!(stage_index("loading detector"), 0);
         assert_eq!(stage_index("detecting"), 1);
-        assert_eq!(stage_index("camera"), 2);
-        assert_eq!(stage_index("flow"), 3);
-        assert_eq!(stage_index("skin"), 4);
-        assert_eq!(stage_index("done"), 5);
-        assert_eq!(stage_index("something else"), 5);
+        assert_eq!(stage_index("reconstructing"), 2);
+        assert_eq!(stage_index("interpolating hands"), 2);
+        assert_eq!(stage_index("camera"), 3);
+        assert_eq!(stage_index("flow"), 4);
+        assert_eq!(stage_index("skin"), 5);
+        assert_eq!(stage_index("done"), 6);
+        assert_eq!(stage_index("something else"), 6);
     }
 
     /// The VRAM readout must answer instead of crashing, and trimming the cache
