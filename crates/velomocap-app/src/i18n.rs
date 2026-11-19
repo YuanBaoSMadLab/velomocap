@@ -371,22 +371,6 @@ pub fn clip_line(path: &str) -> String {
     }
 }
 
-/// Mesh size line in the Solver group.
-/// "FlowHMR · 6890 vertices · 13776 triangles", for the model panel.
-pub fn smplh_line(vertices: usize, triangles: usize) -> String {
-    match lang() {
-        Lang::Zh => format!("FlowHMR · {vertices} 顶点 · {triangles} 三角形"),
-        Lang::En => format!("FlowHMR · {vertices} vertices · {triangles} triangles"),
-    }
-}
-
-pub fn mesh_line(verts: usize, tris: usize, keys: usize) -> String {
-    match lang() {
-        Lang::Zh => format!("{verts} 顶点 · {tris} 三角面 · {keys} 关键点"),
-        Lang::En => format!("{verts} verts · {tris} tris · {keys} keypoints"),
-    }
-}
-
 /// People/frames summary in the Solver group.
 pub fn people_line(people: usize, frames: usize, fps: f64) -> String {
     match lang() {

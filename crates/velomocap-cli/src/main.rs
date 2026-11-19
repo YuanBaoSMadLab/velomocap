@@ -366,15 +366,6 @@ enum Command {
         #[arg(long, default_value = "normal")]
         lock_preset: String,
     },
-    /// Run the SAM 3D Body TorchScript module through LibTorch.
-    SamTorch {
-        /// The TorchScript module that `tools/torch/sam3d_jit.py` writes.
-        #[arg(long, default_value = "models/sam3d/sam3d_body_ts.pt")]
-        weights: PathBuf,
-        /// Keep the module on the CPU.
-        #[arg(long)]
-        cpu: bool,
-    },
     /// Run the whole-pipeline SAM module (body + hands + fusion) through LibTorch.
     ///
     /// The module is `tools/torch/sam3d_full_jit.py`, i.e. the reference
@@ -743,7 +734,6 @@ fn main() -> Result<()> {
             !cpu,
         )
         },
-        Command::SamTorch { weights, cpu } => sam_torch_report(&weights, !cpu),
         Command::SamFullTorch {
             weights,
             cpu,
@@ -1043,88 +1033,6 @@ fn people_report(
         }
     }
     eprintln!("total {:.1}s", started.elapsed().as_secs_f64());
-    Ok(())
-}
-
-/// Drive the TorchScript SAM module from Rust.
-///
-/// The inputs come from the same fixed recipe as `tools/torch/ts_probe.py` and
-/// `cpp/src/ts_probe.cpp`, so the printed values can be compared one to one:
-/// the three paths must agree.
-fn sam_torch_report(weights: &std::path::Path, gpu: bool) -> Result<()> {
-    use velomocap_cpp::sam3d::{Sam3dInput, Sam3dTorch, IMAGE_SIZE};
-
-    if !Sam3dTorch::built() {
-        anyhow::bail!("this build has no LibTorch; set VELOMOCAP_LIBTORCH=1 and rebuild");
-    }
-    let weights = resolve_model(weights);
-    let load = Instant::now();
-    let module = Sam3dTorch::load(&weights, gpu)?;
-    println!(
-        "loaded {} in {:.1}s ({})",
-        weights.display(),
-        load.elapsed().as_secs_f64(),
-        if gpu { "cuda if available" } else { "cpu" }
-    );
-
-    // `(i % 251) / 251`, the recipe the other two probes use.
-    let pixels = IMAGE_SIZE * IMAGE_SIZE;
-    let mut image = vec![0.0f32; 3 * pixels];
-    for (index, value) in image.iter_mut().enumerate() {
-        *value = (index % 251) as f32 / 251.0;
-    }
-    let input = Sam3dInput {
-        image: &image,
-        bbox_center: [640.0, 400.0],
-        bbox_scale: [250.0, 375.0],
-        cam_int: [1100.0, 0.0, 640.0, 0.0, 1100.0, 360.0, 0.0, 0.0, 1.0],
-        keypoints: [0.0, 0.0, -2.0],
-        ori_size: [1280.0, 720.0],
-    };
-    let run = Instant::now();
-    let frame = module.run(&input)?;
-    println!("forward in {:.2}s", run.elapsed().as_secs_f64());
-
-    let first = |values: &[f32]| -> String {
-        values
-            .iter()
-            .take(4)
-            .map(|v| format!("{v:.6}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let sum = |values: &[f32]| -> f64 { values.iter().map(|v| *v as f64).sum() };
-    println!(
-        "body_token   first4 [{}] sum {:.4}",
-        first(&frame.body_token),
-        sum(&frame.body_token)
-    );
-    println!(
-        "verts        first4 [{}] sum {:.4}",
-        first(&frame.verts),
-        sum(&frame.verts)
-    );
-    println!(
-        "pred         first4 [{}] sum {:.4}",
-        first(&frame.pred),
-        sum(&frame.pred)
-    );
-    println!(
-        "pred_cam     first3 [{}] sum {:.4}",
-        frame
-            .pred_cam
-            .iter()
-            .take(3)
-            .map(|v| format!("{v:.6}"))
-            .collect::<Vec<_>>()
-            .join(", "),
-        sum(&frame.pred_cam)
-    );
-    println!(
-        "model_params first4 [{}] sum {:.4}",
-        first(&frame.model_params),
-        sum(&frame.model_params)
-    );
     Ok(())
 }
 

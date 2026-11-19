@@ -497,6 +497,10 @@ fn run(
         cancelled: &cancelled,
     };
     let capture = velomocap_motion::capture_people_with(&video, &settings.config, &mut hooks)?;
+    // The stage split is what any speed claim has to be checked against, and a
+    // headless run has no console panel to read it from. Printed before the flow
+    // stage, which is where a headless run stops.
+    eprintln!("[capture] {}", capture.timings.line());
     // The detector and SAM module are gone at this point, but both allocators
     // keep their blocks: without handing them back, the flow stage cannot fit
     // and its weights end up paged into host memory. `Unlimited` keeps them on

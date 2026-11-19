@@ -172,14 +172,17 @@ impl PersonTrack {
 pub struct Timings {
     pub detect: f64,
     pub reconstruct: f64,
+    /// The stabilising pass and the pruning after the last frame: CPU work the
+    /// device sits idle through, so it is timed apart from the graph.
+    pub cleanup: f64,
     pub total: f64,
 }
 
 impl Timings {
     pub fn line(&self) -> String {
         format!(
-            "detect {:.2}s 路 reconstruct {:.2}s 路 total {:.2}s",
-            self.detect, self.reconstruct, self.total
+            "detect {:.2}s · reconstruct {:.2}s · cleanup {:.2}s · total {:.2}s",
+            self.detect, self.reconstruct, self.cleanup, self.total
         )
     }
 }
@@ -1307,7 +1310,9 @@ pub fn capture_people_with(
 
     // Planted feet stay planted, and the body stops jittering frame to frame.
     (hooks.progress)(decoded, total, "stabilising");
+    let cleanup_started = Instant::now();
     let cleanup = crate::cleanup::stabilise(&mut people, &crate::cleanup::CleanupConfig::default());
+    timings.cleanup = cleanup_started.elapsed().as_secs_f64();
 
     // Stable ordering: by first appearance, then by id. Names were assigned on
     // first sight, so a retired track never renumbers the survivors.
