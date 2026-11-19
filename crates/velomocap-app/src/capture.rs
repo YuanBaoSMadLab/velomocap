@@ -274,6 +274,9 @@ pub struct FlowSettings {
     pub estimate_camera: bool,
     /// Smooth the estimated camera track over time.
     pub refine_camera: bool,
+    /// Put the reconstructed actors on the world origin instead of where the
+    /// camera saw them (the sidebar's "Center At Origin").
+    pub center_scene: bool,
 }
 
 /// The first frame of a clip, plus what its container reported.
@@ -678,6 +681,33 @@ fn run_flow(
             velomocap_motion::shift_to_floor(clip, floor);
         }
     }
+    // The placement puts the take where the camera actually saw it (a few metres
+    // in front of the lens), which is right for a scene of actors but leaves a
+    // lone character far from the origin — awkward in every DCC and in the
+    // viewport's own grid. One shared offset from the mean first-frame root keeps
+    // the actors' distances to each other and puts the group on the origin; the
+    // height is untouched, the floor already put the soles on `y = 0`.
+    let centered: Option<[f32; 2]> = if settings.center_scene {
+        let roots: Vec<[f32; 3]> = generated
+            .iter()
+            .filter_map(|(_, clip)| clip.first_root())
+            .collect();
+        match velomocap_motion::center_shift(&roots) {
+            Some(centre) => {
+                for (_, clip) in generated.iter_mut() {
+                    velomocap_motion::shift_xz(clip, -centre[0], -centre[1]);
+                }
+                eprintln!(
+                    "[scene] centred on the origin: x {:+.3} m, z {:+.3} m",
+                    -centre[0], -centre[1]
+                );
+                Some([-centre[0], -centre[1]])
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
 
     let mut clips = Vec::new();
     for (slot, mut clip) in generated {
@@ -757,6 +787,9 @@ fn run_flow(
                 "scene floor {floor:+.3} m over {} actor(s)",
                 estimates.len()
             ));
+        }
+        if let Some([dx, dz]) = centered {
+            summary.push(format!("centred x {dx:+.3} m z {dz:+.3} m on the origin"));
         }
         summary.push(correction.line());
         let summary = summary.join("; ");

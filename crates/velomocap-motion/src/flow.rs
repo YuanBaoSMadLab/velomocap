@@ -140,6 +140,73 @@ impl FlowClip {
             .map(|skeleton: &Skeleton| skeleton.joint(0))
             .collect()
     }
+
+    /// Where the actor stands on the first frame: the root the reference reads
+    /// when it places a take at the origin.
+    pub fn first_root(&self) -> Option<[f32; 3]> {
+        self.skeletons.first().map(|skeleton: &Skeleton| skeleton.joint(0))
+    }
+}
+
+/// Move a clip along the ground plane: add `dx`, `dz` to the root and every joint.
+///
+/// The vertical counterpart is [`shift_to_floor`], and the same rules apply — it
+/// is a rigid translation, so the motion inside the take is untouched. Nothing
+/// depends on where a take sits on the XZ plane (the placement takes the metric
+/// position from the SAM anchors, which is what makes several people keep their
+/// distances to each other), so this is how a take is brought to the origin
+/// **without** touching its heading, its height or its travel.
+pub fn shift_xz(clip: &mut FlowClip, dx: f32, dz: f32) {
+    if dx == 0.0 && dz == 0.0 {
+        return;
+    }
+    for pose in clip.poses.iter_mut() {
+        pose.translation[0] += dx;
+        pose.translation[2] += dz;
+    }
+    for skeleton in clip.skeletons.iter_mut() {
+        for point in skeleton.positions.chunks_exact_mut(3) {
+            point[0] += dx;
+            point[2] += dz;
+        }
+    }
+}
+
+/// The translation that puts a group of actors on the origin.
+///
+/// The mean of the first-frame roots, XZ only: one shared offset keeps the
+/// actors' distances to each other, so a scene of four people stays a scene of
+/// four people. Height is not part of it — that is the floor's job
+/// ([`shift_to_floor`]). `None` when there is no finite root to read.
+pub fn center_shift(roots: &[[f32; 3]]) -> Option<[f32; 2]> {
+    let usable: Vec<[f32; 3]> = roots
+        .iter()
+        .copied()
+        .filter(|root| root[0].is_finite() && root[2].is_finite())
+        .collect();
+    if usable.is_empty() {
+        return None;
+    }
+    let count = usable.len() as f32;
+    let x = usable.iter().map(|root| root[0]).sum::<f32>() / count;
+    let z = usable.iter().map(|root| root[2]).sum::<f32>() / count;
+    Some([x, z])
+}
+
+/// Centre one take on the origin: its first frame's root goes to `x = z = 0`.
+///
+/// This is the reference's export option, `place_at_origin`
+/// (`mocap/export_options.py: centered_transform`): "Center each person's first
+/// exported frame on world X/Z. Height and travel are preserved." It is applied
+/// to the exported copy, never to the motion the project keeps, unless the
+/// caller asks for it here. Returns the shift that was applied.
+pub fn center_clip(clip: &mut FlowClip) -> Option<[f32; 2]> {
+    let root = clip.first_root()?;
+    if !root[0].is_finite() || !root[2].is_finite() {
+        return None;
+    }
+    shift_xz(clip, -root[0], -root[2]);
+    Some([-root[0], -root[2]])
 }
 
 /// Move a clip onto a plane: subtract `floor` from the root and every joint.
@@ -1151,34 +1218,97 @@ mod tests {
 
     /// A minimal clip standing at `heights` on its own datum, one joint per pose.
     fn scene_clip(heights: &[f32]) -> FlowClip {
+        placed_clip(&heights.iter().map(|h| [0.0, *h, 0.0]).collect::<Vec<_>>())
+    }
+
+    /// A minimal clip whose root walks through `roots`, one joint per pose.
+    fn placed_clip(roots: &[[f32; 3]]) -> FlowClip {
         FlowClip {
             fps: 30.0,
-            poses: heights
+            poses: roots
                 .iter()
-                .map(|height| {
+                .map(|root| {
                     let mut pose = Pose::neutral(52, 16);
-                    pose.translation = [0.0, *height, 0.0];
+                    pose.translation = *root;
                     pose
                 })
                 .collect(),
-            skeletons: heights
+            skeletons: roots
                 .iter()
-                .map(|height| Skeleton {
-                    positions: vec![0.0, *height, 0.0],
+                .map(|root| Skeleton {
+                    positions: root.to_vec(),
                     rotations: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
                 })
                 .collect(),
             rot6d: Vec::new(),
-            trans: heights.iter().map(|height| [0.0, *height, 0.0]).collect(),
+            trans: roots.to_vec(),
             betas: vec![0.0; 16],
             foot_contacts: Vec::new(),
             floor: 0.0,
             floor_from_contacts: true,
             offset: [0.0; 3],
-            source_frames: (0..heights.len()).collect(),
+            source_frames: (0..roots.len()).collect(),
             anchors: 0,
             anchor_residual: [0.0; 3],
         }
+    }
+
+    /// `place_at_origin` (the reference's export option): the first frame's root
+    /// lands on the world XZ origin, its height and the rest of the walk are kept,
+    /// and a second call changes nothing.
+    #[test]
+    fn centring_a_take_puts_its_first_frame_on_the_origin() {
+        let mut clip = placed_clip(&[
+            [-1.0, 0.9, -4.8],
+            [-0.9, 0.95, -4.5],
+            [-0.8, 1.0, -4.2],
+        ]);
+        let shift = center_clip(&mut clip).expect("a finite root");
+        assert!((shift[0] - 1.0).abs() < 1e-6, "x shift {shift:?}");
+        assert!((shift[1] - 4.8).abs() < 1e-6, "z shift {shift:?}");
+        // The first frame is on the origin, at its own height.
+        let first = clip.first_root().expect("a root");
+        assert!(first[0].abs() < 1e-6 && first[2].abs() < 1e-6, "{first:?}");
+        assert!((first[1] - 0.9).abs() < 1e-6, "height must be kept: {first:?}");
+        // Travel is preserved: the root still moves +0.1 m in x and +0.3 m in z.
+        let last = clip.skeletons.last().expect("a frame");
+        assert!((last.positions[0] - 0.2).abs() < 1e-6, "x travel");
+        assert!((last.positions[2] - 0.6).abs() < 1e-6, "z travel");
+        // A second call is a no-op.
+        assert_eq!(center_clip(&mut clip), Some([0.0, 0.0]));
+    }
+
+    /// Centring a scene uses one shared offset, so the actors keep their
+    /// distances to each other instead of collapsing onto the same point.
+    #[test]
+    fn centring_a_scene_keeps_the_actors_apart() {
+        let mut left = placed_clip(&[[1.0, 0.9, -2.0]]);
+        let mut right = placed_clip(&[[3.0, 0.9, -4.0]]);
+        let roots = [
+            left.first_root().expect("a root"),
+            right.first_root().expect("a root"),
+        ];
+        let centre = center_shift(&roots).expect("two finite roots");
+        assert!((centre[0] - 2.0).abs() < 1e-6 && (centre[1] + 3.0).abs() < 1e-6);
+        for clip in [&mut left, &mut right] {
+            shift_xz(clip, -centre[0], -centre[1]);
+        }
+        let a = left.first_root().expect("a root");
+        let b = right.first_root().expect("a root");
+        assert!((a[0] + 1.0).abs() < 1e-6 && (a[2] - 1.0).abs() < 1e-6, "{a:?}");
+        assert!((b[0] - 1.0).abs() < 1e-6 && (b[2] + 1.0).abs() < 1e-6, "{b:?}");
+        // 2 m apart on x and 2 m apart on z, before and after.
+        assert!(((b[0] - a[0]) - 2.0).abs() < 1e-6);
+        assert!(((b[2] - a[2]) + 2.0).abs() < 1e-6);
+    }
+
+    /// A non-finite root cannot be centred: it must not poison the shared offset.
+    #[test]
+    fn a_non_finite_root_does_not_vote() {
+        assert_eq!(center_shift(&[]), None);
+        assert_eq!(center_shift(&[[f32::NAN, 1.0, 0.0]]), None);
+        let centre = center_shift(&[[f32::NAN, 1.0, 0.0], [2.0, 1.0, 4.0]]).expect("one root");
+        assert!((centre[0] - 2.0).abs() < 1e-6 && (centre[1] - 4.0).abs() < 1e-6);
     }
 
     /// `flow_hand_sampling`: hand slots are taken on frames 0, 4, 8, … and the

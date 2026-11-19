@@ -2637,6 +2637,13 @@ fn solver_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
         )
         .on_disabled_hover_text(i18n::t("Only used when the camera is estimated"));
         ui.checkbox(
+            &mut app.center_scene,
+            egui::RichText::new(i18n::t("Center At Origin")).size(11.0),
+        )
+        .on_hover_text(i18n::t(
+            "Put the reconstructed people on the world origin (one shared offset, so their distances to each other stay). Turn it off to keep the metric position the camera saw. Used by the next reconstruction",
+        ));
+        ui.checkbox(
             &mut app.layers.bones,
             egui::RichText::new(i18n::t("Bone overlay")).size(11.0),
         )
@@ -3360,6 +3367,14 @@ fn export_window(app: &mut VeloMocap, ctx: &egui::Context) {
                 );
                 ui.checkbox(&mut app.asset_animation, i18n::zh_en("动画", "Animation"));
             });
+            ui.checkbox(
+                &mut app.asset_place_at_origin,
+                i18n::zh_en("人物放在原点", "Place at origin"),
+            )
+            .on_hover_text(i18n::zh_en(
+                "每个人物第一帧的水平位置归到世界原点，高度和位移保留；多个人各自归零，所以相互间距会变",
+                "Centre each character's first exported frame on world X/Z. Height and travel are kept; people are centred independently, so their relative placement changes",
+            ));
 
             let rows: Vec<(usize, String, String)> = app
                 .people

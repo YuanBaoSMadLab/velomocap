@@ -34,6 +34,9 @@ pub struct Options {
     pub skin: bool,
     pub materials: bool,
     pub animation: bool,
+    /// `place_at_origin`, the reference's export option: the first exported frame
+    /// of the root goes to the world X/Z origin. Height and travel are kept.
+    pub place_at_origin: bool,
 }
 
 impl Default for Options {
@@ -42,6 +45,7 @@ impl Default for Options {
             skin: true,
             materials: true,
             animation: true,
+            place_at_origin: true,
         }
     }
 }
@@ -405,6 +409,17 @@ pub fn write_glb(
     // --- animation --------------------------------------------------------
     let mut animations: Vec<serde_json::Value> = Vec::new();
     if options.animation && frames.len() > 1 {
+        // `place_at_origin` (`mocap/export_options.py`): the reference centres the
+        // *exported copy* on the first frame's root, X/Z only, so height and the
+        // rest of the walk are untouched. A skinned mesh follows its joints, so
+        // shifting the root's translation is the whole transform.
+        let origin: Option<[f32; 3]> = options
+            .place_at_origin
+            .then(|| bones.iter().position(|bone| bone.parent.is_none()))
+            .flatten()
+            .and_then(|root| frames.first().map(|frame| (root, frame)))
+            .map(|(root, frame)| frame.positions.get(root).copied().unwrap_or([0.0; 3]))
+            .filter(|at| at[0].is_finite() && at[2].is_finite());
         let mut samplers: Vec<serde_json::Value> = Vec::new();
         let mut channels: Vec<serde_json::Value> = Vec::new();
         let times: Vec<f32> = (0..frames.len())
@@ -431,7 +446,13 @@ pub fn write_glb(
                         let offset = [at[0] - from[0], at[1] - from[1], at[2] - from[2]];
                         (turn(&inverse, offset), multiply(&inverse, &turn_here))
                     }
-                    None => (at, turn_here),
+                    None => match origin {
+                        // World position of the root, minus the centring offset:
+                        // exactly what the reference's `centered_transform` does to
+                        // the scene matrix before the motion is written.
+                        Some(origin) => ([at[0] - origin[0], at[1], at[2] - origin[2]], turn_here),
+                        None => (at, turn_here),
+                    },
                 };
                 moves.extend_from_slice(&local);
                 turns.extend_from_slice(&quaternion(&rotation));
@@ -641,4 +662,129 @@ fn quaternion(m: &[f32; 9]) -> [f32; 4] {
         ((m[2] + m[6]) / s, (m[5] + m[7]) / s, 0.25 * s, (m[3] - m[1]) / s)
     };
     [x, y, z, w]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-bone stand-in for an imported model: enough for the glTF writer to
+    /// emit a skeleton, a skin and an animation.
+    fn one_bone_character() -> Character {
+        let mut bind = [0.0f32; 16];
+        bind[0] = 1.0;
+        bind[5] = 1.0;
+        bind[10] = 1.0;
+        bind[15] = 1.0;
+        let mut inverse = bind;
+        inverse[12] = 0.0;
+        inverse[13] = -0.9;
+        inverse[14] = 0.0;
+        Character {
+            name: "standin".to_string(),
+            bones: vec![crate::character::Bone {
+                name: "Hips".to_string(),
+                canonical: Some(0),
+                parent: None,
+                bind: [0.0, 0.9, 0.0],
+                bind_rot: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                inverse_bind: inverse,
+            }],
+            order: vec![0],
+            // Two vertices at the bone, one triangle.
+            rest: vec![0.0, 0.9, 0.0, 0.0, 1.0, 0.0],
+            joints: vec![[0, 0, 0, 0]; 2],
+            weights: vec![[1.0, 0.0, 0.0, 0.0]; 2],
+            faces: vec![[0, 1, 0]],
+            uv: Vec::new(),
+            textures: Vec::new(),
+            face_texture: Vec::new(),
+            inherit: Vec::new(),
+            scale: 1.0,
+            calibration: [[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]; 2],
+            sole_lift: 0.0,
+        }
+    }
+
+    fn frames_at(roots: &[[f32; 3]]) -> Vec<Frame> {
+        roots
+            .iter()
+            .map(|root| Frame {
+                rotations: vec![[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]],
+                positions: vec![*root],
+                root: *root,
+            })
+            .collect()
+    }
+
+    /// The root's translation keys, read back out of the file's own accessors.
+    fn root_translations(path: &Path) -> Vec<[f32; 3]> {
+        let bytes = std::fs::read(path).expect("a written file");
+        let json_length = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes[20..20 + json_length]).expect("the JSON chunk");
+        let binary_start = 20 + json_length + 8;
+        let root = json["nodes"]
+            .as_array()
+            .expect("nodes")
+            .iter()
+            .position(|node| node["children"].is_array())
+            .unwrap_or(0);
+        let channels = json["animations"][0]["channels"].as_array().expect("channels");
+        let channel = channels
+            .iter()
+            .find(|channel| channel["target"]["node"] == root && channel["target"]["path"] == "translation")
+            .expect("a translation channel on the root");
+        let sampler = channel["sampler"].as_u64().unwrap() as usize;
+        let accessor = json["animations"][0]["samplers"][sampler]["output"].as_u64().unwrap() as usize;
+        let accessor = &json["accessors"][accessor];
+        let count = accessor["count"].as_u64().unwrap() as usize;
+        let view = &json["bufferViews"][accessor["bufferView"].as_u64().unwrap() as usize];
+        let start = binary_start + view["byteOffset"].as_u64().unwrap_or(0) as usize;
+        (0..count)
+            .map(|index| {
+                let at = start + index * 12;
+                [
+                    f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()),
+                    f32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()),
+                    f32::from_le_bytes(bytes[at + 8..at + 12].try_into().unwrap()),
+                ]
+            })
+            .collect()
+    }
+
+    /// `place_at_origin`: an exported copy starts on the world X/Z origin, its
+    /// height and the rest of the walk kept (`mocap/export_options.py`).
+    #[test]
+    fn the_exported_copy_starts_on_the_origin() {
+        let character = one_bone_character();
+        let frames = frames_at(&[[-1.0, 0.9, -4.8], [-0.9, 0.95, -4.5]]);
+        let path = std::env::temp_dir().join("velomocap-origin-on.glb");
+        write_glb(&character, &frames, Options::default(), 30.0, &path).expect("a glb");
+        let keys = root_translations(&path);
+        assert!(keys[0][0].abs() < 1e-5, "x {:?}", keys[0]);
+        assert!(keys[0][2].abs() < 1e-5, "z {:?}", keys[0]);
+        assert!((keys[0][1] - 0.9).abs() < 1e-5, "height must be kept: {:?}", keys[0]);
+        // The walk is kept: the second key is still 0.1 m to the right and 0.3 m on.
+        assert!((keys[1][0] - 0.1).abs() < 1e-5, "{:?}", keys[1]);
+        assert!((keys[1][2] - 0.3).abs() < 1e-5, "{:?}", keys[1]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// With the option off the file keeps the metric placement.
+    #[test]
+    fn turning_the_option_off_keeps_the_world_position() {
+        let character = one_bone_character();
+        let frames = frames_at(&[[-1.0, 0.9, -4.8], [-0.9, 0.95, -4.5]]);
+        let path = std::env::temp_dir().join("velomocap-origin-off.glb");
+        let options = Options {
+            place_at_origin: false,
+            ..Options::default()
+        };
+        write_glb(&character, &frames, options, 30.0, &path).expect("a glb");
+        let keys = root_translations(&path);
+        assert!((keys[0][0] + 1.0).abs() < 1e-5, "x {:?}", keys[0]);
+        assert!((keys[0][2] + 4.8).abs() < 1e-5, "z {:?}", keys[0]);
+        let _ = std::fs::remove_file(&path);
+    }
 }

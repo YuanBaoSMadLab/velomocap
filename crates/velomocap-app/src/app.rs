@@ -344,6 +344,8 @@ pub struct VeloMocap {
     pub estimate_camera: bool,
     /// Sidebar: smooth the estimated camera rotation.
     pub refine_camera: bool,
+    /// Sidebar: put the reconstructed actors on the world origin.
+    pub center_scene: bool,
     pub scale_width: usize,
         pub max_frames: usize,
     pub capture: Option<CaptureJob>,
@@ -477,6 +479,11 @@ pub struct VeloMocap {
     pub asset_skin: bool,
     pub asset_materials: bool,
     pub asset_animation: bool,
+    /// Centre each exported character's first frame on the world X/Z origin
+    /// (`place_at_origin`); height and travel are kept. On by default: a file
+    /// that lands four metres away from the origin is a file every importer has
+    /// to fix by hand.
+    pub asset_place_at_origin: bool,
     /// Which people's models to write; one file each.
     pub asset_selected: Vec<bool>,
     /// Where they land; empty means beside the clip.
@@ -592,6 +599,10 @@ impl VeloMocap {
             correction: velomocap_motion::correction::CorrectionSettings::default(),
             estimate_camera: false,
             refine_camera: true,
+            // On by default: an actor left four metres in front of the origin is
+            // what the camera saw, not what anyone wants in the viewport or the
+            // file. The sidebar turns it off for a metric scene.
+            center_scene: true,
             scale_width: 960,
             max_frames,
             capture: None,
@@ -687,6 +698,7 @@ impl VeloMocap {
         asset_skin: true,
         asset_materials: true,
         asset_animation: true,
+        asset_place_at_origin: true,
         asset_selected: Vec::new(),
         asset_folder: String::new(),
         asset_status: String::new(),
@@ -1061,6 +1073,7 @@ impl VeloMocap {
             skin: self.asset_skin,
             materials: self.asset_materials,
             animation: self.asset_animation,
+            place_at_origin: self.asset_place_at_origin,
         };
         let model = self.smplh_model.display().to_string();
         let fps = self.current_fps() as f32;
@@ -2194,6 +2207,7 @@ impl VeloMocap {
         }
         self.estimate_camera = settings.estimate_camera;
         self.refine_camera = settings.refine_camera;
+        self.center_scene = settings.center_scene;
         self.confidence = settings.confidence;
         self.use_flow = settings.use_flow;
         if let Some(mode) = crate::project::memory_mode_from_slug(&settings.memory_mode) {
@@ -2205,6 +2219,7 @@ impl VeloMocap {
         self.asset_skin = settings.asset_skin;
         self.asset_materials = settings.asset_materials;
         self.asset_animation = settings.asset_animation;
+        self.asset_place_at_origin = settings.asset_place_at_origin;
         self.asset_folder = settings.asset_folder.clone();
         self.storage_precision = settings.storage_precision;
         self.storage_compression = settings.storage_compression;
@@ -2400,6 +2415,7 @@ impl VeloMocap {
                 locks: self.locks.clone(),
                 estimate_camera: self.estimate_camera,
                 refine_camera: self.refine_camera,
+                center_scene: self.center_scene,
             }),
             mode: self.memory_mode,
         }));

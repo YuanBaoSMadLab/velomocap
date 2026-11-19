@@ -305,6 +305,11 @@ pub struct SettingsState {
     pub correction: velomocap_motion::correction::CorrectionSettings,
     pub estimate_camera: bool,
     pub refine_camera: bool,
+    /// Put the reconstructed actors on the world origin. A project written before
+    /// this flag existed was generated without it, so the default here is `false`
+    /// — the panel keeps showing what the saved motion actually is.
+    #[serde(default)]
+    pub center_scene: bool,
     pub confidence: f32,
     pub use_flow: bool,
     /// `unlimited`, `scheduled`, `hybrid` or `cpu`.
@@ -317,6 +322,10 @@ pub struct SettingsState {
     pub asset_materials: bool,
     #[serde(default = "yes")]
     pub asset_animation: bool,
+    /// Centre each exported character on the origin; `yes()` keeps a project
+    /// written before the flag existed exporting the way the panel now does.
+    #[serde(default = "yes")]
+    pub asset_place_at_origin: bool,
     /// Where the assets land; empty means beside the project.
     #[serde(default)]
     pub asset_folder: String,
@@ -474,6 +483,7 @@ impl Project {
                 correction: app.correction,
                 estimate_camera: app.estimate_camera,
                 refine_camera: app.refine_camera,
+                center_scene: app.center_scene,
                 confidence: app.confidence,
                 use_flow: app.use_flow,
                 memory_mode: memory_mode_slug(app.memory_mode).to_string(),
@@ -482,6 +492,7 @@ impl Project {
                 asset_skin: app.asset_skin,
                 asset_materials: app.asset_materials,
                 asset_animation: app.asset_animation,
+                asset_place_at_origin: app.asset_place_at_origin,
                 asset_folder: app.asset_folder.clone(),
                 storage_precision: app.storage_precision,
                 storage_compression: app.storage_compression,
@@ -1000,6 +1011,7 @@ mod tests {
                 correction: velomocap_motion::correction::CorrectionSettings::default(),
                 estimate_camera: false,
                 refine_camera: true,
+                center_scene: false,
                 confidence: 0.3,
                 use_flow: true,
                 memory_mode: "hybrid".to_string(),
@@ -1008,6 +1020,7 @@ mod tests {
                 asset_skin: true,
                 asset_materials: true,
                 asset_animation: true,
+                asset_place_at_origin: true,
                 asset_folder: String::new(),
                 storage_precision: Precision::High,
                 storage_compression: Compression::Fast,

@@ -304,6 +304,10 @@ pub fn t(english: &'static str) -> &'static str {
         "Mesh not loaded yet" => "网格尚未载入",
         "Solver Settings" => "求解器设置",
         "Static Camera" => "静态相机",
+        "Center At Origin" => "人物居中到原点",
+        "Put the reconstructed people on the world origin (one shared offset, so their distances to each other stay). Turn it off to keep the metric position the camera saw. Used by the next reconstruction" => {
+            "把重建后的人物放到世界原点（统一平移，人和人之间的距离不变）。关掉就保留相机看到的真实位置。下次重建生效"
+        }
         "Camera refinement is not part of this build" => "此版本不含相机优化",
         "Motion Correction" => "动作校正",
         "Enable Correction" => "启用校正",

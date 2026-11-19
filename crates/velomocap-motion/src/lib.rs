@@ -29,8 +29,9 @@ pub use bvh_people::write_person_bvh;
 pub use cleanup::{stabilise, CleanupConfig, CleanupReport};
 pub use export::{binding_from_rest, write_bvh, BvhExport};
 pub use flow::{
-    feature_rows, generate as generate_flow, prepare_bvh, prepare_bvh_for, scene_floor,
-    shift_to_floor, summarise as summarise_flow, write_clip_bvh, write_prepared,
+    center_clip, center_shift, feature_rows, generate as generate_flow, prepare_bvh,
+    prepare_bvh_for, scene_floor, shift_to_floor, shift_xz,
+    summarise as summarise_flow, write_clip_bvh, write_prepared,
     write_prepared_fbx, FlowClip, FlowConfig, PreparedBvh, ANCHOR_FRAMES, FEATURE_DIM,
     INPUT_DIM, NARROWBAND, VTXT_DIM,
 };

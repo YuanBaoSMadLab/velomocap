@@ -272,6 +272,11 @@ enum Command {
         /// Smooth the estimated camera rotation over time.
         #[arg(long)]
         refine_camera: bool,
+        /// Keep the take where the camera saw it (metres in front of the lens)
+        /// instead of centring it on the world origin. The written BVH/FBX are
+        /// centred by default, like the app's exports.
+        #[arg(long)]
+        keep_world: bool,
         /// Pelvis height offset from the automatic height, metres: positive only
         /// gives back the reach drop, negative lowers the body (-0.25..0.25).
         #[arg(long, default_value_t = 0.0)]
@@ -652,6 +657,7 @@ fn main() -> Result<()> {
             floor,
             static_camera,
             refine_camera,
+            keep_world,
             pelvis,
             limit,
             start,
@@ -721,6 +727,7 @@ fn main() -> Result<()> {
             floor,
             static_camera,
             refine_camera,
+            keep_world,
             pelvis,
             limit,
             start,
@@ -1343,6 +1350,7 @@ fn flow_report(
     floor: f32,
     static_camera: bool,
     refine_camera: bool,
+    keep_world: bool,
     pelvis: f32,
     limit: usize,
     start: usize,
@@ -1782,6 +1790,17 @@ fn flow_report(
                 std::fs::write(&rest_path, rest_bytes)?;
                 println!("wrote {} (same shape, rest pose)", rest_path.display());
             }
+        }
+    }
+    // The reference's `place_at_origin` export option, on by default: the metric
+    // placement is what a shared scene needs, but a lone character four metres in
+    // front of the origin is a character every DCC has to fix by hand. Applied to
+    // the exported copy only — the dumps above are still the raw take.
+    if !keep_world {
+        if let Some([dx, dz]) = velomocap_motion::center_clip(&mut clip) {
+            println!(
+                "  centred on the origin: x {dx:+.3} m z {dz:+.3} m (--keep-world keeps the metric position)"
+            );
         }
     }
     if let Some(path) = bvh {
