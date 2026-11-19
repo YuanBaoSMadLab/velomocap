@@ -170,19 +170,25 @@ impl PersonTrack {
 
 #[derive(Clone, Debug, Default)]
 pub struct Timings {
+    /// Reading and deserialising the two TorchScript modules: seconds the card
+    /// spends idle before the first frame can run.
+    pub load: f64,
     pub detect: f64,
     pub reconstruct: f64,
     /// The stabilising pass and the pruning after the last frame: CPU work the
     /// device sits idle through, so it is timed apart from the graph.
     pub cleanup: f64,
+    /// Decoding, tracking, the per-frame hooks and the bookkeeping between
+    /// batches — everything the card waits through.
+    pub other: f64,
     pub total: f64,
 }
 
 impl Timings {
     pub fn line(&self) -> String {
         format!(
-            "detect {:.2}s · reconstruct {:.2}s · cleanup {:.2}s · total {:.2}s",
-            self.detect, self.reconstruct, self.cleanup, self.total
+            "load {:.2}s · detect {:.2}s · reconstruct {:.2}s · cleanup {:.2}s · other {:.2}s · total {:.2}s",
+            self.load, self.detect, self.reconstruct, self.cleanup, self.other, self.total
         )
     }
 }
@@ -998,6 +1004,7 @@ pub fn capture_people_with(
     } else {
         None
     };
+    let load_started = Instant::now();
     let body = match torch_weights.as_deref() {
         Some(path) if velomocap_cpp::sam3d::Sam3dTorch::built() => {
             match velomocap_cpp::sam3d::Sam3dTorch::load_batch(path, config.gpu, torch_batch) {
@@ -1056,6 +1063,7 @@ pub fn capture_people_with(
         ))),
     };
     let backend = body.backend();
+    let load_seconds = load_started.elapsed().as_secs_f64();
 
     (hooks.progress)(0, 0, "opening video");
     // The reference re-encodes the clip to a constant 30 fps before anything
@@ -1076,7 +1084,10 @@ pub fn capture_people_with(
     let mut tracker = Tracker::new(0.3, config.max_missing);
 
     let mut people: Vec<PersonTrack> = Vec::new();
-    let mut timings = Timings::default();
+    let mut timings = Timings {
+        load: load_seconds,
+        ..Default::default()
+    };
     let mut meshes_stored = 0usize;
     let mut dropped_meshes = 0usize;
     let mut decoded = 0usize;
@@ -1116,12 +1127,15 @@ pub fn capture_people_with(
         }
         let index = decoded;
         decoded += 1;
+        let frame_start = Instant::now();
+        let reconstruct_before = timings.reconstruct;
         (hooks.preview)(&frame);
 
         (hooks.progress)(decoded, total, "detecting");
         let detect_start = Instant::now();
         let detections = detector.detect(&frame.rgb, frame.width, frame.height)?;
-        timings.detect += detect_start.elapsed().as_secs_f64();
+        let detect_here = detect_start.elapsed().as_secs_f64();
+        timings.detect += detect_here;
         tracker.update(&detections);
 
         // Every picked person answers to exactly one identity for the whole take:
@@ -1272,6 +1286,10 @@ pub fn capture_people_with(
         }
 
         (hooks.people)(index, &people);
+        // Everything the card waits through: decode, tracking, the hooks and the
+        // packing of this frame's jobs, minus the detector and the graph itself.
+        timings.other += (frame_start.elapsed().as_secs_f64() - detect_here)
+            - (timings.reconstruct - reconstruct_before);
         if config.max_frames > 0 && decoded >= config.max_frames {
             break;
         }
