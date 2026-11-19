@@ -97,6 +97,23 @@ impl ContactTracks {
         }
     }
 
+    /// Copy the detection into every track that still follows it.
+    ///
+    /// This is the reference's first-touch rule (`footlock_editor`: `contacts`
+    /// starts as a copy of `automatic_contacts`), and it is what makes a painted
+    /// lock *add* to the detector's runs. Without it, the first click on a foot
+    /// row replaced the whole foot's contacts with one frame: every other frame
+    /// the detector had found became "airborne", the correction stopped pinning
+    /// it, and the foot then floated wherever the network left it (12 mm on the
+    /// clip this was found on) while looking like a lock that had been ignored.
+    pub fn seed_from(&mut self, detected: &[Vec<Interval>; TRACK_COUNT]) {
+        for (index, track) in self.tracks.iter_mut().enumerate() {
+            if track.is_none() {
+                *track = Some(detected[index].clone());
+            }
+        }
+    }
+
     /// Sort, clamp, drop empties and merge overlaps, exactly like the reference's
     /// `normalize_ranges` (which merges an overlapping interval into its
     /// predecessor instead of rejecting the edit).
@@ -316,6 +333,29 @@ mod tests {
         assert!(locks.active(LEFT_FOOT, 11));
         assert!(!locks.active(LEFT_FOOT, 12), "end is exclusive");
         assert!(!locks.active(RIGHT_FOOT, 10));
+    }
+
+    /// The first edit starts from the detection: an automatic track takes a copy
+    /// of the detector's runs, an edited one is left alone, and an empty
+    /// detection stays an empty (but manual) track.
+    #[test]
+    fn seeding_starts_the_editor_from_the_detection() {
+        let detected: [Vec<Interval>; TRACK_COUNT] = [
+            vec![[0, 30], [40, 60]],
+            vec![[10, 40]],
+            Vec::new(),
+            Vec::new(),
+        ];
+        let mut locks = ContactTracks::automatic();
+        locks.set_track(RIGHT_FOOT, vec![[50, 52]]);
+        locks.seed_from(&detected);
+        assert_eq!(locks.track(LEFT_FOOT), Some(&[[0, 30], [40, 60]][..]));
+        assert_eq!(
+            locks.track(RIGHT_FOOT),
+            Some(&[[50, 52]][..]),
+            "an edited track must not be overwritten"
+        );
+        assert_eq!(locks.track(LEFT_HAND), Some(&[][..]));
     }
 
     #[test]

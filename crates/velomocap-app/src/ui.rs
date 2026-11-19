@@ -2052,7 +2052,13 @@ fn lock_rows(app: &mut VeloMocap, ui: &mut egui::Ui, frames: usize) {
                         }
                     }
                     if grab.0 == LockGrab::New {
-                        let mut list = before.clone().unwrap_or_default();
+                        // The first touch of an automatic track starts from the
+                        // detection, like the reference's editor: a new lock is
+                        // then added to the runs the clip already has instead of
+                        // becoming the only contact this foot has.
+                        app.seed_locks_from_detection();
+                        let mut list =
+                            app.locks.track(track).map(<[_]>::to_vec).unwrap_or_default();
                         list.push([frame, (frame + 1).min(frames)]);
                         app.locks.set_track(track, list);
                         app.locks.normalise(frames);
@@ -2237,6 +2243,9 @@ fn lock_rows(app: &mut VeloMocap, ui: &mut egui::Ui, frames: usize) {
                         .pointer_latest_pos()
                         .map(|position| frame_of(rect, position.x))
                         .unwrap_or(app.playhead);
+                    // Same first-touch rule as the press above: the lock is an
+                    // addition to the detector's runs, not a replacement for them.
+                    app.seed_locks_from_detection();
                     let before = app.locks.track(track).map(<[_]>::to_vec);
                     let mut list = before.clone().unwrap_or_default();
                     list.push([frame, (frame + 1).min(frames)]);

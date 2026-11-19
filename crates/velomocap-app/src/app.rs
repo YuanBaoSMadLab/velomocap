@@ -2643,6 +2643,21 @@ impl VeloMocap {
         }
     }
 
+    /// Start a manual edit from the detector's own runs.
+    ///
+    /// Called before the first lock is drawn: `ContactTracks::seed_from` copies
+    /// the detection into every track that is still automatic, so a painted lock
+    /// adds to the contacts the clip already has instead of replacing the whole
+    /// foot's track with one frame — which left the rest of that foot treated as
+    /// airborne, and therefore floating exactly as the network left it.
+    pub fn seed_locks_from_detection(&mut self) {
+        let detected = match self.flow.get(self.selected) {
+            Some(clip) => clip.contacts.clone(),
+            None => return,
+        };
+        self.locks.seed_from(&detected);
+    }
+
     /// Remember one track as it was before an edit and record the edit.
     pub fn push_lock_edit(&mut self, track: usize, before: Option<Vec<velomocap_motion::Interval>>) {
         let after = self.locks.track(track).map(<[_]>::to_vec);
