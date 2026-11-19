@@ -210,7 +210,7 @@ impl PeopleCapture {
         let feet = if feet.is_empty() {
             String::new()
         } else {
-            format!(" 路 {feet}")
+            format!(" · {feet}")
         };
         let meshes: usize = self
             .people
@@ -218,13 +218,13 @@ impl PeopleCapture {
             .map(|p| p.frames.iter().flatten().count())
             .sum();
         format!(
-            "{} people 路 {} person-frames 路 {} meshes @ {:.2} fps{}",
+            "{} people · {} person-frames · {} meshes @ {:.2} fps{}",
             self.people.len(),
             hits,
             meshes,
             self.fps,
             if self.dropped_meshes > 0 {
-                format!(" 路 {} dropped (mesh budget)", self.dropped_meshes)
+                format!(" · {} dropped (mesh budget)", self.dropped_meshes)
             } else {
                 String::new()
             },
@@ -634,8 +634,8 @@ fn flush_batch(
     Ok(())
 }
 
-/// The frames that run the hand branch: `[0, stride, 2路stride, 鈥` plus the
-/// last one 鈥?`mocap/flow_hand_sampling.py::sample_indices` exactly.
+/// The frames that run the hand branch: `[0, stride, 2×stride, …` plus the
+/// last one — `mocap/flow_hand_sampling.py::sample_indices` exactly.
 ///
 /// A stride of one (or zero) keeps every frame, which is what the module did
 /// before the fast path existed. The last frame is always an anchor so the

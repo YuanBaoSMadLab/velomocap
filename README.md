@@ -28,12 +28,17 @@ license: Apache-2.0 (source only, model weights excluded)
 ## Pipeline
 
 ```text
-video 鈹€鈻?YOLOv8 detector 鈹€鈻?IoU tracker
-                              鈹?                              鈻?        SAM 3D Body (TorchScript through LibTorch, ONNX fallback)
-        body 鈹€鈻?both hands 鈹€鈻?fusion 鈹€鈻?MHR mesh
-                              鈹? features: body + left hand + right hand
-                              鈻?        VGGT-Omega camera 鈹€鈻?FlowHMR MMDiT 鈹€鈻?SMPL-H solver 鈹€鈻?foot lock
-                              鈹?                              鈻?        viewport 路 animated .glb 路 BVH 路 binary FBX
+video ─► YOLOv8 detector ─► IoU tracker
+                              │
+                              ▼
+        SAM 3D Body (TorchScript through LibTorch, ONNX fallback)
+        body ─► both hands ─► fusion ─► MHR mesh
+                              │  features: body + left hand + right hand
+                              ▼
+        VGGT-Omega camera ─► FlowHMR MMDiT ─► SMPL-H solver ─► foot lock
+                              │
+                              ▼
+        viewport · animated .glb · BVH · binary FBX
 ```
 
 ## Compared with the Python way
@@ -41,7 +46,7 @@ video 鈹€鈻?YOLOv8 detector 鈹€鈻?IoU tracker
 | | Python pipelines (the reference implementation and similar projects) | VeloMocap |
 | --- | --- | --- |
 | Run time | Python interpreter + venv; an install script fetches runtimes | one native executable; no interpreter |
-| Each stage | research repositories glued together with Python | detector, tracker, body, camera, motion, foot lock, exporters 鈥?all here |
+| Each stage | research repositories glued together with Python | detector, tracker, body, camera, motion, foot lock, exporters — all here |
 | Deployment | pip/conda environment; a version drift breaks the chain | a folder: executable + DLLs + model path |
 | Scripting | needs a Python process | `velomocap-cli`, one command per job |
 | Inference | PyTorch / ONNX | LibTorch TorchScript by default, ONNX Runtime as a fallback, same weights |
@@ -50,7 +55,7 @@ video 鈹€鈻?YOLOv8 detector 鈹€鈻?IoU tracker
 
 ## What it does
 
-- **Import 鈫?detect 鈫?tick 鈫?reconstruct.** One detection pass, then only the people you
+- **Import → detect → tick → reconstruct.** One detection pass, then only the people you
   ticked are reconstructed; a tick survives the tracker re-numbering a body mid-take.
 - **Project and recovery.** One `.vp` file holds the video reference, the bodies, the mesh,
   the baked motion, the avatars and the hand-drawn locks. A take is also autosaved into
@@ -116,13 +121,13 @@ lists every file with its upstream, its licence and whether it was converted;
 weights, says which upstreams may not be redistributed (SMPL-H, YOLOv8), and
 [licenses/UPLOAD.md](licenses/UPLOAD.md) describes how to publish the allowed ones on
 Hugging Face or ModelScope. A packaged install carries only the files the app loads at run
-time; 	ools/make_package_manifest.py writes the manifest of such a package, so
-	ools/check_models.py can verify it offline.
+time; `tools/make_package_manifest.py` writes the manifest of such a package, so
+`tools/check_models.py` can verify it offline.
 
 ## Releases
 
 Tags mark the source that produced a working build. No binaries, archives or installers are
-published 鈥?build from source as above.
+published — build from source as above.
 
 ## Scope
 
@@ -148,14 +153,14 @@ tools/                    offline model export, comparisons, fetching
 
 ## Keywords
 
-motion capture 路 markerless mocap 路 video to animation 路 pose estimation 路 3D human 路
-SAM 3D Body 路 MHR 路 SMPL-H 路 SMPL 路 FlowHMR 路 VGGT 路 YOLOv8 路 ONNX Runtime 路 LibTorch 路
-TorchScript 路 Rust 路 C++ 路 egui 路 BVH 路 FBX 路 glTF 路 VRM 路 retargeting 路 Windows
+motion capture · markerless mocap · video to animation · pose estimation · 3D human ·
+SAM 3D Body · MHR · SMPL-H · SMPL · FlowHMR · VGGT · YOLOv8 · ONNX Runtime · LibTorch ·
+TorchScript · Rust · C++ · egui · BVH · FBX · glTF · VRM · retargeting · Windows
 
 ## License
 
-Apache License 2.0 鈥?see [LICENSE](LICENSE). It covers the source in this repository only;
+Apache License 2.0 — see [LICENSE](LICENSE). It covers the source in this repository only;
 [NOTICE](NOTICE) lists the model weights, body models and third-party binaries that keep
 their own licenses.
 
-涓枃璇存槑瑙?[README-zh.md](README-zh.md)銆?
+中文说明见 [README-zh.md](README-zh.md)。
