@@ -2670,7 +2670,11 @@ impl VeloMocap {
     /// the user found the "Apply Correction" button in the sidebar — which is
     /// exactly what "the locks do nothing" looked like.
     pub fn apply_correction_if_idle(&mut self) {
-        if !self.locks_dirty || self.recorrect.is_some() || self.capture.is_some() {
+        if !self.locks_dirty || self.recorrect.is_some() {
+            return;
+        }
+        // A *finished* capture job stays in `capture`, so ask whether it runs.
+        if self.capture.as_ref().is_some_and(|job| job.is_running()) {
             return;
         }
         let Some(edited) = self.locks_edited_at else {
