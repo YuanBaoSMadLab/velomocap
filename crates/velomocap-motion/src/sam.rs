@@ -278,18 +278,6 @@ fn device_is_roomy() -> bool {
         .unwrap_or(false)
 }
 
-/// Whether the device has room for the widest batch *and* both graphs.
-///
-/// The full and the body-only module together hold ~7 GB of weights, and a
-/// batch of eight peaks around 4 GiB on top at the app's work resolution. Below
-/// twelve gigabytes the capture keeps one graph and per-frame hands, which
-/// still fits.
-fn device_has_room_for_two() -> bool {
-    velomocap_cpp::sam3d::cuda_memory()
-        .map(|(_, total)| total >= 12 * 1024 * 1024 * 1024)
-        .unwrap_or(false)
-}
-
 /// The body-only graph (`sam3d_body_b<N>_ts.pt`) traced at the same batch.
 fn find_body_module(config: &SamConfig, batch: usize) -> Option<PathBuf> {
     let mut roots = vec![config.sam3d_dir.clone()];
@@ -396,15 +384,16 @@ enum SamRunner {
     /// The eleven ONNX graphs driven from Rust.
     Onnx(std::cell::RefCell<Box<Sam3dBody>>),
     /// One TorchScript module: `run_inference(inference_type="full")`, hands and
-    /// fusion included. See `docs/SAM3D.md`. The module may be traced at a
-    /// batch of several items; [`SamRunner::batch`] reports how many.
+    /// fusion included, or the body-only graph (`inference_type="body"`). See
+    /// `docs/SAM3D.md`; [`SamRunner::batch`] reports how many items one call
+    /// carries.
     ///
-    /// `body` is the same graph traced with `inference_type="body"`: one body
-    /// pass and no hand crops. It carries the frames whose hand features are
-    /// interpolated from a neighbour, which is the reference's video default.
+    /// **One module at a time.** The two graphs use the same 3 GB of backbone
+    /// weights, so holding both resident cost 3 GB of device memory for nothing:
+    /// the capture runs the hand frames with the full graph, releases it, and
+    /// then loads the body-only graph for the rest (`run_phase`).
     Torch {
         full: Box<velomocap_cpp::sam3d::Sam3dTorch>,
-        body: Option<Box<velomocap_cpp::sam3d::Sam3dTorch>>,
     },
 }
 
@@ -419,8 +408,6 @@ struct PendingJob {
     rgb: Arc<Vec<u8>>,
     width: usize,
     height: usize,
-    /// Whether this item goes through the full graph (hand crops included).
-    hands: bool,
 }
 
 impl SamRunner {
@@ -435,13 +422,8 @@ impl SamRunner {
     fn batch(&self) -> usize {
         match self {
             Self::Onnx(_) => 1,
-            Self::Torch { full, .. } => full.batch(),
+            Self::Torch { full } => full.batch(),
         }
-    }
-
-    /// Whether this backend can leave the hand branch out of some frames.
-    fn can_stride_hands(&self) -> bool {
-        matches!(self, Self::Torch { body: Some(_), .. })
     }
 
     /// Run a full batch and return one frame per job, in order.
@@ -468,7 +450,7 @@ impl SamRunner {
                 }
                 Ok(out)
             }
-            Self::Torch { full, body } => {
+            Self::Torch { full } => {
                 let (height, width) = (jobs[0].height, jobs[0].width);
                 let area = width * height;
                 let plane = 3 * area;
@@ -509,15 +491,9 @@ impl SamRunner {
                         cam_int,
                     })
                     .collect();
-                // One queue per graph: the caller never mixes sampled and
-                // unsampled items in a single call.
-                let module = if jobs[0].hands {
-                    full
-                } else {
-                    body.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!("this backend has no body-only module")
-                    })?
-                };
+                // One module per call: the phases hand it either the full graph or
+                // the body-only one, never a mix.
+                let module = full;
                 let outputs = module
                     .run_full_batch(&inputs)
                     .map_err(|error| anyhow::anyhow!("SAM 3D Body (TorchScript): {error}"))?;
@@ -636,6 +612,97 @@ fn flush_batch(
         // the track's range is the widest it has seen, not the last write.
         track.last_frame = track.last_frame.max(job.index);
         track.hits += 1;
+    }
+    Ok(())
+}
+
+/// Run one module over the frames it is responsible for.
+///
+/// The capture is split in two passes so that only one graph is resident: this
+/// one decodes the clip again (a few milliseconds a frame), takes the jobs the
+/// detection pass recorded for the frames this phase owns, and feeds them to
+/// `runner` in batches of its traced size.
+#[allow(clippy::too_many_arguments)]
+fn run_phase(
+    tools: &velomocap_video::Tools,
+    video: &Path,
+    work_width: usize,
+    total: usize,
+    plan: &[Vec<(usize, Detection)>],
+    want_hands: bool,
+    hands_on_frame: &[bool],
+    runner: &SamRunner,
+    mesh: &MeshTopology,
+    config: &SamConfig,
+    intrinsics: [[f32; 3]; 3],
+    people: &mut Vec<PersonTrack>,
+    timings: &mut Timings,
+    meshes_stored: &mut usize,
+    dropped_meshes: &mut usize,
+    hooks: &mut SamHooks<'_>,
+) -> Result<()> {
+    let batch = runner.batch().max(1);
+    let mut decoder = Decoder::open_flow(tools, video, Some(work_width))?;
+    let mut pending: Vec<PendingJob> = Vec::with_capacity(batch * 2);
+    let mut index = 0usize;
+    while let Some(frame) = decoder.next_frame()? {
+        if (hooks.cancelled)() {
+            break;
+        }
+        if index >= total {
+            break;
+        }
+        let here = hands_on_frame.get(index).copied().unwrap_or(false);
+        let jobs = plan.get(index);
+        if here != want_hands || jobs.map_or(true, Vec::is_empty) {
+            index += 1;
+            continue;
+        }
+        let jobs = jobs.expect("checked above");
+        let frame_rgb = Arc::new(frame.rgb.clone());
+        for (slot, detection) in jobs {
+            (hooks.progress)(index + 1, total, "reconstructing");
+            pending.push(PendingJob {
+                slot: *slot,
+                index,
+                detection: *detection,
+                rgb: Arc::clone(&frame_rgb),
+                width: frame.width,
+                height: frame.height,
+            });
+        }
+        while pending.len() >= batch {
+            let group: Vec<PendingJob> = pending.drain(..batch).collect();
+            flush_batch(
+                people,
+                mesh,
+                config,
+                runner,
+                &group,
+                intrinsics,
+                timings,
+                meshes_stored,
+                dropped_meshes,
+            )?;
+            (hooks.people)(index, people);
+        }
+        index += 1;
+    }
+    // Whatever is left of the last batch still has to be reconstructed: the
+    // module pads it up to its own batch and the extra results are dropped.
+    if !pending.is_empty() && !(hooks.cancelled)() {
+        let group: Vec<PendingJob> = pending.drain(..).collect();
+        flush_batch(
+            people,
+            mesh,
+            config,
+            runner,
+            &group,
+            intrinsics,
+            timings,
+            meshes_stored,
+            dropped_meshes,
+        )?;
     }
     Ok(())
 }
@@ -998,12 +1065,16 @@ pub fn capture_people_with(
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(config.hand_stride);
-    let body_weights = if torch_weights.is_some() && hand_stride > 1 && device_has_room_for_two()
-    {
+    // A body-only graph exists exactly when the hands are sampled: it carries the
+    // frames whose hand features are interpolated. Its presence is what makes the
+    // two-phase capture possible, so a card that could not hold two modules no
+    // longer has to give the hands up.
+    let body_weights = if torch_weights.is_some() && hand_stride > 1 {
         find_body_module(config, torch_batch)
     } else {
         None
     };
+    let hand_stride = if body_weights.is_some() { hand_stride } else { 1 };
     let load_started = Instant::now();
     let body = match torch_weights.as_deref() {
         Some(path) if velomocap_cpp::sam3d::Sam3dTorch::built() => {
@@ -1014,29 +1085,8 @@ pub fn capture_people_with(
                         path.display(),
                         module.batch()
                     );
-                    let body_only = body_weights.as_deref().and_then(|body_path| {
-                        match velomocap_cpp::sam3d::Sam3dTorch::load_batch(
-                            body_path, config.gpu, torch_batch,
-                        ) {
-                            Ok(body_module) => {
-                                eprintln!(
-                                    "[SAM] hands every {} frame(s), body {} elsewhere",
-                                    hand_stride.max(1),
-                                    body_path.display()
-                                );
-                                Some(Box::new(body_module))
-                            }
-                            Err(error) => {
-                                eprintln!(
-                                    "[SAM] body-only load failed ({error}); hands every frame"
-                                );
-                                None
-                            }
-                        }
-                    });
                     SamRunner::Torch {
                         full: Box::new(module),
-                        body: body_only,
                     }
                 }
                 Err(error) => {
@@ -1097,17 +1147,8 @@ pub fn capture_people_with(
     // slot, so the cast cannot grow past the number of seeds.
     let mut picks: Vec<Pick> = Vec::new();
     let mut slots: Vec<Option<usize>> = Vec::new();
-    // People waiting for a batch of `body.batch()` items. Hand frames and body
-    // frames go to different graphs, so each gets its own queue.
-    let mut pending_hands: Vec<PendingJob> = Vec::new();
-    let mut pending_body: Vec<PendingJob> = Vec::new();
     // The frames the hand branch runs on; the rest are interpolated at the end.
-    // A backend without a body-only graph runs the hands everywhere.
-    let hand_stride = if body.can_stride_hands() {
-        hand_stride.max(1)
-    } else {
-        1
-    };
+    // Without a body-only graph every frame takes the hand branch.
     let anchors = hand_sample_indices(total, hand_stride);
     let mut hands_on_frame = vec![false; total.max(1)];
     for index in &anchors {
@@ -1121,6 +1162,9 @@ pub fn capture_people_with(
         );
     }
 
+    // Pass one: decode, detect, track and decide which person owns which frame.
+    // The graph is not touched here, so nothing of it is on the card yet.
+    let mut plan: Vec<Vec<(usize, Detection)>> = Vec::with_capacity(total);
     while let Some(frame) = decoder.next_frame()? {
         if (hooks.cancelled)() {
             break;
@@ -1128,7 +1172,6 @@ pub fn capture_people_with(
         let index = decoded;
         decoded += 1;
         let frame_start = Instant::now();
-        let reconstruct_before = timings.reconstruct;
         (hooks.preview)(&frame);
 
         (hooks.progress)(decoded, total, "detecting");
@@ -1233,49 +1276,19 @@ pub fn capture_people_with(
             }
         }
 
-        // Queue this frame's people. A module traced at several items per call
-        // takes them in batches; the ONNX chain takes them one at a time, which
-        // is the same code with a batch of one. Frames whose hand features are
-        // interpolated go to the body-only graph instead.
-        let frame_rgb = Arc::new(frame.rgb.clone());
-        let hands_here = hands_on_frame[index.min(hands_on_frame.len().saturating_sub(1))];
-        let queue = if hands_here {
-            &mut pending_hands
-        } else {
-            &mut pending_body
-        };
+        // Queue this frame's people for the phase that owns it. A module traced at
+        // several items per call takes them in batches; the ONNX chain takes them
+        // one at a time, which is the same code with a batch of one. Frames whose
+        // hand features are interpolated go to the body-only graph instead.
+        while plan.len() <= index {
+            plan.push(Vec::new());
+        }
         for (slot, detection) in jobs {
             (hooks.progress)(decoded, total, "reconstructing");
             while people[slot].frames.len() <= index {
                 people[slot].frames.push(None);
             }
-            queue.push(PendingJob {
-                slot,
-                index,
-                detection,
-                rgb: Arc::clone(&frame_rgb),
-                width: frame.width,
-                height: frame.height,
-                hands: hands_here,
-            });
-        }
-        let batch = body.batch().max(1);
-        for queue in [&mut pending_hands, &mut pending_body] {
-            while queue.len() >= batch {
-                let count = batch.min(queue.len());
-                let group: Vec<PendingJob> = queue.drain(..count).collect();
-                flush_batch(
-                    &mut people,
-                    &mesh,
-                    config,
-                    &body,
-                    &group,
-                    intrinsics,
-                    &mut timings,
-                    &mut meshes_stored,
-                    &mut dropped_meshes,
-                )?;
-            }
+            plan[index].push((slot, detection));
         }
 
         // Keep every other track's frame list aligned with the clip.
@@ -1287,41 +1300,149 @@ pub fn capture_people_with(
 
         (hooks.people)(index, &people);
         // Everything the card waits through: decode, tracking, the hooks and the
-        // packing of this frame's jobs, minus the detector and the graph itself.
-        timings.other += (frame_start.elapsed().as_secs_f64() - detect_here)
-            - (timings.reconstruct - reconstruct_before);
+        // packing of this frame's jobs.
+        timings.other += frame_start.elapsed().as_secs_f64() - detect_here;
         if config.max_frames > 0 && decoded >= config.max_frames {
             break;
         }
     }
 
-    // Whatever is left of the last batch still has to be reconstructed: the
-    // module pads it up to its own batch and the extra results are dropped.
-    if !(hooks.cancelled)() && !(pending_hands.is_empty() && pending_body.is_empty()) {
-        for queue in [&mut pending_hands, &mut pending_body] {
-            if queue.is_empty() {
-                continue;
+    // Pass two: the graph, one module at a time. The hand frames use the full
+    // graph; then it is released and the body-only graph runs the rest. Holding
+    // both resident is what pushed a capture from 6 GB of device memory to 9.
+    //
+    // Both graphs ready to run means the hands are sampled: the full graph takes
+    // the hand frames, the body-only one takes the rest. Otherwise a single phase
+    // runs every frame through the full graph.
+    let two_phases = body_weights.is_some();
+    if let Some(path) = body_weights.as_deref() {
+        eprintln!(
+            "[SAM] hands every {} frame(s), body {} elsewhere (one module at a time)",
+            hand_stride.max(1),
+            path.display()
+        );
+    }
+    let mut runner = Some(body);
+    if let Some(active) = runner.as_ref() {
+        run_phase(
+            &tools,
+            video,
+            config.work_width,
+            total,
+            &plan,
+            true,
+            &hands_on_frame,
+            active,
+            &mesh,
+            config,
+            intrinsics,
+            &mut people,
+            &mut timings,
+            &mut meshes_stored,
+            &mut dropped_meshes,
+            hooks,
+        )?;
+    }
+    // The frames that do not need the hand crops: release the full graph first, so
+    // the body-only one is the only module on the card.
+    if two_phases && !(hooks.cancelled)() {
+        drop(runner.take());
+        let path = body_weights.as_deref().expect("checked above");
+        let second_load = Instant::now();
+        match velomocap_cpp::sam3d::Sam3dTorch::load_batch(path, config.gpu, torch_batch) {
+            Ok(module) => {
+                timings.load += second_load.elapsed().as_secs_f64();
+                let runner = SamRunner::Torch {
+                    full: Box::new(module),
+                };
+                run_phase(
+                    &tools,
+                    video,
+                    config.work_width,
+                    total,
+                    &plan,
+                    false,
+                    &hands_on_frame,
+                    &runner,
+                    &mesh,
+                    config,
+                    intrinsics,
+                    &mut people,
+                    &mut timings,
+                    &mut meshes_stored,
+                    &mut dropped_meshes,
+                    hooks,
+                )?;
             }
-            let group: Vec<PendingJob> = queue.drain(..).collect();
-            flush_batch(
-                &mut people,
-                &mesh,
-                config,
-                &body,
-                &group,
-                intrinsics,
-                &mut timings,
-                &mut meshes_stored,
-                &mut dropped_meshes,
-            )?;
+            Err(error) => {
+                // The body graph failed to load: fall back to the full graph for
+                // the remaining frames rather than losing them.
+                eprintln!("[SAM] body-only load failed ({error}); reloading the full graph");
+                let path = torch_weights.as_deref().expect("a TorchScript module");
+                let module = velomocap_cpp::sam3d::Sam3dTorch::load_batch(
+                    path,
+                    config.gpu,
+                    torch_batch,
+                )?;
+                let runner = SamRunner::Torch {
+                    full: Box::new(module),
+                };
+                run_phase(
+                    &tools,
+                    video,
+                    config.work_width,
+                    total,
+                    &plan,
+                    false,
+                    &hands_on_frame,
+                    &runner,
+                    &mesh,
+                    config,
+                    intrinsics,
+                    &mut people,
+                    &mut timings,
+                    &mut meshes_stored,
+                    &mut dropped_meshes,
+                    hooks,
+                )?;
+            }
         }
+    }
+    // One module for the whole clip (no body-only graph): the same graph takes the
+    // frames the hand phase skipped.
+    if !two_phases {
+        if let Some(active) = runner.as_ref() {
+            if let SamRunner::Torch { .. } = active {
+                if hand_stride > 1 {
+                    run_phase(
+                        &tools,
+                        video,
+                        config.work_width,
+                        total,
+                        &plan,
+                        false,
+                        &hands_on_frame,
+                        active,
+                        &mesh,
+                        config,
+                        intrinsics,
+                        &mut people,
+                        &mut timings,
+                        &mut meshes_stored,
+                        &mut dropped_meshes,
+                        hooks,
+                    )?;
+                }
+            }
+        }
+    }
+    drop(runner);
+    if hand_stride > 1 && !(hooks.cancelled)() {
         // Fill the hand features of the frames the hand branch skipped, from
         // their neighbouring anchors (`flow_hand_sampling.py::interpolate_hands`).
-        if hand_stride > 1 {
-            (hooks.progress)(decoded, total, "interpolating hands");
-            for track in people.iter_mut() {
-                interpolate_hand_tokens(&mut track.frames, &anchors);
-            }
+        (hooks.progress)(decoded, total, "interpolating hands");
+        for track in people.iter_mut() {
+            interpolate_hand_tokens(&mut track.frames, &anchors);
         }
         (hooks.people)(decoded.saturating_sub(1), &people);
     }
