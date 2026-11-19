@@ -1393,6 +1393,46 @@ fn flow_report(
         people: &mut people,
         cancelled: &cancelled,
     };
+    let motion_config = FlowConfig {
+        motion: MotionConfig {
+            weights: resolve_model(weights),
+            stats: resolve_model(stats),
+            steps: steps.max(1),
+            seed,
+            session: SessionConfig {
+                gpu,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        max_frames: frames,
+        start,
+        blank_tokens: blank,
+        zero_noise,
+        dump: dump.map(|p| p.to_path_buf()),
+        // A single clip has no other actor to agree with: shift it here.
+        defer_floor: false,
+    };
+    // VGGT's load is disk and CPU work (4.4 GB of weights plus ONNX Runtime's
+    // optimisation pass), so it runs in the background while the capture works.
+    // Its *estimate* does not: measured on this card, overlapping the two
+    // engines made the pair slower (31.8 s against 28.4 s for VGGT alone, and
+    // the capture lost what the overlap gained), because both want the same SMs.
+    let camera_load = (camera.is_none() && !static_camera).then(|| {
+        let weights = resolve_model(camera_weights);
+        std::thread::spawn(move || -> Result<VggtCamera> {
+            VggtCamera::load(VggtConfig {
+                weights,
+                interval: camera_interval,
+                max_frames: limit,
+                session: SessionConfig {
+                    gpu,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+        })
+    });
     let capture = capture_people_with(video, &sam_config, &mut hooks)?;
     eprintln!();
     println!("sam: {} people · {} frames", capture.people.len(), capture.frames);
@@ -1461,19 +1501,15 @@ fn flow_report(
             )
         }
         None => {
+            // The weights have been loading in the background since before the
+            // capture started; this join is the wait, not the work.
+            let mut vggt = match camera_load {
+                Some(job) => job
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("the VGGT load thread panicked"))??,
+                None => unreachable!("a load is always started when the camera is estimated"),
+            };
             let tools = velomocap_video::Tools::discover()?;
-            let mut vggt = VggtCamera::load(VggtConfig {
-                weights: resolve_model(camera_weights),
-                interval: camera_interval,
-                // `--limit` bounds the clip, so the camera pass must not read the
-                // whole video for it.
-                max_frames: limit,
-                session: SessionConfig {
-                    gpu,
-                    ..Default::default()
-                },
-                ..Default::default()
-            })?;
             let started = Instant::now();
             let track = vggt.estimate(&tools, video)?;
             println!(
@@ -1521,28 +1557,11 @@ fn flow_report(
         model.num_vertices, model.num_joints, model.num_betas
     );
 
-    let config = FlowConfig {
-        motion: MotionConfig {
-            weights: resolve_model(weights),
-            stats: resolve_model(stats),
-            steps: steps.max(1),
-            seed,
-            session: SessionConfig {
-                gpu,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        max_frames: frames,
-        start,
-        blank_tokens: blank,
-        zero_noise,
-        dump: dump.map(|p| p.to_path_buf()),
-        // A single clip has no other actor to agree with: shift it here.
-        defer_floor: false,
-    };
+    // FlowHMR loads *after* the camera pass on purpose: its 1.8 GB of weights
+    // stay resident, and holding them across VGGT's estimate pushed that stage
+    // from 21 s to 159 s on a 17 GB card (VGGT peaks at 15.9 GB on its own).
     let started = Instant::now();
-    let mut clip = velomocap_motion::generate_flow(track, &camera_track, &model, &config)?;
+    let mut clip = velomocap_motion::generate_flow(track, &camera_track, &model, &motion_config)?;
     println!(
         "flowhmr: {:.1}s, {} steps, backend {}",
         started.elapsed().as_secs_f64(),

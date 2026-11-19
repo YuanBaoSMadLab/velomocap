@@ -622,7 +622,10 @@ fn flush_batch(
         } else {
             *dropped_meshes += 1;
         }
-        track.last_frame = job.index;
+        // A batch can span frames, and the two queues flush independently, so a
+        // later flush can carry an *earlier* frame than one that already landed:
+        // the track's range is the widest it has seen, not the last write.
+        track.last_frame = track.last_frame.max(job.index);
         track.hits += 1;
     }
     Ok(())
