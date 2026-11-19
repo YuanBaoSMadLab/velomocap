@@ -431,6 +431,9 @@ pub struct VeloMocap {
     locks_pending: bool,
     /// The locks changed since the clip was generated: the next run applies them.
     pub locks_dirty: bool,
+    /// When the last lock edit happened, so the re-solve can wait for the user to
+    /// stop drawing instead of running once per drag step.
+    pub locks_edited_at: Option<Instant>,
     /// When the playhead last moved on its own, so a seek that never produced a
     /// picture can be retried instead of leaving the pane on the old frame.
     seek_at: Instant,
@@ -674,6 +677,7 @@ impl VeloMocap {
             lock_drag: None,
             locks_pending: true,
             locks_dirty: false,
+            locks_edited_at: None,
             seek_at: Instant::now(),
             seek_tries: 0,
             console: Vec::new(),
@@ -2658,6 +2662,29 @@ impl VeloMocap {
         self.locks.seed_from(&detected);
     }
 
+    /// Re-solve once the user stops drawing, so a lock visibly does something.
+    ///
+    /// The correction is cheap (no inference: it re-applies the passes to the
+    /// take's stored motion), so a drawn lock is followed by a re-solve half a
+    /// second after the last edit. Without this, nothing on screen changed until
+    /// the user found the "Apply Correction" button in the sidebar — which is
+    /// exactly what "the locks do nothing" looked like.
+    pub fn apply_correction_if_idle(&mut self) {
+        if !self.locks_dirty || self.recorrect.is_some() || self.capture.is_some() {
+            return;
+        }
+        let Some(edited) = self.locks_edited_at else {
+            return;
+        };
+        if edited.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        if !self.can_apply_correction() {
+            return;
+        }
+        self.apply_correction();
+    }
+
     /// Remember one track as it was before an edit and record the edit.
     pub fn push_lock_edit(&mut self, track: usize, before: Option<Vec<velomocap_motion::Interval>>) {
         let after = self.locks.track(track).map(<[_]>::to_vec);
@@ -2675,6 +2702,7 @@ impl VeloMocap {
             self.lock_undo.remove(0);
         }
         self.lock_redo.clear();
+        self.locks_edited_at = Some(Instant::now());
         self.save_locks();
     }
 
@@ -3615,6 +3643,7 @@ impl eframe::App for VeloMocap {
         self.poll_detection(ctx);
         self.poll_capture(ctx);
         self.poll_recorrect(ctx);
+        self.apply_correction_if_idle();
         self.poll_stream(ctx);
         self.poll_asset_export(ctx);
         self.shortcuts(ctx);

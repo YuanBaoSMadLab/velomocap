@@ -274,6 +274,40 @@ pub struct ClipState {
     pub rotations: Slice,
     pub bvh: BvhState,
     pub contacts: [Vec<[usize; 2]>; 4],
+    /// The motion the model generated, before the contact correction: what
+    /// "Apply Correction" starts from. `None` in a project written before this
+    /// block existed.
+    #[serde(default)]
+    pub source: Option<SourceState>,
+}
+
+/// The solver's input for one take.
+///
+/// Only the pose parameters are stored — a few hundred kilobytes per take. The
+/// forward pass that turns them into skeletons runs when the solver loads its
+/// model, so a project does not carry two copies of the geometry.
+#[derive(Serialize, Deserialize)]
+pub struct SourceState {
+    pub fps: f32,
+    pub joints: usize,
+    pub betas: usize,
+    pub frame_count: usize,
+    /// Per frame: root (3), translation (3), body `(joints-1)*3`, betas.
+    pub poses: Slice,
+    /// Per frame: the four contact channels.
+    pub foot_contacts: Slice,
+    pub floor: f32,
+    pub floor_from_contacts: bool,
+    pub offset: [f32; 3],
+    pub anchors: usize,
+    pub anchor_residual: [f32; 3],
+}
+
+impl SourceState {
+    /// Values per stored pose, in write order.
+    pub fn stride(joints: usize, betas: usize) -> usize {
+        6 + joints.saturating_sub(1) * 3 + betas
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -465,6 +499,41 @@ impl Project {
                             local: block.f64s(&clip.bvh.local),
                         },
                         contacts: clip.contacts.clone(),
+                        source: clip.source.as_ref().map(|source| {
+                            let betas = source.betas.len();
+                            let joints = source
+                                .poses
+                                .first()
+                                .map(|pose| pose.body.len() / 3 + 1)
+                                .unwrap_or(0);
+                            let mut poses = Vec::with_capacity(
+                                source.poses.len() * SourceState::stride(joints, betas),
+                            );
+                            for pose in source.poses.iter() {
+                                poses.extend_from_slice(&pose.root);
+                                poses.extend_from_slice(&pose.translation);
+                                poses.extend_from_slice(&pose.body);
+                                poses.extend_from_slice(&pose.betas);
+                            }
+                            let mut contacts =
+                                Vec::with_capacity(source.foot_contacts.len() * 4);
+                            for row in &source.foot_contacts {
+                                contacts.extend_from_slice(row);
+                            }
+                            SourceState {
+                                fps: source.fps,
+                                joints,
+                                betas,
+                                frame_count: source.poses.len(),
+                                poses: block.f32s(&poses),
+                                foot_contacts: block.f32s(&contacts),
+                                floor: source.floor,
+                                floor_from_contacts: source.floor_from_contacts,
+                                offset: source.offset,
+                                anchors: source.anchors,
+                                anchor_residual: source.anchor_residual,
+                            }
+                        }),
                     }
                 })
                 .collect(),
@@ -745,9 +814,53 @@ pub fn clip(state: &ClipState, numbers: &Viewed<'_>) -> FlowBody {
         }),
         skeletons: Arc::new(skeletons),
         contacts: state.contacts.clone(),
-        // A project stores the baked take, not the solver's input: "apply
-        // correction" needs a regeneration first (the console says so).
-        source: None,
+        source: state.source.as_ref().map(|source| {
+            Arc::new(clip_source(source, numbers))
+        }),
+    }
+}
+
+/// Rebuild the solver's input from a project.
+///
+/// The skeletons are left empty on purpose: the correction needs the body model
+/// to produce them, and that model is loaded by `recorrect`, which fills them
+/// from these poses before the first pass reads a probe.
+fn clip_source(state: &SourceState, numbers: &Viewed<'_>) -> velomocap_motion::FlowClip {
+    let stride = SourceState::stride(state.joints, state.betas);
+    let flat = numbers.f32s(&state.poses);
+    let mut poses = Vec::with_capacity(state.frame_count);
+    for index in 0..state.frame_count {
+        let from = index * stride;
+        let Some(row) = flat.get(from..from + stride) else {
+            break;
+        };
+        let mut pose = velomocap_body::Pose::neutral(state.joints.max(1), state.betas);
+        pose.root.copy_from_slice(&row[0..3]);
+        pose.translation.copy_from_slice(&row[3..6]);
+        let body = &row[6..6 + state.joints.saturating_sub(1) * 3];
+        pose.body.copy_from_slice(body);
+        pose.betas.copy_from_slice(&row[6 + body.len()..stride]);
+        poses.push(pose);
+    }
+    let contacts = numbers.f32s(&state.foot_contacts);
+    let foot_contacts: Vec<[f32; 4]> = contacts
+        .chunks_exact(4)
+        .map(|row| [row[0], row[1], row[2], row[3]])
+        .collect();
+    velomocap_motion::FlowClip {
+        fps: state.fps,
+        skeletons: Vec::new(),
+        rot6d: Vec::new(),
+        trans: poses.iter().map(|pose| pose.translation).collect(),
+        betas: poses.first().map(|pose| pose.betas.clone()).unwrap_or_default(),
+        foot_contacts,
+        floor: state.floor,
+        floor_from_contacts: state.floor_from_contacts,
+        offset: state.offset,
+        source_frames: (0..poses.len()).collect(),
+        anchors: state.anchors,
+        anchor_residual: state.anchor_residual,
+        poses,
     }
 }
 
@@ -947,6 +1060,13 @@ mod tests {
         let rest = block.f64s(&[0.5; 6]);
         let roots = block.f64s(&[0.25; 6]);
         let local = block.f64s(&[0.75; 18]);
+        // Two poses of a two-joint body with two shape coefficients: root,
+        // translation, one body rotation, betas.
+        let source_poses = block.f32s(&[
+            0.0, 0.0, 0.0, 1.0, 0.9, 2.0, 0.1, 0.2, 0.3, 0.4, 0.5, //
+            0.1, 0.0, 0.0, 1.1, 0.9, 2.1, 0.2, 0.3, 0.4, 0.6, 0.7,
+        ]);
+        let source_contacts = block.f32s(&[1.0, 1.0, 0.0, 0.0, 1.0, 0.9, 0.0, 0.0]);
         let document = Document {
             version: VERSION,
             video: Some(VideoState {
@@ -999,6 +1119,22 @@ mod tests {
                     local,
                 },
                 contacts: [vec![[0, 4]], vec![], vec![], vec![]],
+                // Exercise the block: a take saved here must come back with the
+                // solver's input, which is what makes a drawn lock solvable after
+                // the project is reopened.
+                source: Some(SourceState {
+                    fps: 30.0,
+                    joints: 2,
+                    betas: 2,
+                    frame_count: 2,
+                    poses: source_poses,
+                    foot_contacts: source_contacts,
+                    floor: 0.01,
+                    floor_from_contacts: true,
+                    offset: [0.1, 0.0, -0.2],
+                    anchors: 2,
+                    anchor_residual: [0.001, 0.002, 0.003],
+                }),
             }],
             candidates: vec![CandidateState {
                 bbox: [0.0; 4],
@@ -1097,6 +1233,28 @@ mod tests {
         assert_eq!(body.bvh.parents, vec![-1, 0]);
         assert_eq!(body.bvh.frames(), 1);
         assert_eq!(body.contacts[0], vec![[0, 4]]);
+        // The solver's input travels with the take: without it a drawn lock had
+        // nothing to re-solve on a reopened project.
+        let source = body.source.expect("the solver input is saved");
+        assert_eq!(source.poses.len(), 2);
+        // The block is written at the project's storage precision, so compare to
+        // the millimetre rather than bit for bit.
+        let close = |a: [f32; 3], b: [f32; 3]| (0..3).all(|i| (a[i] - b[i]).abs() < 1e-3);
+        assert!(close(source.poses[1].translation, [1.1, 0.9, 2.1]));
+        assert!(close(
+            [source.poses[0].body[0], source.poses[0].body[1], source.poses[0].body[2]],
+            [0.1, 0.2, 0.3]
+        ));
+        assert!(close(
+            [source.foot_contacts[0][0], source.foot_contacts[0][1], source.foot_contacts[0][2]],
+            [1.0, 1.0, 0.0]
+        ));
+        assert!((source.floor - 0.01).abs() < 1e-4);
+        assert!(close(source.offset, [0.1, 0.0, -0.2]));
+        assert!(
+            source.skeletons.is_empty(),
+            "the forward pass fills the skeletons when the solver loads"
+        );
         let person = person(&opened.document.people[0], &opened.view());
         assert_eq!(person.name, "Person 1");
         assert_eq!(person.frames.len(), 2);

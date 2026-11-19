@@ -1768,6 +1768,34 @@ fn clip_label(app: &mut VeloMocap, ui: &mut egui::Ui) {
                     // does not exist in this build, so a control that never
                     // works only reads as broken. The two that do exist are here.
                     let has_locks = !app.locks.is_automatic();
+                    // Drawing a lock is only half the job: the take on screen was
+                    // solved before the lock existed, and a lock that changes
+                    // nothing on screen reads as a broken interface. Editing a
+                    // track re-solves by itself after a pause (see
+                    // `apply_correction_if_idle`), and this button is the manual
+                    // way to do it now.
+                    let can_apply = app.can_apply_correction();
+                    let busy = app.recorrect.is_some();
+                    if ui
+                        .add_enabled(
+                            can_apply && has_locks,
+                            egui::Button::new(if busy {
+                                i18n::t("Applying…")
+                            } else {
+                                i18n::t("Apply locks")
+                            })
+                            .min_size(egui::vec2(84.0, 18.0)),
+                        )
+                        .on_hover_text(i18n::t(
+                            "Re-solve the contacts with the timeline's locks, without running the model again",
+                        ))
+                        .on_disabled_hover_text(i18n::t(
+                            "Nothing to apply: no lock is drawn, or this take has no solver input (a project saved before the locks could be re-solved)",
+                        ))
+                        .clicked()
+                    {
+                        app.apply_correction();
+                    }
                     if ui
                         .add_enabled(
                             has_locks,
@@ -2814,7 +2842,7 @@ fn correction_group(app: &mut VeloMocap, ui: &mut egui::Ui) {
                     "Re-solve the contacts with these settings and the timeline's locks, without running the model again",
                 ))
                 .on_disabled_hover_text(i18n::t(
-                    "Generate a motion first: a take loaded from a project has no saved solver input",
+                    "Generate a motion first: a take loaded from a project saved before this build has no solver input",
                 ))
                 .clicked()
             {

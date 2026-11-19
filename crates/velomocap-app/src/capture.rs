@@ -343,6 +343,15 @@ pub fn recorrect(
     let mut out = Vec::with_capacity(takes.len());
     for take in takes {
         let mut clip = (*take.source).clone();
+        // A take that came back from a project stores poses only; the forward
+        // pass is what turns them into the skeletons the first pass reads.
+        if clip.skeletons.len() != clip.poses.len() {
+            clip.skeletons = clip
+                .poses
+                .iter()
+                .map(|pose| model.forward_joints(pose))
+                .collect();
+        }
         let correction = velomocap_motion::correction::apply_with_locks(
             &mut clip, &model, settings, locks,
         )?;
@@ -1064,5 +1073,51 @@ mod tests {
             take.source.poses[0].translation, before.poses[0].translation,
             "the source must not be corrected in place"
         );
+    }
+
+    /// A take that came back from a project carries poses but no skeletons: the
+    /// solver has to run the forward pass before its first probe reads them.
+    #[test]
+    fn applying_correction_fills_skeletons_for_a_reopened_take() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/body_models/smplh/neutral/model.npz");
+        if !path.is_file() {
+            eprintln!("skipping: no SMPL-H model at {}", path.display());
+            return;
+        }
+        let frames = 6usize;
+        let body = velomocap_body::BodyModel::load(&path, 16).expect("body");
+        let pose = velomocap_body::Pose::neutral(body.num_joints, 16);
+        let source = velomocap_motion::FlowClip {
+            fps: 30.0,
+            poses: vec![pose; frames],
+            // A project stores the poses only.
+            skeletons: Vec::new(),
+            rot6d: Vec::new(),
+            trans: vec![[0.0; 3]; frames],
+            betas: vec![0.0; 16],
+            foot_contacts: vec![[1.0f32; 4]; frames],
+            floor: 0.0,
+            floor_from_contacts: true,
+            offset: [0.0; 3],
+            source_frames: (0..frames).collect(),
+            anchors: 0,
+            anchor_residual: [0.0; 3],
+        };
+        let takes = vec![TakeSource {
+            name: "Person 1".into(),
+            first_frame: 0,
+            source: Arc::new(source),
+        }];
+        let settings = velomocap_motion::correction::CorrectionSettings::default();
+        let rebuilt = recorrect(
+            &takes,
+            &path,
+            &settings,
+            &velomocap_motion::ContactTracks::automatic(),
+        )
+        .expect("recorrect from a project take");
+        assert_eq!(rebuilt[0].frames.len(), frames);
+        assert_eq!(rebuilt[0].skeletons.len(), frames);
     }
 }
