@@ -251,6 +251,14 @@ pub struct SamHooks<'a> {
 }
 
 
+/// How much of a clip pass one may keep in RAM for the two phases.
+///
+/// A 960x1700 frame is 4.9 MB, so four gigabytes cover about 810 of them — 27
+/// seconds of the reference's 30 fps. Longer clips decode again per phase, which
+/// is what every build did before the cache existed. `VELOMOCAP_FRAME_CACHE_MB`
+/// overrides it (0 turns the cache off).
+const FRAME_CACHE_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
 /// How many items a module file was traced at.
 ///
 /// `sam3d_full_b8_ts.pt` carries eight people/frames per call; the plain
@@ -675,17 +683,35 @@ impl Reconstruction {
     }
 }
 
+/// Where a phase gets its frames from.
+///
+/// Pass one has already decoded the whole clip. When the clip fits the frame
+/// budget these are the frames it kept, one `Arc` each, so a phase costs no
+/// decode and no per-frame RGB copy; otherwise the phase decodes the clip again,
+/// which is the only way a long clip fits in memory.
+enum PhaseFrames<'a> {
+    /// Decode the clip again.
+    Video {
+        tools: &'a velomocap_video::Tools,
+        video: &'a Path,
+        work_width: usize,
+    },
+    /// The frames pass one kept.
+    Cached {
+        frames: &'a [Option<Arc<Vec<u8>>>],
+        width: usize,
+        height: usize,
+    },
+}
+
 /// Run one module over the frames it is responsible for.
 ///
 /// The capture is split in two passes so that only one graph is resident: this
-/// one decodes the clip again (a few milliseconds a frame), takes the jobs the
-/// detection pass recorded for the frames this phase owns, and feeds them to
-/// `runner` in batches of its traced size.
+/// one takes the jobs the detection pass recorded for the frames this phase owns
+/// and feeds them to `runner` in batches of its traced size.
 #[allow(clippy::too_many_arguments)]
 fn run_phase(
-    tools: &velomocap_video::Tools,
-    video: &Path,
-    work_width: usize,
+    frames: &PhaseFrames<'_>,
     total: usize,
     plan: &[Vec<(usize, Detection)>],
     want_hands: bool,
@@ -702,16 +728,43 @@ fn run_phase(
     hooks: &mut SamHooks<'_>,
 ) -> Result<()> {
     let batch = runner.batch().max(1);
-    let mut decoder = Decoder::open_flow(tools, video, Some(work_width))?;
+    let mut decoder = match frames {
+        PhaseFrames::Video {
+            tools,
+            video,
+            work_width,
+        } => Some(Decoder::open_flow(tools, video, Some(*work_width))?),
+        PhaseFrames::Cached { .. } => None,
+    };
     let mut pending: Vec<PendingJob> = Vec::with_capacity(batch * 2);
     let mut index = 0usize;
-    while let Some(frame) = decoder.next_frame()? {
+    while index < total {
         if (hooks.cancelled)() {
             break;
         }
-        if index >= total {
-            break;
-        }
+        // One frame per index, from whichever source this phase was given.
+        let (frame_rgb, width, height) = if let Some(decoder) = decoder.as_mut() {
+            match decoder.next_frame()? {
+                Some(frame) => (Arc::new(frame.rgb), frame.width, frame.height),
+                None => break,
+            }
+        } else {
+            let PhaseFrames::Cached {
+                frames: cached,
+                width,
+                height,
+            } = frames
+            else {
+                unreachable!("a phase without a decoder always has a cache");
+            };
+            match cached.get(index).and_then(|slot| slot.as_ref()) {
+                Some(rgb) => (Arc::clone(rgb), *width, *height),
+                None => {
+                    index += 1;
+                    continue;
+                }
+            }
+        };
         let here = hands_on_frame.get(index).copied().unwrap_or(false);
         let jobs = plan.get(index);
         if here != want_hands || jobs.map_or(true, Vec::is_empty) {
@@ -719,15 +772,14 @@ fn run_phase(
             continue;
         }
         let jobs = jobs.expect("checked above");
-        let frame_rgb = Arc::new(frame.rgb.clone());
         for (slot, detection) in jobs {
             pending.push(PendingJob {
                 slot: *slot,
                 index,
                 detection: *detection,
                 rgb: Arc::clone(&frame_rgb),
-                width: frame.width,
-                height: frame.height,
+                width,
+                height,
             });
         }
         while pending.len() >= batch {
@@ -1194,6 +1246,32 @@ pub fn capture_people_with(
     let intrinsics = default_intrinsics(width, height);
     let mut tracker = Tracker::new(0.3, config.max_missing);
 
+    // Pass one already decodes every frame, so keeping them costs RAM instead of
+    // a second and third decode of the whole clip. The budget is what a user's
+    // machine can spare without the OS paging; a clip that does not fit falls
+    // back to the old behaviour, one decode per phase.
+    let frame_bytes = (width * height * 3).max(1);
+    let cache_budget = std::env::var("VELOMOCAP_FRAME_CACHE_MB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|mib| mib * 1024 * 1024)
+        .unwrap_or(FRAME_CACHE_BYTES);
+    let mut cache: Option<Vec<Option<Arc<Vec<u8>>>>> = if cache_budget / frame_bytes >= total {
+        eprintln!(
+            "[SAM] keeping the {} decoded frames in RAM ({:.0} MB), so the two phases do not decode the clip again",
+            total,
+            (total * frame_bytes) as f64 / (1024.0 * 1024.0)
+        );
+        Some(vec![None; total])
+    } else {
+        eprintln!(
+            "[SAM] the clip needs {:.0} MB of frames and the cache budget is {:.0} MB, so each phase decodes it again",
+            (total * frame_bytes) as f64 / (1024.0 * 1024.0),
+            (cache_budget as f64) / (1024.0 * 1024.0)
+        );
+        None
+    };
+
     let mut people: Vec<PersonTrack> = Vec::new();
     let mut timings = Timings {
         load: load_seconds,
@@ -1226,7 +1304,7 @@ pub fn capture_people_with(
     // Pass one: decode, detect, track and decide which person owns which frame.
     // The graph is not touched here, so nothing of it is on the card yet.
     let mut plan: Vec<Vec<(usize, Detection)>> = Vec::with_capacity(total);
-    while let Some(frame) = decoder.next_frame()? {
+    while let Some(mut frame) = decoder.next_frame()? {
         if (hooks.cancelled)() {
             break;
         }
@@ -1358,6 +1436,12 @@ pub fn capture_people_with(
             }
         }
 
+        // Pass one owns the decode. Handing the frame over here means the two
+        // phases cost neither a decode nor a copy of the RGB buffer.
+        if let Some(cache) = cache.as_mut() {
+            cache[index] = Some(Arc::new(std::mem::take(&mut frame.rgb)));
+        }
+
         (hooks.people)(index, &people);
         // Everything the card waits through: decode, tracking, the hooks and the
         // packing of this frame's jobs.
@@ -1374,6 +1458,21 @@ pub fn capture_people_with(
     // Both graphs ready to run means the hands are sampled: the full graph takes
     // the hand frames, the body-only one takes the rest. Otherwise a single phase
     // runs every frame through the full graph.
+    //
+    // The phases read pass one's frames when the budget covered the clip, and
+    // decode the clip again when it did not.
+    let frames = match cache.as_deref() {
+        Some(frames) => PhaseFrames::Cached {
+            frames,
+            width,
+            height,
+        },
+        None => PhaseFrames::Video {
+            tools: &tools,
+            video,
+            work_width: config.work_width,
+        },
+    };
     let two_phases = body_weights.is_some();
     if let Some(path) = body_weights.as_deref() {
         eprintln!(
@@ -1388,9 +1487,7 @@ pub fn capture_people_with(
     let mut reconstruction = Reconstruction::new(&plan);
     if let Some(active) = runner.as_ref() {
         run_phase(
-            &tools,
-            video,
-            config.work_width,
+            &frames,
             total,
             &plan,
             true,
@@ -1420,9 +1517,7 @@ pub fn capture_people_with(
                     full: Box::new(module),
                 };
                 run_phase(
-                    &tools,
-                    video,
-                    config.work_width,
+                    &frames,
                     total,
                     &plan,
                     false,
@@ -1453,9 +1548,7 @@ pub fn capture_people_with(
                     full: Box::new(module),
                 };
                 run_phase(
-                    &tools,
-                    video,
-                    config.work_width,
+                    &frames,
                     total,
                     &plan,
                     false,
@@ -1481,9 +1574,7 @@ pub fn capture_people_with(
             if let SamRunner::Torch { .. } = active {
                 if hand_stride > 1 {
                     run_phase(
-                        &tools,
-                        video,
-                        config.work_width,
+                        &frames,
                         total,
                         &plan,
                         false,

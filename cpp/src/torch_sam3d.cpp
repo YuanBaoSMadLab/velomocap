@@ -115,7 +115,16 @@ void* vm_sam3d_load(const char* path, int use_cuda, char* error, size_t error_le
     // time it runs, and the app calls it once per frame. Turning the graph
     // optimiser off keeps every call on the interpreted plan, which is what the
     // per-frame path needs.
-    torch::jit::setGraphExecutorOptimize(false);
+    //
+    // `optimize_for_inference` is the obvious alternative and does not work on
+    // this graph: freezing inlines the scripted MHR submodules and the traced
+    // calls then fail with "Couldn't find method 'forward'". The graph keeps the
+    // interpreted plan.
+    //
+    // `VELOMOCAP_SAM_GRAPH_OPTIMIZE=1` re-enables the profiling executor's pass
+    // instead: it fuses pointwise chains and runs nvFuser groups, at the cost of
+    // one long pass the first time the plan for these shapes is built.
+    torch::jit::setGraphExecutorOptimize(std::getenv("VELOMOCAP_SAM_GRAPH_OPTIMIZE") != nullptr);
     return handle.release();
   } catch (const std::exception& failure) {
     fail(error, error_len, std::string("load failed: ") + failure.what());

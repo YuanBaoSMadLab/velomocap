@@ -125,6 +125,9 @@ impl CaptureStage {
 /// run looked hung.
 pub const STAGE_COUNT: usize = 7;
 
+/// One preview image per six decoded frames: 5 Hz for a 30 fps clip.
+pub const PREVIEW_EVERY: usize = 6;
+
 pub fn stage_name(index: usize) -> &'static str {
     match index {
         0 => "loading models",
@@ -490,6 +493,14 @@ fn run(
     let mut preview = {
         let shared = Arc::clone(&shared);
         move |frame: &velomocap_video::Frame| {
+            // The pane shows one image at a time; downscaling 960x1700 to 480
+            // wide for every frame of a 30 fps pass is a sixth of a second per
+            // hundred frames spent on frames nobody sees. Five a second keeps
+            // the picture moving, and frame 0 always lands so the canvas gets
+            // its size.
+            if frame.index != 0 && frame.index % PREVIEW_EVERY != 0 {
+                return;
+            }
             let preview = downscale(frame.index, &frame.rgb, frame.width, frame.height, 480);
             if let Ok(mut state) = shared.lock() {
                 state.preview = Some(Arc::new(preview));
